@@ -11,6 +11,7 @@ from pydantic import BaseModel, JsonValue, ValidationError
 from rivet.contracts.tools import ToolCall, ToolDefinition
 
 ToolExecutor = Callable[[BaseModel], Awaitable[str]]
+ToolCallExecutor = Callable[[ToolCall, BaseModel], Awaitable[str]]
 
 
 class AgentToolValidationError(ValueError):
@@ -23,7 +24,13 @@ class AgentTool:
 
     definition: ToolDefinition
     input_model: type[BaseModel]
-    executor: ToolExecutor
+    executor: ToolExecutor | None = None
+    call_executor: ToolCallExecutor | None = None
+
+    def __post_init__(self) -> None:
+        """要求普通执行器与需要 call 身份的执行器二选一。"""
+        if (self.executor is None) == (self.call_executor is None):
+            raise ValueError("AgentTool 必须且只能配置一个执行器")
 
     @classmethod
     def from_model(
@@ -48,10 +55,31 @@ class AgentTool:
             executor=executor,
         )
 
+    @classmethod
+    def from_call_model(
+        cls,
+        *,
+        definition: ToolDefinition,
+        input_model: type[BaseModel],
+        executor: ToolCallExecutor,
+    ) -> AgentTool:
+        """绑定需要 Tool Call 身份和审计上下文的执行器。"""
+        if input_model.model_config.get("extra") != "forbid":
+            raise ValueError("AgentTool 输入模型必须配置 extra='forbid'")
+        return cls(
+            definition=definition,
+            input_model=input_model,
+            call_executor=executor,
+        )
+
     async def execute(self, call: ToolCall) -> str:
         """先执行本地 Schema 校验，再调用工具实现。"""
         try:
             arguments = self.input_model.model_validate(call.arguments)
         except ValidationError as error:
             raise AgentToolValidationError("工具参数未通过本地 Schema") from error
+        if self.call_executor is not None:
+            return await self.call_executor(call, arguments)
+        if self.executor is None:
+            raise RuntimeError("AgentTool 执行器不变量被破坏")
         return await self.executor(arguments)
