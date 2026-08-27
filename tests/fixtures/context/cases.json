@@ -1,0 +1,135 @@
+[
+  {
+    "case_id": "python-symbol",
+    "task": "修复 authenticate_user 登录超时",
+    "include_syntax": true,
+    "gold_files": ["src/auth/service.py"],
+    "files": {
+      "src/auth/service.py": "import asyncio\n\nasync def authenticate_user(token: str) -> bool:\n    await asyncio.sleep(0)\n    return bool(token)\n",
+      "src/catalog.py": "def list_products() -> list[str]:\n    return []\n",
+      "tests/test_catalog.py": "def test_catalog_is_empty():\n    assert True\n"
+    }
+  },
+  {
+    "case_id": "python-stack",
+    "task": "Traceback: File \"src/payments/gateway.py\", line 7, in charge PaymentDeclined",
+    "include_syntax": false,
+    "gold_files": ["src/payments/gateway.py"],
+    "files": {
+      "src/payments/gateway.py": "class PaymentDeclined(Exception):\n    pass\n\ndef charge(amount: int) -> None:\n    if amount < 0:\n        raise PaymentDeclined(amount)\n",
+      "src/payments/models.py": "class Payment:\n    amount: int\n",
+      "README.md": "Payments package.\n"
+    }
+  },
+  {
+    "case_id": "paired-test",
+    "task": "login session regression test failing",
+    "include_syntax": true,
+    "gold_files": ["src/login/session.py", "tests/test_login_session.py"],
+    "files": {
+      "src/login/session.py": "def open_session(user_id: str) -> str:\n    return f'session:{user_id}'\n",
+      "tests/test_login_session.py": "from login.session import open_session\n\ndef test_open_session_has_prefix():\n    assert open_session('u').startswith('session:')\n",
+      "src/login/profile.py": "def display_name() -> str:\n    return 'user'\n"
+    }
+  },
+  {
+    "case_id": "manifest",
+    "task": "更新 pyproject.toml 的项目依赖",
+    "include_syntax": false,
+    "gold_files": ["pyproject.toml"],
+    "files": {
+      "pyproject.toml": "[project]\nname = \"fixture\"\nversion = \"0.1.0\"\ndependencies = []\n",
+      "src/fixture.py": "VALUE = 1\n",
+      "README.md": "Fixture project.\n"
+    }
+  },
+  {
+    "case_id": "typescript-component",
+    "task": "修复 UserCard 组件的 displayName",
+    "include_syntax": true,
+    "gold_files": ["web/user-card.tsx"],
+    "files": {
+      "web/user-card.tsx": "export class UserCard {\n  displayName(name: string): string { return name.trim() }\n}\n",
+      "web/admin-card.tsx": "export class AdminCard {\n  title(): string { return 'admin' }\n}\n",
+      "package.json": "{\"name\":\"fixture\",\"private\":true}\n"
+    }
+  },
+  {
+    "case_id": "javascript-router",
+    "task": "router registerRoute 导入解析错误",
+    "include_syntax": true,
+    "gold_files": ["src/router.js"],
+    "files": {
+      "src/router.js": "import { normalizePath } from './paths.js'\nexport function registerRoute(path, handler) { return [normalizePath(path), handler] }\n",
+      "src/paths.js": "export function normalizePath(path) { return path.trim() }\n",
+      "src/logger.js": "export function log(message) { return message }\n"
+    }
+  },
+  {
+    "case_id": "python-class",
+    "task": "InventoryCache invalidate 方法没有清理条目",
+    "include_syntax": true,
+    "gold_files": ["src/cache.py"],
+    "files": {
+      "src/cache.py": "class InventoryCache:\n    def __init__(self):\n        self.entries = {}\n\n    def invalidate(self, key: str) -> None:\n        self.entries.pop(key, None)\n",
+      "src/inventory.py": "def load_inventory() -> list[str]:\n    return []\n",
+      "tests/test_inventory.py": "def test_inventory_fixture():\n    assert True\n"
+    }
+  },
+  {
+    "case_id": "error-code",
+    "task": "处理 E_CONN_RESET 重试失败",
+    "include_syntax": false,
+    "gold_files": ["src/network/client.py"],
+    "files": {
+      "src/network/client.py": "E_CONN_RESET = 'E_CONN_RESET'\n\ndef should_retry(code: str) -> bool:\n    return code == E_CONN_RESET\n",
+      "src/network/server.py": "E_LISTEN = 'E_LISTEN'\n",
+      "docs/errors.md": "Network error catalog.\n"
+    }
+  },
+  {
+    "case_id": "entrypoint",
+    "task": "bootstrap CLI 入口启动失败",
+    "include_syntax": true,
+    "gold_files": ["src/app/__main__.py"],
+    "files": {
+      "src/app/__main__.py": "from app.cli import bootstrap\n\nif __name__ == '__main__':\n    bootstrap()\n",
+      "src/app/cli.py": "def bootstrap() -> None:\n    print('ready')\n",
+      "src/app/config.py": "def load_config() -> dict[str, str]:\n    return {}\n"
+    }
+  },
+  {
+    "case_id": "build-config",
+    "task": "启用 TypeScript strict 构建配置",
+    "include_syntax": false,
+    "gold_files": ["tsconfig.json"],
+    "files": {
+      "tsconfig.json": "{\"compilerOptions\":{\"strict\":false}}\n",
+      "package.json": "{\"scripts\":{\"build\":\"tsc\"}}\n",
+      "src/index.ts": "export const ready: boolean = true\n"
+    }
+  },
+  {
+    "case_id": "test-name",
+    "task": "test_rejects_path_traversal 安全测试失败",
+    "include_syntax": true,
+    "gold_files": ["tests/security/test_paths.py"],
+    "files": {
+      "tests/security/test_paths.py": "def test_rejects_path_traversal():\n    assert '..' not in 'safe/path'\n",
+      "src/paths.py": "def normalize(path: str) -> str:\n    return path\n",
+      "tests/test_other.py": "def test_other():\n    assert True\n"
+    }
+  },
+  {
+    "case_id": "recent-git",
+    "task": "修复 calculate_total 舍入逻辑",
+    "include_syntax": true,
+    "gold_files": ["src/billing/current.py"],
+    "recent_paths": ["src/billing/current.py"],
+    "files": {
+      "src/billing/current.py": "from decimal import Decimal\n\ndef calculate_total(values: list[Decimal]) -> Decimal:\n    return sum(values, Decimal())\n",
+      "src/billing/legacy.py": "from decimal import Decimal\n\ndef calculate_total(values: list[Decimal]) -> Decimal:\n    return sum(values, Decimal())\n",
+      "tests/test_billing.py": "def test_billing_placeholder():\n    assert True\n"
+    }
+  }
+]
