@@ -14,6 +14,7 @@ from rivet.contracts.messages import (
     UserMessage,
 )
 from rivet.contracts.modules import ModuleManifest, ResourceRecord
+from rivet.contracts.provider import ModelRequest, ModelResponse, TokenUsage
 from rivet.contracts.readers import ReaderRequest, ReaderResult
 from rivet.contracts.tools import (
     ToolCall,
@@ -49,6 +50,9 @@ CONTRACT_MODELS: tuple[type[BaseModel], ...] = (
     UserMessage,
     ModuleManifest,
     ResourceRecord,
+    ModelRequest,
+    ModelResponse,
+    TokenUsage,
     ReaderRequest,
     ReaderResult,
     ToolCall,

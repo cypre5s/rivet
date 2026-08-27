@@ -1,0 +1,9 @@
+data: {"id":"completion_fixture_1","object":"chat.completion.chunk","created":1787850000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"fixture reasoning"},"finish_reason":null}]}
+
+data: {"id":"completion_fixture_1","object":"chat.completion.chunk","created":1787850000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"fixture "},"finish_reason":null}]}
+
+data: {"id":"completion_fixture_1","object":"chat.completion.chunk","created":1787850000,"model":"deepseek-v4-pro","choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12,"completion_tokens_details":{"reasoning_tokens":2}}}
+
+data: [DONE]
+
+: fixture eof

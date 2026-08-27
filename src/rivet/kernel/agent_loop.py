@@ -1,0 +1,371 @@
+"""实现 Provider 中立、预算受控且可确定终止的 Agent Loop。"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import time
+from collections.abc import Callable
+from datetime import UTC, datetime
+from decimal import Decimal
+
+from rivet.contracts.messages import Message, ToolMessage
+from rivet.contracts.provider import (
+    ModelFinishReason,
+    ModelProviderError,
+    ModelRequest,
+    ModelResponse,
+    TokenUsage,
+)
+from rivet.contracts.tools import ToolCall
+from rivet.kernel.agent_models import (
+    AgentLoopConfig,
+    AgentLoopResult,
+    AgentLoopState,
+    AgentTask,
+    AgentTerminationReason,
+)
+from rivet.kernel.agent_tools import AgentTool, AgentToolValidationError
+from rivet.kernel.model_provider import ModelProvider
+
+Clock = Callable[[], datetime]
+MonotonicClock = Callable[[], float]
+
+
+class _RunCancelled(Exception):
+    """在内部竞速中传播用户取消，不跨越 Kernel 公共边界。"""
+
+
+class AgentLoop:
+    """逐轮调用模型，并由本地规则决定工具执行和终止。"""
+
+    def __init__(
+        self,
+        provider: ModelProvider,
+        *,
+        tools: tuple[AgentTool, ...],
+        config: AgentLoopConfig | None = None,
+        clock: Clock | None = None,
+        monotonic: MonotonicClock = time.monotonic,
+    ) -> None:
+        self._provider = provider
+        self._config = config or AgentLoopConfig()
+        self._clock = clock or (lambda: datetime.now(UTC))
+        self._monotonic = monotonic
+        self._tools = {tool.definition.name: tool for tool in tools}
+        if len(self._tools) != len(tools):
+            raise ValueError("Agent Loop 工具名不得重复")
+
+    async def run(
+        self,
+        task: AgentTask,
+        *,
+        cancel_event: asyncio.Event | None = None,
+    ) -> AgentLoopResult:
+        """运行至本地成功条件或任一失败关闭条件。"""
+        messages: list[Message] = list(task.messages)
+        round_count = 0
+        tool_call_count = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+        reasoning_tokens = 0
+        total_cost = Decimal(0)
+        started_at = self._monotonic()
+        last_action_fingerprint: str | None = None
+        consecutive_repeats = 0
+        observation_fingerprints: set[str] = set()
+        no_progress_rounds = 0
+        state_history: list[AgentLoopState] = []
+
+        def transition(state: AgentLoopState) -> None:
+            """只记录真实发生且不与上一项重复的状态变化。"""
+            if not state_history or state_history[-1] is not state:
+                state_history.append(state)
+
+        def result(
+            state: AgentLoopState,
+            reason: AgentTerminationReason,
+            *,
+            answer: str | None = None,
+        ) -> AgentLoopResult:
+            transition(state)
+            usage = TokenUsage(
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=prompt_tokens + completion_tokens,
+                reasoning_tokens=reasoning_tokens,
+                cost_usd=total_cost if total_cost else None,
+            )
+            return AgentLoopResult(
+                state=state,
+                state_history=tuple(state_history),
+                termination_reason=reason,
+                messages=tuple(messages),
+                answer=answer,
+                round_count=round_count,
+                tool_call_count=tool_call_count,
+                usage=usage,
+            )
+
+        transition(AgentLoopState.RECEIVE)
+        transition(AgentLoopState.UNDERSTAND)
+        transition(AgentLoopState.GATHER_CONTEXT)
+        transition(AgentLoopState.PLAN)
+        while True:
+            transition(AgentLoopState.PREPARE)
+            if cancel_event is not None and cancel_event.is_set():
+                return result(
+                    AgentLoopState.CANCELLED,
+                    AgentTerminationReason.USER_CANCELLED,
+                )
+            elapsed = self._monotonic() - started_at
+            if elapsed >= self._config.max_wall_seconds:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.WALL_TIME_EXCEEDED,
+                )
+            if round_count >= self._config.max_rounds:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.MAX_ROUNDS_EXCEEDED,
+                )
+
+            request = ModelRequest(
+                model=task.model,
+                messages=tuple(messages),
+                tools=tuple(tool.definition for tool in self._tools.values()),
+                stream=self._config.stream,
+                thinking=self._config.thinking,
+                reasoning_effort=self._config.reasoning_effort,
+                max_tokens=self._config.max_completion_tokens,
+            )
+            try:
+                transition(AgentLoopState.MODEL_CALL)
+                response = await self._complete_with_limits(
+                    request,
+                    cancel_event=cancel_event,
+                    timeout_seconds=self._config.max_wall_seconds - elapsed,
+                )
+            except _RunCancelled:
+                return result(
+                    AgentLoopState.CANCELLED,
+                    AgentTerminationReason.USER_CANCELLED,
+                )
+            except TimeoutError:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.WALL_TIME_EXCEEDED,
+                )
+            except ModelProviderError:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.PROVIDER_FAILED,
+                )
+
+            transition(AgentLoopState.PARSE_TOOL_CALLS)
+            round_count += 1
+            prompt_tokens += response.usage.prompt_tokens
+            completion_tokens += response.usage.completion_tokens
+            reasoning_tokens += response.usage.reasoning_tokens
+            if response.usage.cost_usd is not None:
+                total_cost += response.usage.cost_usd
+            if prompt_tokens + completion_tokens > self._config.max_total_tokens:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.TOKEN_BUDGET_EXCEEDED,
+                )
+            if self._config.max_cost_usd is not None and (
+                response.usage.cost_usd is None
+                or total_cost > self._config.max_cost_usd
+            ):
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.COST_BUDGET_EXCEEDED,
+                )
+
+            messages.append(response.message)
+            if response.finish_reason is ModelFinishReason.STOP:
+                transition(AgentLoopState.EVALUATE)
+                transition(AgentLoopState.VERIFY)
+                return result(
+                    AgentLoopState.COMPLETE,
+                    AgentTerminationReason.FINAL_ANSWER,
+                    answer=response.message.content,
+                )
+            if response.finish_reason is not ModelFinishReason.TOOL_CALLS:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.INVALID_MODEL_RESPONSE,
+                )
+
+            round_made_progress = False
+            for call in response.message.tool_calls:
+                transition(AgentLoopState.AUTHORIZE)
+                fingerprint = self._tool_fingerprint(call)
+                if fingerprint == last_action_fingerprint:
+                    consecutive_repeats += 1
+                else:
+                    last_action_fingerprint = fingerprint
+                    consecutive_repeats = 1
+                if consecutive_repeats >= self._config.max_consecutive_repeats:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.REPEATED_ACTION,
+                    )
+                if tool_call_count >= self._config.max_tool_calls:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.MAX_TOOL_CALLS_EXCEEDED,
+                    )
+                tool = self._tools.get(call.tool_name)
+                if tool is None:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.UNKNOWN_TOOL,
+                    )
+                try:
+                    transition(AgentLoopState.EXECUTE_TOOLS)
+                    remaining_seconds = self._config.max_wall_seconds - (
+                        self._monotonic() - started_at
+                    )
+                    observation = await self._execute_with_limits(
+                        tool,
+                        call,
+                        cancel_event=cancel_event,
+                        timeout_seconds=remaining_seconds,
+                    )
+                except _RunCancelled:
+                    return result(
+                        AgentLoopState.CANCELLED,
+                        AgentTerminationReason.USER_CANCELLED,
+                    )
+                except TimeoutError:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.WALL_TIME_EXCEEDED,
+                    )
+                except AgentToolValidationError:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.TOOL_VALIDATION_FAILED,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.TOOL_EXECUTION_FAILED,
+                    )
+                tool_call_count += 1
+                safe_observation = observation or "（工具未返回文本）"
+                observation_fingerprint = hashlib.sha256(
+                    safe_observation.encode("utf-8")
+                ).hexdigest()
+                if observation_fingerprint not in observation_fingerprints:
+                    observation_fingerprints.add(observation_fingerprint)
+                    round_made_progress = True
+                messages.append(
+                    ToolMessage(
+                        tool_call_id=call.tool_call_id,
+                        content=safe_observation,
+                        created_at=self._clock(),
+                    )
+                )
+                transition(AgentLoopState.OBSERVE)
+            transition(AgentLoopState.EVALUATE)
+            if round_made_progress:
+                no_progress_rounds = 0
+            else:
+                no_progress_rounds += 1
+                if no_progress_rounds >= self._config.max_no_progress_rounds:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.NO_PROGRESS,
+                    )
+
+    async def _complete_with_limits(
+        self,
+        request: ModelRequest,
+        *,
+        cancel_event: asyncio.Event | None,
+        timeout_seconds: float,
+    ) -> ModelResponse:
+        """让墙钟超时和用户取消都能取消正在进行的 HTTP 调用。"""
+        provider_task = asyncio.create_task(self._provider.complete(request))
+        cancel_task = (
+            asyncio.create_task(cancel_event.wait())
+            if cancel_event is not None
+            else None
+        )
+        waiters: set[asyncio.Task[object]] = {provider_task}
+        if cancel_task is not None:
+            waiters.add(cancel_task)
+        try:
+            done, _ = await asyncio.wait(
+                waiters,
+                timeout=max(0.0, timeout_seconds),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if provider_task in done:
+                return await provider_task
+            provider_task.cancel()
+            await asyncio.gather(provider_task, return_exceptions=True)
+            if cancel_task is not None and cancel_task in done:
+                raise _RunCancelled
+            raise TimeoutError
+        finally:
+            if not provider_task.done():
+                provider_task.cancel()
+                await asyncio.gather(provider_task, return_exceptions=True)
+            if cancel_task is not None:
+                cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
+
+    async def _execute_with_limits(
+        self,
+        tool: AgentTool,
+        call: ToolCall,
+        *,
+        cancel_event: asyncio.Event | None,
+        timeout_seconds: float,
+    ) -> str:
+        """让用户取消和总墙钟预算也覆盖工具执行阶段。"""
+        tool_task = asyncio.create_task(tool.execute(call))
+        cancel_task = (
+            asyncio.create_task(cancel_event.wait())
+            if cancel_event is not None
+            else None
+        )
+        waiters: set[asyncio.Task[object]] = {tool_task}
+        if cancel_task is not None:
+            waiters.add(cancel_task)
+        try:
+            done, _ = await asyncio.wait(
+                waiters,
+                timeout=max(0.0, timeout_seconds),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if tool_task in done:
+                return await tool_task
+            if cancel_task is not None and cancel_task in done:
+                raise _RunCancelled
+            raise TimeoutError
+        finally:
+            if not tool_task.done():
+                tool_task.cancel()
+                await asyncio.gather(tool_task, return_exceptions=True)
+            if cancel_task is not None:
+                cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
+
+    @staticmethod
+    def _tool_fingerprint(call: ToolCall) -> str:
+        """忽略厂商 call id，对工具名和规范化参数生成动作指纹。"""
+        payload = json.dumps(
+            {"arguments": call.arguments, "tool_name": call.tool_name},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
