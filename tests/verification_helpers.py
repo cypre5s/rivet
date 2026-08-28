@@ -81,7 +81,11 @@ def _write_base_project(repository: Path) -> None:
     run_git(repository, "commit", "-qm", "add verification fixture")
 
 
-def _acceptance(case: VerificationFixtureCase) -> AcceptanceSpec:
+def _acceptance(
+    case: VerificationFixtureCase,
+    *,
+    behavior_verification_commands: tuple[tuple[str, ...], ...] | None = None,
+) -> AcceptanceSpec:
     """将每个 fixture 转为冻结命令、范围和预算。"""
     return AcceptanceSpec(
         acceptance_id=f"acceptance_{case.case_id}",
@@ -92,6 +96,11 @@ def _acceptance(case: VerificationFixtureCase) -> AcceptanceSpec:
         expected_behaviors=("transform 对任意整数返回两倍值",),
         preserved_behaviors=("零值行为与 stable.txt 保持不变",),
         verification_commands=((sys.executable, case.targeted_script),),
+        behavior_verification_commands=(
+            ((sys.executable, "check_general.py"),)
+            if behavior_verification_commands is None
+            else behavior_verification_commands
+        ),
         max_wall_seconds=case.max_wall_seconds,
         max_tokens=1_000,
         max_tool_calls=20,
@@ -108,6 +117,7 @@ async def run_verification_case(
     project_configuration: ProjectConfiguration | None = None,
     use_production_sandbox: bool = False,
     sandbox_executable: Path | None = None,
+    behavior_verification_commands: tuple[tuple[str, ...], ...] | None = None,
 ) -> PreparedVerification:
     """创建真实 Worktree、写补丁并执行完整验证矩阵。"""
     repository = initialize_repository(tmp_path)
@@ -117,7 +127,10 @@ async def run_verification_case(
     record = await manager.create(transaction_id=f"tx_{case.case_id}")
     await manager.freeze_acceptance(
         record.transaction_id,
-        _acceptance(case),
+        _acceptance(
+            case,
+            behavior_verification_commands=behavior_verification_commands,
+        ),
         confirmed=True,
     )
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))

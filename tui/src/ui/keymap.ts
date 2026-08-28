@@ -14,6 +14,24 @@ export interface KeyDescriptor {
   ctrl: boolean;
 }
 
+export type CtrlCAction = "cancel" | "exit";
+
+export const CTRL_C_EXIT_WINDOW_MS = 1500;
+
+export function resolveCtrlCAction(
+  previousAt: number | null,
+  now: number,
+): CtrlCAction {
+  if (
+    previousAt !== null &&
+    now >= previousAt &&
+    now - previousAt <= CTRL_C_EXIT_WINDOW_MS
+  ) {
+    return "exit";
+  }
+  return "cancel";
+}
+
 export function resolveKeyCommand(key: KeyDescriptor): KeyCommand | null {
   if (key.name === "tab") return key.shift ? "focus.previous" : "focus.next";
   if (key.ctrl && key.name === "p") return "palette.open";

@@ -1,5 +1,5 @@
 import { useKeyboard, useTerminalDimensions } from "@opentui/react";
-import { useEffect, useReducer, useState } from "react";
+import { useEffect, useReducer, useRef, useState } from "react";
 
 import { CommandPalette } from "./components/command-palette.tsx";
 import { Header } from "./components/header.tsx";
@@ -16,7 +16,7 @@ import {
   type InspectorTab,
   type RivetState,
 } from "./state/reducer.ts";
-import { resolveKeyCommand } from "./ui/keymap.ts";
+import { resolveCtrlCAction, resolveKeyCommand } from "./ui/keymap.ts";
 import { computeLayout } from "./ui/layout.ts";
 import { parseCommandInput } from "./ui/commands.ts";
 import { INSPECTOR_TABS } from "./ui/view-model.ts";
@@ -27,6 +27,7 @@ export interface RivetAppProps {
   client?: WorkerClient;
   onPermission?: (requestId: string, approved: boolean) => void;
   onRecover?: () => void;
+  onExit?: () => void;
 }
 
 export function RivetApp({
@@ -35,6 +36,7 @@ export function RivetApp({
   client,
   onPermission,
   onRecover,
+  onExit,
 }: RivetAppProps) {
   const [state, dispatch] = useReducer(reduceRivetState, initialState);
   const [input, setInput] = useState("");
@@ -43,6 +45,7 @@ export function RivetApp({
   const [activeTab, setActiveTab] = useState<InspectorTab>(state.inspectorTab);
   const [hiddenBefore, setHiddenBefore] = useState(-1);
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
+  const lastCtrlCAt = useRef<number | null>(null);
   const dimensions = useTerminalDimensions();
   const layout = computeLayout(dimensions.width, dimensions.height);
   const theme = createTheme(noColor);
@@ -135,12 +138,20 @@ export function RivetApp({
         key.preventDefault();
         setHiddenBefore(state.lastSequence);
         return;
-      case "task.cancel":
+      case "task.cancel": {
         key.preventDefault();
+        const ctrlCAt = Date.now();
+        if (resolveCtrlCAction(lastCtrlCAt.current, ctrlCAt) === "exit") {
+          lastCtrlCAt.current = null;
+          onExit?.();
+          return;
+        }
+        lastCtrlCAt.current = ctrlCAt;
         if (client !== undefined && activeRequestId !== null) {
           client.cancel(activeRequestId);
         }
         return;
+      }
       case "worker.recover":
         key.preventDefault();
         if (state.connection === "crashed") onRecover?.();

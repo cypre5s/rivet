@@ -24,7 +24,7 @@ from rivet.ipc.worker import (
 )
 
 MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
-CommandRunner = Callable[[tuple[str, ...]], Awaitable["CommandExecution"]]
+CommandRunner = Callable[[tuple[str, ...], EmitEvent], Awaitable["CommandExecution"]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -36,6 +36,16 @@ class CommandExecution:
     stderr: bytes
     stdout_truncated: bool = False
     stderr_truncated: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _ProjectedTraceEvent:
+    """保存投影前的事件类型、载荷、Run 与 Worker 流关联。"""
+
+    event_type: str
+    payload: dict[str, JsonValue]
+    run_id: str
+    stream_id: str | None
 
 
 class CommandWorkerApplication(BaseWorkerApplication):
@@ -97,7 +107,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
                     cancel_event=cancel_event,
                 )
                 arguments = (*arguments, "--yes")
-            execution = await self._runner(arguments)
+            execution = await self._runner(arguments, emit)
             payload = self._decode_execution(execution)
             if execution.return_code not in {0, 4}:
                 self._raise_execution_error(execution)
@@ -211,7 +221,11 @@ class CommandWorkerApplication(BaseWorkerApplication):
             )
         return (*prefix, transaction_id)
 
-    async def _run_subprocess(self, argv: tuple[str, ...]) -> CommandExecution:
+    async def _run_subprocess(
+        self,
+        argv: tuple[str, ...],
+        emit: EmitEvent,
+    ) -> CommandExecution:
         """以白名单环境运行同一 CLI，并按 TERM/KILL 回收取消任务。"""
         environment = {
             name: value
@@ -235,6 +249,10 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 "XDG_STATE_HOME",
             }
         }
+        stream_id = f"stream_{uuid.uuid4().hex}"
+        environment["RIVET_STREAM_ID"] = stream_id
+        trace_path = self._repository / ".rivet" / "trace" / "events.ndjson"
+        trace_offset = self._trace_offset(trace_path)
         process = await asyncio.create_subprocess_exec(
             *argv,
             cwd=self._repository,
@@ -253,15 +271,30 @@ class CommandWorkerApplication(BaseWorkerApplication):
             )
         stdout_task = asyncio.create_task(self._read_bounded(process.stdout))
         stderr_task = asyncio.create_task(self._read_bounded(process.stderr))
+        trace_task = asyncio.create_task(
+            self._stream_trace_events(
+                process,
+                trace_path=trace_path,
+                initial_offset=trace_offset,
+                stream_id=stream_id,
+                emit=emit,
+            )
+        )
         try:
             await process.wait()
         except asyncio.CancelledError:
             await self._terminate_process_group(process)
-            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            await asyncio.gather(
+                stdout_task,
+                stderr_task,
+                trace_task,
+                return_exceptions=True,
+            )
             raise
-        stdout_result, stderr_result = await asyncio.gather(
+        stdout_result, stderr_result, _ = await asyncio.gather(
             stdout_task,
             stderr_task,
+            trace_task,
         )
         stdout, stdout_truncated = stdout_result
         stderr, stderr_truncated = stderr_result
@@ -277,6 +310,119 @@ class CommandWorkerApplication(BaseWorkerApplication):
             stderr,
             stdout_truncated,
             stderr_truncated,
+        )
+
+    @staticmethod
+    def _trace_offset(trace_path: Path) -> int:
+        """只把命令启动后追加的 Trace 事件投影到当前 TUI 请求。"""
+        try:
+            if trace_path.is_symlink() or not trace_path.is_file():
+                return 0
+            return trace_path.stat().st_size
+        except OSError:
+            return 0
+
+    async def _stream_trace_events(
+        self,
+        process: asyncio.subprocess.Process,
+        *,
+        trace_path: Path,
+        initial_offset: int,
+        stream_id: str,
+        emit: EmitEvent,
+    ) -> None:
+        """在子 CLI 运行期间持续投影已持久化、已脱敏的 Trace 行。"""
+        offset = initial_offset
+        pending = bytearray()
+        active_run_id: str | None = None
+        while True:
+            chunk = self._read_trace_chunk(trace_path, offset)
+            if chunk:
+                offset += len(chunk)
+                pending.extend(chunk)
+                while b"\n" in pending:
+                    raw_line, _, remainder = pending.partition(b"\n")
+                    pending = bytearray(remainder)
+                    projected = self._project_trace_line(bytes(raw_line))
+                    if projected is None:
+                        continue
+                    if active_run_id is None:
+                        if projected.stream_id != stream_id:
+                            continue
+                        active_run_id = projected.run_id
+                    if projected.run_id == active_run_id:
+                        await emit(projected.event_type, projected.payload)
+            if process.returncode is not None:
+                final_chunk = self._read_trace_chunk(trace_path, offset)
+                if final_chunk:
+                    continue
+                return
+            await asyncio.sleep(0.02)
+
+    @staticmethod
+    def _read_trace_chunk(trace_path: Path, offset: int) -> bytes:
+        """有界读取一个普通 Trace 文件的新追加部分。"""
+        try:
+            if trace_path.is_symlink() or not trace_path.is_file():
+                return b""
+            with trace_path.open("rb") as stream:
+                stream.seek(offset)
+                return stream.read(MAX_COMMAND_OUTPUT_BYTES)
+        except OSError:
+            return b""
+
+    @staticmethod
+    def _project_trace_line(
+        raw_line: bytes,
+    ) -> _ProjectedTraceEvent | None:
+        """严格收窄 Trace envelope，并补充 TUI 时间线所需摘要。"""
+        try:
+            raw_record: object = json.loads(raw_line)
+        except (UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw_record, dict):
+            return None
+        record = cast(dict[str, object], raw_record)
+        raw_event = record.get("event")
+        if not isinstance(raw_event, dict):
+            return None
+        event = cast(dict[str, object], raw_event)
+        event_type = event.get("event_type")
+        run_id = event.get("run_id")
+        raw_payload = event.get("payload")
+        if (
+            not isinstance(event_type, str)
+            or not isinstance(run_id, str)
+            or not isinstance(raw_payload, dict)
+        ):
+            return None
+        try:
+            payload = cast(
+                dict[str, JsonValue],
+                json.loads(
+                    json.dumps(
+                        raw_payload,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                ),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        summary = event.get("result_summary") or event.get("input_summary")
+        if isinstance(summary, str):
+            payload.setdefault("summary", summary)
+        projected_type = (
+            "transaction.started" if event_type == "transaction.created" else event_type
+        )
+        raw_stream_id = payload.get("stream_id")
+        stream_id = raw_stream_id if isinstance(raw_stream_id, str) else None
+        payload.pop("stream_id", None)
+        return _ProjectedTraceEvent(
+            event_type=projected_type,
+            payload=payload,
+            run_id=run_id,
+            stream_id=stream_id,
         )
 
     @staticmethod

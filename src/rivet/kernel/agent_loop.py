@@ -6,9 +6,8 @@ import asyncio
 import hashlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from decimal import Decimal
 
 from rivet.contracts.messages import Message, ToolMessage
 from rivet.contracts.provider import (
@@ -31,6 +30,7 @@ from rivet.kernel.model_provider import ModelProvider
 
 Clock = Callable[[], datetime]
 MonotonicClock = Callable[[], float]
+ContextGatherer = Callable[[AgentTask], Awaitable[tuple[Message, ...]]]
 
 
 class _RunCancelled(Exception):
@@ -46,11 +46,13 @@ class AgentLoop:
         *,
         tools: tuple[AgentTool, ...],
         config: AgentLoopConfig | None = None,
+        context_gatherer: ContextGatherer | None = None,
         clock: Clock | None = None,
         monotonic: MonotonicClock = time.monotonic,
     ) -> None:
         self._provider = provider
         self._config = config or AgentLoopConfig()
+        self._context_gatherer = context_gatherer
         self._clock = clock or (lambda: datetime.now(UTC))
         self._monotonic = monotonic
         self._tools = {tool.definition.name: tool for tool in tools}
@@ -65,12 +67,12 @@ class AgentLoop:
     ) -> AgentLoopResult:
         """运行至本地成功条件或任一失败关闭条件。"""
         messages: list[Message] = list(task.messages)
-        round_count = 0
-        tool_call_count = 0
-        prompt_tokens = 0
-        completion_tokens = 0
-        reasoning_tokens = 0
-        total_cost = Decimal(0)
+        round_count = task.initial_round_count
+        tool_call_count = task.initial_tool_call_count
+        prompt_tokens = task.initial_prompt_tokens
+        completion_tokens = task.initial_completion_tokens
+        reasoning_tokens = task.initial_reasoning_tokens
+        total_cost = task.initial_cost_usd
         started_at = self._monotonic()
         last_action_fingerprint: str | None = None
         consecutive_repeats = 0
@@ -111,6 +113,52 @@ class AgentLoop:
         transition(AgentLoopState.RECEIVE)
         transition(AgentLoopState.UNDERSTAND)
         transition(AgentLoopState.GATHER_CONTEXT)
+        if round_count >= self._config.max_rounds:
+            return result(
+                AgentLoopState.FAILED,
+                AgentTerminationReason.MAX_ROUNDS_EXCEEDED,
+            )
+        if prompt_tokens + completion_tokens >= self._config.max_total_tokens:
+            return result(
+                AgentLoopState.FAILED,
+                AgentTerminationReason.TOKEN_BUDGET_EXCEEDED,
+            )
+        if (
+            self._config.max_cost_usd is not None
+            and total_cost >= self._config.max_cost_usd
+        ):
+            return result(
+                AgentLoopState.FAILED,
+                AgentTerminationReason.COST_BUDGET_EXCEEDED,
+            )
+        if self._context_gatherer is not None:
+            if cancel_event is not None and cancel_event.is_set():
+                return result(
+                    AgentLoopState.CANCELLED,
+                    AgentTerminationReason.USER_CANCELLED,
+                )
+            try:
+                gathered = await self._gather_context_with_limits(
+                    task,
+                    cancel_event=cancel_event,
+                    timeout_seconds=self._config.max_wall_seconds,
+                )
+            except _RunCancelled:
+                return result(
+                    AgentLoopState.CANCELLED,
+                    AgentTerminationReason.USER_CANCELLED,
+                )
+            except TimeoutError:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.WALL_TIME_EXCEEDED,
+                )
+            except Exception:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.CONTEXT_FAILED,
+                )
+            messages.extend(gathered)
         transition(AgentLoopState.PLAN)
         while True:
             transition(AgentLoopState.PREPARE)
@@ -129,6 +177,19 @@ class AgentLoop:
                 return result(
                     AgentLoopState.FAILED,
                     AgentTerminationReason.MAX_ROUNDS_EXCEEDED,
+                )
+            if prompt_tokens + completion_tokens >= self._config.max_total_tokens:
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.TOKEN_BUDGET_EXCEEDED,
+                )
+            if (
+                self._config.max_cost_usd is not None
+                and total_cost >= self._config.max_cost_usd
+            ):
+                return result(
+                    AgentLoopState.FAILED,
+                    AgentTerminationReason.COST_BUDGET_EXCEEDED,
                 )
 
             request = ModelRequest(
@@ -318,6 +379,51 @@ class AgentLoop:
             if not provider_task.done():
                 provider_task.cancel()
                 await asyncio.gather(provider_task, return_exceptions=True)
+            if cancel_task is not None:
+                cancel_task.cancel()
+                await asyncio.gather(cancel_task, return_exceptions=True)
+
+    async def _gather_context_with_limits(
+        self,
+        task: AgentTask,
+        *,
+        cancel_event: asyncio.Event | None,
+        timeout_seconds: float,
+    ) -> tuple[Message, ...]:
+        """让上下文获取与模型和工具共享取消、墙钟失败关闭语义。"""
+        if self._context_gatherer is None:
+            return ()
+
+        async def invoke_gatherer() -> tuple[Message, ...]:
+            """把通用 Awaitable 收窄为 asyncio 可调度协程。"""
+            if self._context_gatherer is None:
+                return ()
+            return await self._context_gatherer(task)
+
+        gather_task = asyncio.create_task(invoke_gatherer())
+        cancel_task = (
+            asyncio.create_task(cancel_event.wait())
+            if cancel_event is not None
+            else None
+        )
+        waiters: set[asyncio.Task[object]] = {gather_task}
+        if cancel_task is not None:
+            waiters.add(cancel_task)
+        try:
+            done, _ = await asyncio.wait(
+                waiters,
+                timeout=max(0.0, timeout_seconds),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if gather_task in done:
+                return await gather_task
+            if cancel_task is not None and cancel_task in done:
+                raise _RunCancelled
+            raise TimeoutError
+        finally:
+            if not gather_task.done():
+                gather_task.cancel()
+                await asyncio.gather(gather_task, return_exceptions=True)
             if cancel_task is not None:
                 cancel_task.cancel()
                 await asyncio.gather(cancel_task, return_exceptions=True)

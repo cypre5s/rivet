@@ -47,6 +47,7 @@ class AgentTerminationReason(StrEnum):
     TOOL_VALIDATION_FAILED = "tool_validation_failed"
     TOOL_EXECUTION_FAILED = "tool_execution_failed"
     PROVIDER_FAILED = "provider_failed"
+    CONTEXT_FAILED = "context_failed"
     INVALID_MODEL_RESPONSE = "invalid_model_response"
 
 
@@ -91,6 +92,12 @@ class AgentTask:
     session_id: SessionId
     messages: tuple[Message, ...]
     model: str
+    initial_round_count: int = 0
+    initial_tool_call_count: int = 0
+    initial_prompt_tokens: int = 0
+    initial_completion_tokens: int = 0
+    initial_reasoning_tokens: int = 0
+    initial_cost_usd: Decimal = Decimal(0)
 
     def __post_init__(self) -> None:
         """要求任务至少包含一条消息和明确模型。"""
@@ -98,6 +105,15 @@ class AgentTask:
             raise ValueError("AgentTask 至少需要一条消息")
         if not self.model:
             raise ValueError("AgentTask 必须指定模型")
+        counters = (
+            self.initial_round_count,
+            self.initial_tool_call_count,
+            self.initial_prompt_tokens,
+            self.initial_completion_tokens,
+            self.initial_reasoning_tokens,
+        )
+        if any(value < 0 for value in counters) or self.initial_cost_usd < 0:
+            raise ValueError("AgentTask 恢复计数不得为负数")
 
 
 @dataclass(frozen=True, slots=True)

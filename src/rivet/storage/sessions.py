@@ -8,6 +8,7 @@ import json
 import os
 import re
 import tempfile
+from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Literal, Self, cast
@@ -28,6 +29,7 @@ from rivet.contracts.common import (
     ToolCallId,
     TransactionId,
 )
+from rivet.contracts.messages import Message
 
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
 SESSION_ID_PATTERN = re.compile(r"^session_[a-z0-9][a-z0-9_-]{0,62}$")
@@ -52,6 +54,15 @@ class SessionStatus(StrEnum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     INTERRUPTED = "INTERRUPTED"
+
+
+class SessionStage(StrEnum):
+    """区分可续跑 Agent、待验证事务和只读终态元数据。"""
+
+    AGENT_LOOP = "AGENT_LOOP"
+    PATCH_FINALIZATION = "PATCH_FINALIZATION"
+    VERIFICATION = "VERIFICATION"
+    TERMINAL = "TERMINAL"
 
 
 class ToolRecoveryStatus(StrEnum):
@@ -91,6 +102,16 @@ class SessionCheckpoint(ContractModel):
     command: CommandName
     query: NonEmptyText
     status: SessionStatus
+    stage: SessionStage = SessionStage.AGENT_LOOP
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+    messages: tuple[Message, ...] = Field(default=(), max_length=1_024)
+    termination_reason: str | None = Field(default=None, max_length=128)
+    round_count: int = Field(default=0, ge=0)
+    tool_call_count: int = Field(default=0, ge=0)
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
+    cost_usd: Decimal = Field(default=Decimal(0), ge=0)
     provider_state: JsonValue | None = None
     pending_tools: tuple[PendingToolCall, ...] = Field(default=(), max_length=256)
 
@@ -204,6 +225,16 @@ class SessionStore:
             command=checkpoint.command,
             query=checkpoint.query,
             status=SessionStatus.INTERRUPTED,
+            stage=checkpoint.stage,
+            model=checkpoint.model,
+            messages=checkpoint.messages,
+            termination_reason=checkpoint.termination_reason,
+            round_count=checkpoint.round_count,
+            tool_call_count=checkpoint.tool_call_count,
+            prompt_tokens=checkpoint.prompt_tokens,
+            completion_tokens=checkpoint.completion_tokens,
+            reasoning_tokens=checkpoint.reasoning_tokens,
+            cost_usd=checkpoint.cost_usd,
             provider_state=checkpoint.provider_state,
             pending_tools=pending_tools,
         )

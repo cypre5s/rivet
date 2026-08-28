@@ -85,6 +85,7 @@ def acceptance_spec(
         expected_behaviors=(expected_behavior,),
         preserved_behaviors=("主工作区在验证前保持不变",),
         verification_commands=(("git", "diff", "--check"),),
+        behavior_verification_commands=(("git", "diff", "--check"),),
         max_wall_seconds=120,
         max_tokens=2_000,
         max_tool_calls=20,

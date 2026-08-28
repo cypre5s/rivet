@@ -63,6 +63,7 @@ def test_project_configuration_is_parsed_but_requires_explicit_confirmation(
         """
 schema_version = 1
 [verification]
+acceptance = [["python", "acceptance.py"]]
 targeted = [["python", "target.py"]]
 related = [["python", "related.py"]]
 regression = [["python", "regression.py"]]
@@ -87,6 +88,7 @@ static = [["python", "-m", "compileall", "src"]]
 
     assert not any(step.command[-1] == "regression.py" for step in unconfirmed.steps)
     assert any(step.command[-1] == "regression.py" for step in confirmed.steps)
+    assert any(step.command[-1] == "acceptance.py" for step in confirmed.steps)
     assert {step.kind for step in confirmed.steps} == set(VerificationKind)
 
 

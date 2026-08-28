@@ -390,6 +390,7 @@ async def _run_in_transaction(
         expected_behaviors=(fixture.task.fixed_value,),
         preserved_behaviors=("支持文件保持不变",),
         verification_commands=(verifier_command,),
+        behavior_verification_commands=(verifier_command,),
         max_wall_seconds=60,
         max_tokens=8_000,
         max_tool_calls=8,

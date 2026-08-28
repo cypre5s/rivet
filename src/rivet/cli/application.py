@@ -14,13 +14,19 @@ from typing import cast
 
 from rivet.cli.config import ConfigOverrides, ResolvedConfig, load_config
 from rivet.cli.doctor import DoctorSection, doctor_json, inspect_doctor, render_doctor
-from rivet.cli.errors import CliConfigurationError, CliError
+from rivet.cli.errors import CliConfigurationError, CliError, CliSecurityError
 from rivet.cli.exit_codes import ExitCode
-from rivet.cli.modules import module_status_mapping
+from rivet.cli.modules import load_module_status_mapping
 from rivet.cli.parser import build_internal_parser, build_parser
 from rivet.storage.git_exclude import configure_runtime_excludes
 from rivet.storage.ownership import SafeCleaner
-from rivet.storage.sessions import SessionStore
+from rivet.storage.sessions import (
+    SessionCheckpoint,
+    SessionStage,
+    SessionStatus,
+    SessionStore,
+    ToolRecoveryStatus,
+)
 from rivet.trace.paths import RuntimePaths
 
 PROJECT_CONFIG = """schema_version = 1
@@ -29,6 +35,7 @@ PROJECT_CONFIG = """schema_version = 1
 safe_mode = false
 
 [verification]
+acceptance = []
 targeted = []
 related = []
 regression = []
@@ -107,7 +114,15 @@ def _dispatch(
         _print_payload(payload, json_output=json_output)
         return int(ExitCode.SUCCESS)
     if command == "modules":
-        _print_payload(module_status_mapping(), json_output=json_output)
+        _print_payload(
+            asyncio.run(
+                load_module_status_mapping(
+                    repository,
+                    safe_mode=config.safe_mode,
+                )
+            ),
+            json_output=json_output,
+        )
         return int(ExitCode.SUCCESS)
     if command == "doctor":
         section = cast(DoctorSection, arguments.section)
@@ -121,7 +136,14 @@ def _dispatch(
         _print_payload(report.public_mapping(), json_output=json_output)
         return int(ExitCode.SUCCESS)
     if command == "read":
-        return asyncio.run(_read_file(arguments, repository, json_output=json_output))
+        return asyncio.run(
+            _read_file(
+                arguments,
+                repository,
+                safe_mode=config.safe_mode,
+                json_output=json_output,
+            )
+        )
     if command == "trace":
         from rivet.trace.cli import run_trace_command
 
@@ -131,7 +153,15 @@ def _dispatch(
             json_output=json_output,
         )
     if command == "resume":
-        return asyncio.run(_resume(arguments, repository, json_output=json_output))
+        return asyncio.run(
+            _resume(
+                arguments,
+                repository,
+                config=config,
+                environment=environment,
+                json_output=json_output,
+            )
+        )
     if command == "benchmark":
         return _benchmark(arguments, repository)
     if command in {"ask", "plan", "fix"}:
@@ -155,6 +185,7 @@ def _dispatch(
                 arguments,
                 repository=repository,
                 json_output=json_output,
+                safe_mode=config.safe_mode,
             )
         )
     raise CliConfigurationError(
@@ -212,12 +243,15 @@ async def _read_file(
     arguments: Namespace,
     repository: Path,
     *,
+    safe_mode: bool,
     json_output: bool,
 ) -> int:
     """调用统一 ReaderService 并保证资源域归零。"""
+    from rivet.cli.runtime import create_cli_kernel, module_scope, shutdown_cli_kernel
     from rivet.contracts.readers import ReaderRequest, ReaderStatus
-    from rivet.kernel.resources import ResourceScope
-    from rivet.readers.service import ReaderService
+    from rivet.kernel.errors import KernelError, SafeModeViolationError
+    from rivet.kernel.module_runtime import ModuleLease
+    from rivet.tools.paths import WorkspaceBoundary
 
     source_argument = cast(Path, arguments.file)
     source = (
@@ -233,13 +267,41 @@ async def _read_file(
             "读取路径不属于授权仓库",
             "选择仓库内文件后重试",
         ) from error
-    scope = ResourceScope("reader.cli")
+    boundary = WorkspaceBoundary(repository)
+    kernel = create_cli_kernel(repository, safe_mode=safe_mode)
+    leases: list[ModuleLease] = []
     try:
-        result = await ReaderService(repository, scope=scope).read(
-            ReaderRequest(source_path=source_path)
+        await kernel.start()
+        detection_lease = await kernel.acquire_lease("reader.detect")
+        leases.append(detection_lease)
+        from rivet.readers.detection import detect_file
+
+        inspection = detect_file(
+            boundary.resolve_repository(source_path, require_file=True),
+            source_path=source_path,
         )
+        lease = await kernel.acquire_lease(inspection.capability_id)
+        leases.append(lease)
+        from rivet.readers.service import ReaderService
+
+        result = await ReaderService(
+            repository,
+            scope=module_scope(lease.instance),
+        ).read(ReaderRequest(source_path=source_path))
+    except SafeModeViolationError as error:
+        raise CliSecurityError(
+            "module.safe_mode_denied",
+            "Safe Mode 不允许激活该 Reader 模块",
+            "改用受支持的基础格式，或审查配置后关闭 Safe Mode",
+        ) from error
+    except KernelError as error:
+        raise CliConfigurationError(
+            "module.reader_unavailable",
+            "Reader 模块无法安全激活",
+            "运行 rivet modules 和 rivet doctor 检查模块状态",
+        ) from error
     finally:
-        await scope.close()
+        await shutdown_cli_kernel(kernel, leases)
     if json_output:
         print(result.model_dump_json())
     else:
@@ -255,9 +317,11 @@ async def _resume(
     arguments: Namespace,
     repository: Path,
     *,
+    config: ResolvedConfig,
+    environment: Mapping[str, str],
     json_output: bool,
 ) -> int:
-    """恢复 checkpoint 事实但绝不自动重放 UNKNOWN 写操作。"""
+    """续跑安全 Agent 阶段，并拒绝自动重放结果未知的工具调用。"""
     session_id = cast(str, arguments.session_id)
     try:
         checkpoint = SessionStore(repository).resume(session_id)
@@ -273,6 +337,84 @@ async def _resume(
             "会话 checkpoint 无法验证",
             "保留现场并检查本地状态完整性",
         ) from error
+    resumable_statuses = {
+        SessionStatus.INTERRUPTED,
+        SessionStatus.CANCELLED,
+        SessionStatus.FAILED,
+    }
+    if (
+        checkpoint.stage is SessionStage.AGENT_LOOP
+        and checkpoint.status in resumable_statuses
+        and checkpoint.model is not None
+        and checkpoint.messages
+    ):
+        unresolved_calls = _unresolved_tool_calls(checkpoint)
+        unsafe_pending = tuple(
+            tool
+            for tool in checkpoint.pending_tools
+            if tool.status in {ToolRecoveryStatus.RUNNING, ToolRecoveryStatus.UNKNOWN}
+        )
+        if unsafe_pending or unresolved_calls:
+            raise CliConfigurationError(
+                "resume.tool_outcome_unknown",
+                "会话含结果未知的工具调用，不能自动重放",
+                "检查 Trace 和事务 Diff 后 abort，或重新发起明确任务",
+            )
+        _require_credential(config)
+        from rivet.cli.model_commands import run_model_command
+
+        return await run_model_command(
+            arguments,
+            repository=repository,
+            config=config,
+            environment=environment,
+            json_output=json_output,
+            resume_checkpoint=checkpoint,
+        )
+    if (
+        checkpoint.stage is SessionStage.PATCH_FINALIZATION
+        and checkpoint.status in resumable_statuses | {SessionStatus.RUNNING}
+        and checkpoint.transaction_id is not None
+    ):
+        from rivet.cli.model_commands import run_model_command
+
+        return await run_model_command(
+            arguments,
+            repository=repository,
+            config=config,
+            environment=environment,
+            json_output=json_output,
+            resume_checkpoint=checkpoint,
+        )
+    if (
+        checkpoint.stage is SessionStage.VERIFICATION
+        and checkpoint.status in resumable_statuses
+        and checkpoint.transaction_id is not None
+    ):
+        from rivet.cli.transaction_commands import run_transaction_command
+
+        exit_code = await run_transaction_command(
+            Namespace(
+                command="verify",
+                transaction_id=checkpoint.transaction_id,
+            ),
+            repository=repository,
+            json_output=json_output,
+            safe_mode=config.safe_mode,
+        )
+        SessionStore(repository).save(
+            checkpoint.model_copy(
+                update={
+                    "stage": SessionStage.TERMINAL,
+                    "status": (
+                        SessionStatus.COMPLETED
+                        if exit_code == int(ExitCode.SUCCESS)
+                        else SessionStatus.FAILED
+                    ),
+                }
+            )
+        )
+        return exit_code
     trace_status = "MISSING"
     trace_event_count = 0
     from rivet.trace.errors import TraceError
@@ -332,6 +474,7 @@ async def _resume(
             for tool in checkpoint.pending_tools
         ],
         "provider_state_restored": checkpoint.provider_state is not None,
+        "resumable": False,
         "run_id": checkpoint.run_id,
         "session_id": checkpoint.session_id,
         "status": checkpoint.status.value,
@@ -342,6 +485,24 @@ async def _resume(
     }
     _print_payload(payload, json_output=json_output)
     return int(ExitCode.SUCCESS)
+
+
+def _unresolved_tool_calls(checkpoint: SessionCheckpoint) -> tuple[str, ...]:
+    """从消息历史推导没有 ToolMessage 回执的调用，防止副作用重放。"""
+    from rivet.contracts.messages import AssistantMessage, ToolMessage
+
+    completed = {
+        message.tool_call_id
+        for message in checkpoint.messages
+        if isinstance(message, ToolMessage)
+    }
+    return tuple(
+        call.tool_call_id
+        for message in checkpoint.messages
+        if isinstance(message, AssistantMessage)
+        for call in message.tool_calls
+        if call.tool_call_id not in completed
+    )
 
 
 def _benchmark(arguments: Namespace, repository: Path) -> int:

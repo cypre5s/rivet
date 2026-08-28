@@ -11,7 +11,12 @@ import httpx
 import pytest
 from pydantic import BaseModel, ConfigDict, JsonValue
 
-from rivet.contracts.messages import AssistantMessage, ProviderOpaqueState, UserMessage
+from rivet.contracts.messages import (
+    AssistantMessage,
+    ProviderOpaqueState,
+    SystemMessage,
+    UserMessage,
+)
 from rivet.contracts.provider import (
     ModelFinishReason,
     ModelRequest,
@@ -169,6 +174,79 @@ async def test_final_answer_completes_without_tools() -> None:
         AgentLoopState.VERIFY,
         AgentLoopState.COMPLETE,
     )
+
+
+@pytest.mark.asyncio
+async def test_context_gatherer_runs_inside_kernel_before_first_model_call() -> None:
+    provider = ScriptedProvider((_response(content="done"),))
+    gathered = SystemMessage(content="受限仓库上下文", created_at=NOW)
+
+    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
+        """返回由正式 Context 能力选择的测试消息。"""
+        return (gathered,)
+
+    loop = AgentLoop(
+        provider,
+        tools=(),
+        context_gatherer=gather_context,
+        clock=lambda: NOW,
+    )
+
+    result = await loop.run(_task())
+
+    assert result.state is AgentLoopState.COMPLETE
+    assert provider.requests[0].messages[-1] == gathered
+
+
+@pytest.mark.asyncio
+async def test_context_gatherer_failure_closes_before_provider_call() -> None:
+    provider = ScriptedProvider((_response(content="unused"),))
+
+    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
+        """模拟上下文能力稳定失败。"""
+        raise RuntimeError("fixture failure")
+
+    result = await AgentLoop(
+        provider,
+        tools=(),
+        context_gatherer=gather_context,
+        clock=lambda: NOW,
+    ).run(_task())
+
+    assert result.state is AgentLoopState.FAILED
+    assert result.termination_reason is AgentTerminationReason.CONTEXT_FAILED
+    assert provider.requests == []
+
+
+@pytest.mark.asyncio
+async def test_resumed_budget_exhaustion_stops_before_context_and_provider() -> None:
+    provider = ScriptedProvider((_response(content="unused"),))
+    context_called = False
+
+    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
+        """记录预算预检是否错误进入了上下文阶段。"""
+        nonlocal context_called
+        context_called = True
+        return ()
+
+    task = AgentTask(
+        run_id="run_agent_budget_resume",
+        session_id="session_agent_budget_resume",
+        messages=(UserMessage(content="continue", created_at=NOW),),
+        model="deepseek-v4-pro",
+        initial_prompt_tokens=10,
+    )
+    result = await AgentLoop(
+        provider,
+        tools=(),
+        config=AgentLoopConfig(max_total_tokens=10),
+        context_gatherer=gather_context,
+        clock=lambda: NOW,
+    ).run(task)
+
+    assert result.termination_reason is AgentTerminationReason.TOKEN_BUDGET_EXCEEDED
+    assert context_called is False
+    assert provider.requests == []
 
 
 @pytest.mark.asyncio

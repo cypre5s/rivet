@@ -48,6 +48,8 @@ def build_verification_matrix(
     external_commands = (
         *specification.baseline_reproduction,
         *specification.verification_commands,
+        *specification.behavior_verification_commands,
+        *configuration.acceptance,
         *configuration.targeted,
         *configuration.related,
         *configuration.regression,
@@ -65,12 +67,16 @@ def build_verification_matrix(
         commands: tuple[Command, ...],
         *,
         required: bool,
+        namespace: str = "",
     ) -> None:
         """为同类命令生成稳定且全局唯一的步骤 ID。"""
+        namespace_part = f"_{namespace}" if namespace else ""
         for index, command in enumerate(_unique_commands(commands), start=1):
             steps.append(
                 VerificationStep(
-                    step_id=f"verification_{kind.value.lower()}_{index:03d}",
+                    step_id=(
+                        f"verification_{kind.value.lower()}{namespace_part}_{index:03d}"
+                    ),
                     kind=kind,
                     name=name,
                     required=required,
@@ -102,6 +108,17 @@ def build_verification_matrix(
         "运行目标测试",
         (*specification.verification_commands, *configuration.targeted),
         required=True,
+    )
+    behavior_commands = (
+        *specification.behavior_verification_commands,
+        *configuration.acceptance,
+    )
+    add(
+        VerificationKind.TARGETED,
+        "运行独立行为验收",
+        behavior_commands,
+        required=bool(behavior_commands),
+        namespace="behavior",
     )
     related = configuration.related or (("rivet-internal", "related-unconfigured"),)
     add(

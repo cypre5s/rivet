@@ -13,15 +13,14 @@ from rivet.cli.errors import (
     CliVerificationError,
 )
 from rivet.cli.exit_codes import ExitCode
+from rivet.cli.runtime import create_cli_kernel, module_scope, shutdown_cli_kernel
 from rivet.contracts.transactions import TransactionRecord, TransactionState
-from rivet.kernel.resources import ResourceScope
+from rivet.kernel.errors import KernelError, SafeModeViolationError
+from rivet.kernel.module_runtime import ModuleLease
 from rivet.trace.paths import RuntimePaths
 from rivet.transaction.errors import TransactionError
-from rivet.transaction.manager import TransactionManager
 from rivet.transaction.store import TransactionStore
-from rivet.verify.detector import ProjectDetector
 from rivet.verify.errors import VerificationError
-from rivet.verify.service import VerificationService
 
 
 async def run_transaction_command(
@@ -29,13 +28,22 @@ async def run_transaction_command(
     *,
     repository: Path,
     json_output: bool,
+    safe_mode: bool = False,
 ) -> int:
     """执行一个事务命令并保证临时资源按状态清理或移交。"""
-    scope = ResourceScope("cli.transaction")
-    manager = TransactionManager(repository, scope=scope)
+    kernel = create_cli_kernel(repository, safe_mode=safe_mode)
+    leases: list[ModuleLease] = []
+    manager = None
     suspended = False
     registered_transaction_id: str | None = None
     try:
+        await kernel.start()
+        transaction_lease = await kernel.acquire_lease("transaction.worktree")
+        leases.append(transaction_lease)
+        scope = module_scope(transaction_lease.instance)
+        from rivet.transaction.manager import TransactionManager
+
+        manager = TransactionManager(repository, scope=scope)
         await manager.inspect_repository()
         store = _store(repository)
         transaction_id = _resolve_transaction_id(
@@ -57,6 +65,11 @@ async def run_transaction_command(
                 print(content.decode("utf-8", errors="replace"), end="")
             return int(ExitCode.SUCCESS)
         if command == "verify":
+            verify_lease = await kernel.acquire_lease("verify.deterministic")
+            leases.append(verify_lease)
+            from rivet.verify.detector import ProjectDetector
+            from rivet.verify.service import VerificationService
+
             record = store.load_record(transaction_id)
             if record.state is TransactionState.VERIFIED:
                 _verify_record_evidence(store, record)
@@ -82,7 +95,7 @@ async def run_transaction_command(
             detection = ProjectDetector().detect(repository)
             outcome = await VerificationService(
                 manager,
-                scope=scope,
+                scope=module_scope(verify_lease.instance),
                 project_configuration=detection.configuration,
                 configuration_confirmed=detection.configuration is not None,
             ).verify(transaction_id)
@@ -137,17 +150,35 @@ async def run_transaction_command(
             error.summary,
             "检查 Evidence 和冻结验收条件",
         ) from error
+    except SafeModeViolationError as error:
+        raise CliSecurityError(
+            "module.safe_mode_denied",
+            "Safe Mode 不允许执行事务命令",
+            "保持只读操作，或审查配置后关闭 Safe Mode",
+        ) from error
+    except KernelError as error:
+        raise CliVerificationError(
+            "module.transaction_unavailable",
+            "事务模块无法安全激活或关闭",
+            "运行 rivet modules 和 rivet doctor 检查模块状态",
+        ) from error
     finally:
-        if not suspended and registered_transaction_id is not None:
-            try:
-                manager.suspend(registered_transaction_id)
-            except TransactionError as error:
-                if error.code not in {
-                    "transaction.suspend_terminal",
-                    "transaction.worktree_missing",
-                }:
-                    raise
-        await scope.close()
+        try:
+            if (
+                manager is not None
+                and not suspended
+                and registered_transaction_id is not None
+            ):
+                try:
+                    manager.suspend(registered_transaction_id)
+                except TransactionError as error:
+                    if error.code not in {
+                        "transaction.suspend_terminal",
+                        "transaction.worktree_missing",
+                    }:
+                        raise
+        finally:
+            await shutdown_cli_kernel(kernel, leases)
 
 
 def _store(repository: Path) -> TransactionStore:

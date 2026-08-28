@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { resolveKeyCommand } from "./keymap.ts";
+import {
+  CTRL_C_EXIT_WINDOW_MS,
+  resolveCtrlCAction,
+  resolveKeyCommand,
+} from "./keymap.ts";
 
 describe("Rivet keymap", () => {
   test("maps the required global keys", () => {
@@ -27,6 +31,16 @@ describe("Rivet keymap", () => {
     );
     expect(resolveKeyCommand({ name: "escape", shift: false, ctrl: false })).toBe(
       "overlay.close",
+    );
+  });
+});
+
+describe("Ctrl+C lifecycle", () => {
+  test("cancels first and exits only on a prompt second press", () => {
+    expect(resolveCtrlCAction(null, 1000)).toBe("cancel");
+    expect(resolveCtrlCAction(1000, 1100)).toBe("exit");
+    expect(resolveCtrlCAction(1000, 1000 + CTRL_C_EXIT_WINDOW_MS + 1)).toBe(
+      "cancel",
     );
   });
 });

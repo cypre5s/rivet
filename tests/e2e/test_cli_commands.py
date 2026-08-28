@@ -96,6 +96,10 @@ def test_init_config_modules_doctor_and_clean_are_offline(
     for completed in (configured, modules, doctor, cleaned):
         assert completed.returncode == 0, completed.stderr
         cast(dict[str, object], json.loads(completed.stdout))
+    module_payload = cast(dict[str, object], json.loads(modules.stdout))
+    module_summary = cast(dict[str, object], module_payload["summary"])
+    assert module_payload["source"] == "module_runtime"
+    assert module_summary["active"] == 0
     assert "credential_value" not in configured.stdout
 
 

@@ -38,8 +38,9 @@ class ProjectCommandCandidate:
 
 @dataclass(frozen=True, slots=True)
 class ProjectConfiguration:
-    """保存 `.rivet/project.toml` 中四类显式 argv。"""
+    """保存 `.rivet/project.toml` 中五类显式 argv。"""
 
+    acceptance: tuple[tuple[str, ...], ...] = ()
     targeted: tuple[tuple[str, ...], ...] = ()
     related: tuple[tuple[str, ...], ...] = ()
     regression: tuple[tuple[str, ...], ...] = ()
@@ -193,13 +194,20 @@ class ProjectDetector:
                 "verification 必须是 TOML 表",
             )
         verification = cast(dict[str, object], raw_verification)
-        allowed_groups = {"targeted", "related", "regression", "static"}
+        allowed_groups = {
+            "acceptance",
+            "targeted",
+            "related",
+            "regression",
+            "static",
+        }
         if set(verification) - allowed_groups:
             raise VerificationError(
                 "verification.project_config_unknown_field",
                 "项目验证配置包含未知命令组",
             )
         return ProjectConfiguration(
+            acceptance=self._parse_commands(verification.get("acceptance", [])),
             targeted=self._parse_commands(verification.get("targeted", [])),
             related=self._parse_commands(verification.get("related", [])),
             regression=self._parse_commands(verification.get("regression", [])),

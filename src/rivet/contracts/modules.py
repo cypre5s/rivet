@@ -67,6 +67,7 @@ class ModuleManifest(ContractModel):
     activation: ActivationPolicy
     factory: FactoryPath
     enabled: bool = True
+    safe_mode_allowed: bool = False
     priority: int = 0
     provides: tuple[CapabilityId, ...] = Field(min_length=1)
     requires: tuple[ModuleId, ...] = ()

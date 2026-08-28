@@ -115,4 +115,25 @@ describe("Rivet OpenTUI workbench", () => {
     expect(decisions).toEqual([["request_permission", true]]);
     await act(async () => setup.renderer.destroy());
   });
+
+  test("exits safely only after the second prompt Ctrl+C", async () => {
+    let exitCount = 0;
+    const setup = await testRender(
+      <RivetApp
+        initialState={initialRivetState()}
+        noColor={true}
+        onExit={() => exitCount++}
+      />,
+      { width: 80, height: 24, exitOnCtrlC: false },
+    );
+    await setup.renderOnce();
+
+    await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
+    expect(exitCount).toBe(0);
+    await Bun.sleep(20);
+    await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
+    expect(exitCount).toBe(1);
+
+    await act(async () => setup.renderer.destroy());
+  });
 });

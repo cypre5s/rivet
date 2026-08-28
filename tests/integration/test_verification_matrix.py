@@ -8,6 +8,7 @@ import pytest
 
 from rivet.contracts.transactions import TransactionState
 from rivet.contracts.verification import VerificationKind, VerificationStatus
+from rivet.transaction.errors import TransactionError
 from rivet.verify.detector import ProjectConfiguration
 from tests.fixtures.verification.cases import (
     VERIFICATION_CASES,
@@ -106,6 +107,44 @@ async def test_missing_required_tool_produces_inconclusive_verdict(
         if result.step.kind is VerificationKind.ENVIRONMENT
     )
     assert environment.status is VerificationStatus.INCONCLUSIVE
+
+    await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
+    prepared.scope.assert_empty()
+    await prepared.scope.close()
+
+
+@pytest.mark.asyncio
+async def test_old_test_only_cannot_release_hardcoded_patch(tmp_path: Path) -> None:
+    case = VerificationFixtureCase(
+        case_id="old_test_trap",
+        implementation="def transform(value: int) -> int:\n    return 4\n",
+        expected_status=VerificationStatus.INCONCLUSIVE,
+        baseline_script="check_target.py",
+        targeted_script="check_target.py",
+    )
+    python_command = ("python", "check_target.py")
+    prepared = await run_verification_case(
+        tmp_path,
+        case,
+        behavior_verification_commands=(),
+        project_configuration=ProjectConfiguration(
+            related=(python_command,),
+            regression=(python_command,),
+            static=(("python", "-m", "compileall", "-q", "app.py"),),
+        ),
+    )
+
+    acceptance = next(
+        result
+        for result in prepared.outcome.verdict.results
+        if result.step.kind is VerificationKind.ACCEPTANCE
+    )
+    assert prepared.outcome.verdict.status is VerificationStatus.INCONCLUSIVE
+    assert prepared.outcome.verdict.passed is False
+    assert acceptance.status is VerificationStatus.INCONCLUSIVE
+    assert prepared.outcome.transaction.state is TransactionState.REJECTED
+    with pytest.raises(TransactionError, match="只有 VERIFIED"):
+        await prepared.manager.apply(prepared.outcome.transaction.transaction_id)
 
     await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
     prepared.scope.assert_empty()

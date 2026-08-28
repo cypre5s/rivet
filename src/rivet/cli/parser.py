@@ -99,6 +99,11 @@ def build_parser() -> ArgumentParser:
 
     resume_parser = subparsers.add_parser("resume", help="恢复持久化会话")
     resume_parser.add_argument("session_id")
+    resume_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="重新批准中断 fix 的事务写入与验证",
+    )
     _add_runtime_aliases(resume_parser)
 
     modules_parser = subparsers.add_parser("modules", help="查看按需模块状态")

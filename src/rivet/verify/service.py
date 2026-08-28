@@ -574,11 +574,17 @@ class VerificationService:
             for draft in prior_drafts
             if draft.step.kind is VerificationKind.BASELINE
         )
-        expected = tuple(
+        targeted = tuple(
             draft
             for draft in prior_drafts
             if draft.step.kind
             in {VerificationKind.REPRODUCTION, VerificationKind.TARGETED}
+        )
+        behavior = tuple(
+            draft
+            for draft in prior_drafts
+            if draft.step.kind is VerificationKind.TARGETED
+            and draft.step.name == "运行独立行为验收"
         )
         preserved = tuple(
             draft
@@ -588,7 +594,7 @@ class VerificationService:
             and draft.step.required
         )
         dependency_status = _aggregate_status(
-            tuple(draft.status for draft in (*baseline, *expected, *preserved))
+            tuple(draft.status for draft in (*baseline, *targeted, *preserved))
         )
         baseline_reproduced = any(
             draft.status is VerificationStatus.PASSED
@@ -598,17 +604,20 @@ class VerificationService:
         overlap = set(context.acceptance.expected_behaviors) & set(
             context.acceptance.preserved_behaviors
         )
-        if dependency_status is not VerificationStatus.PASSED:
+        if not behavior:
+            status = VerificationStatus.INCONCLUSIVE
+        elif dependency_status is not VerificationStatus.PASSED:
             status = dependency_status
         elif not baseline_reproduced or overlap:
             status = VerificationStatus.FAILED
         else:
             status = VerificationStatus.PASSED
-        expected_ids = [draft.step.step_id for draft in expected]
+        expected_ids = [draft.step.step_id for draft in behavior]
         preserved_ids = [draft.step.step_id for draft in preserved]
         report: dict[str, object] = {
             "status": status.value,
             "baseline_reproduced": baseline_reproduced,
+            "independent_behavior_verifier_configured": bool(behavior),
             "expected_behavior_bindings": {
                 behavior: expected_ids
                 for behavior in context.acceptance.expected_behaviors

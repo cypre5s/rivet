@@ -9,6 +9,7 @@ import pytest
 from rivet.storage.sessions import (
     PendingToolCall,
     SessionCheckpoint,
+    SessionStage,
     SessionStatus,
     SessionStore,
     ToolRecoveryStatus,
@@ -54,6 +55,7 @@ def test_completed_session_resume_is_idempotent(tmp_path: Path) -> None:
         command="ask",
         query="解释",
         status=SessionStatus.COMPLETED,
+        stage=SessionStage.TERMINAL,
     )
     store.save(checkpoint)
 
@@ -62,6 +64,42 @@ def test_completed_session_resume_is_idempotent(tmp_path: Path) -> None:
 
     assert first == checkpoint
     assert second == checkpoint
+
+
+def test_session_store_roundtrips_messages_and_budget_for_continuation(
+    tmp_path: Path,
+) -> None:
+    from datetime import UTC, datetime
+
+    from rivet.contracts.messages import UserMessage
+
+    checkpoint = SessionCheckpoint(
+        session_id="session_resume_history",
+        run_id="run_resume_history",
+        command="ask",
+        query="继续分析",
+        status=SessionStatus.INTERRUPTED,
+        model="deepseek-v4-pro",
+        messages=(
+            UserMessage(
+                content="继续分析",
+                created_at=datetime(2026, 8, 28, tzinfo=UTC),
+            ),
+        ),
+        round_count=2,
+        tool_call_count=3,
+        prompt_tokens=100,
+        completion_tokens=20,
+    )
+    store = SessionStore(tmp_path)
+    store.save(checkpoint)
+
+    loaded = store.load(checkpoint.session_id)
+
+    assert loaded.messages == checkpoint.messages
+    assert loaded.round_count == 2
+    assert loaded.tool_call_count == 3
+    assert loaded.prompt_tokens + loaded.completion_tokens == 120
 
 
 def test_session_store_rejects_tamper_and_unknown_id(tmp_path: Path) -> None:

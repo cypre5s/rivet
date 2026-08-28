@@ -25,4 +25,14 @@ class ModuleInstance(Protocol):
         ...
 
 
+@runtime_checkable
+class ScopedModuleInstance(ModuleInstance, Protocol):
+    """向编排层暴露由 ModuleRuntime 独占管理的资源域。"""
+
+    @property
+    def resource_scope(self) -> ResourceScope:
+        """返回仅在模块处于活动期时有效的资源域。"""
+        ...
+
+
 ModuleFactory = Callable[[], ModuleInstance]

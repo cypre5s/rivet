@@ -51,6 +51,7 @@ class AcceptanceSpec(ContractModel):
     expected_behaviors: tuple[NonEmptyText, ...] = Field(min_length=1)
     preserved_behaviors: tuple[NonEmptyText, ...] = Field(min_length=1)
     verification_commands: tuple[Command, ...] = Field(min_length=1)
+    behavior_verification_commands: tuple[Command, ...] = ()
     max_wall_seconds: int = Field(gt=0)
     max_tokens: int = Field(gt=0)
     max_tool_calls: int = Field(gt=0)
@@ -68,7 +69,11 @@ class AcceptanceSpec(ContractModel):
         overlap = set(self.allowed_paths) & set(self.forbidden_paths)
         if overlap:
             raise ValueError("允许路径与禁止路径不得重叠")
-        all_commands = (*self.baseline_reproduction, *self.verification_commands)
+        all_commands = (
+            *self.baseline_reproduction,
+            *self.verification_commands,
+            *self.behavior_verification_commands,
+        )
         if any(not command for command in all_commands):
             raise ValueError("验收命令不得为空")
         return self

@@ -17,7 +17,7 @@ from rivet.ipc.command_application import (
     CommandExecution,
     CommandWorkerApplication,
 )
-from rivet.ipc.worker import WorkerMethodError
+from rivet.ipc.worker import EmitEvent, WorkerMethodError
 
 
 def _request(
@@ -38,7 +38,10 @@ async def test_ask_routes_to_json_cli_and_emits_result(tmp_path: Path) -> None:
     arguments: list[tuple[str, ...]] = []
     events: list[tuple[str, dict[str, JsonValue]]] = []
 
-    async def runner(argv: tuple[str, ...]) -> CommandExecution:
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
         """返回固定 CLI 成功结果。"""
         arguments.append(argv)
         return CommandExecution(
@@ -84,7 +87,10 @@ async def test_fix_waits_for_explicit_permission_then_adds_yes(
     events: list[tuple[str, dict[str, JsonValue]]] = []
     permission_ready = asyncio.Event()
 
-    async def runner(argv: tuple[str, ...]) -> CommandExecution:
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
         """记录最终 argv 并返回验证失败的隔离事务。"""
         arguments.append(argv)
         return CommandExecution(
@@ -146,7 +152,10 @@ async def test_fix_waits_for_explicit_permission_then_adds_yes(
 async def test_cli_error_is_classified_without_forwarding_stderr(
     tmp_path: Path,
 ) -> None:
-    async def runner(_argv: tuple[str, ...]) -> CommandExecution:
+    async def runner(
+        _argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
         """返回含分类字段和额外私有文本的 CLI 失败。"""
         return CommandExecution(
             3,
@@ -191,7 +200,14 @@ async def test_subprocess_output_is_drained_with_bounded_memory(
 
         async def run_probe(self, argv: tuple[str, ...]) -> CommandExecution:
             """运行固定测试 argv。"""
-            return await self._run_subprocess(argv)
+
+            async def discard(
+                _event_type: str,
+                _payload: dict[str, JsonValue],
+            ) -> None:
+                """丢弃探针事件。"""
+
+            return await self._run_subprocess(argv, discard)
 
     monkeypatch.setattr(command_application, "MAX_COMMAND_OUTPUT_BYTES", 64)
     application = ProbeApplication(
@@ -205,3 +221,55 @@ async def test_subprocess_output_is_drained_with_bounded_memory(
         )
 
     assert captured.value.code == "ipc.command_output_too_large"
+
+
+@pytest.mark.asyncio
+async def test_subprocess_trace_is_emitted_before_command_completion(
+    tmp_path: Path,
+) -> None:
+    class ProbeApplication(CommandWorkerApplication):
+        """只向测试暴露带实时 Trace 的默认 runner。"""
+
+        async def run_probe(
+            self,
+            argv: tuple[str, ...],
+            emit: EmitEvent,
+        ) -> CommandExecution:
+            """运行固定测试 argv。"""
+            return await self._run_subprocess(argv, emit)
+
+    event_seen = asyncio.Event()
+    events: list[str] = []
+
+    async def emit(
+        event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        """记录命令仍在运行时到达的投影事件。"""
+        events.append(event_type)
+        event_seen.set()
+
+    script = (
+        "import json,os,time; from pathlib import Path; "
+        "p=Path('.rivet/trace/events.ndjson'); p.parent.mkdir(parents=True); "
+        "e={'schema_version':1,'sequence':1,'event':"
+        "{'event_type':'context.selected','run_id':'run_stream_test',"
+        "'payload':{'path':'a.py','stream_id':os.environ['RIVET_STREAM_ID']},"
+        "'result_summary':'已选择上下文'}}; "
+        "p.write_text(json.dumps(e)+'\\n',encoding='utf-8'); "
+        "time.sleep(0.3); print('{}')"
+    )
+    application = ProbeApplication(
+        tmp_path,
+        environment={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+    running = asyncio.create_task(
+        application.run_probe((sys.executable, "-c", script), emit)
+    )
+
+    await asyncio.wait_for(event_seen.wait(), timeout=1)
+    assert not running.done()
+    execution = await running
+
+    assert execution.return_code == 0
+    assert events == ["context.selected"]

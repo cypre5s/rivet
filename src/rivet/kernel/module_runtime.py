@@ -78,6 +78,12 @@ class ActivationJournal:
     def _write(self, module_ids: set[str]) -> None:
         """通过同目录替换写入固定版本与稳定排序。"""
         self._validate_path()
+        if not module_ids:
+            try:
+                self.path.unlink(missing_ok=True)
+            except OSError as error:
+                raise ActivationJournalError("激活日志无法清除") from error
+            return
         temporary_path = self.path.with_name(f".{self.path.name}.tmp")
         payload = json.dumps(
             {
@@ -114,6 +120,21 @@ class _RuntimeModule:
     scope: ResourceScope | None = None
     lease_count: int = 0
     idle_task: asyncio.Task[None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ModuleRuntimeSnapshot:
+    """公开单个模块的实时状态、Lease 和资源事实。"""
+
+    module_id: str
+    state: ModuleState
+    activation: ActivationPolicy
+    safe_mode_allowed: bool
+    dependencies: tuple[str, ...]
+    capabilities: tuple[str, ...]
+    lease_count: int
+    resource_counts: ResourceCounts
+    quarantine_reason: str | None
 
 
 class ModuleLease:
@@ -222,6 +243,38 @@ class ModuleRuntime:
         if node is None:
             raise CapabilityNotFoundError(f"未知模块 {module_id}")
         return node.state
+
+    def snapshots(self) -> tuple[ModuleRuntimeSnapshot, ...]:
+        """按拓扑顺序返回当前运行时事实，不激活任何模块。"""
+        snapshots: list[ModuleRuntimeSnapshot] = []
+        for module_id in self._activation_order:
+            node = self._modules[module_id]
+            snapshots.append(
+                ModuleRuntimeSnapshot(
+                    module_id=module_id,
+                    state=node.state,
+                    activation=node.manifest.activation,
+                    safe_mode_allowed=node.manifest.safe_mode_allowed,
+                    dependencies=node.manifest.requires,
+                    capabilities=node.manifest.provides,
+                    lease_count=node.lease_count,
+                    resource_counts=(
+                        node.scope.counts()
+                        if node.scope is not None
+                        else ResourceCounts()
+                    ),
+                    quarantine_reason=(
+                        "上次激活未完成"
+                        if node.state is ModuleState.QUARANTINED
+                        else None
+                    ),
+                )
+            )
+        return tuple(snapshots)
+
+    def provider_module_id(self, capability_id: CapabilityId) -> ModuleId:
+        """只解析 capability 提供者标识，不触发 factory 导入。"""
+        return self._registry.provider_for(capability_id).module_id
 
     async def sleep_module(self, module_id: ModuleId) -> bool:
         """无 Lease 时休眠可选模块并回收其全部 scope 资源。"""
@@ -368,7 +421,11 @@ class ModuleRuntime:
     def _resolve_manifest(self, capability_id: CapabilityId) -> ModuleManifest:
         """应用 registry 与 Safe Mode 权限边界。"""
         manifest = self._registry.provider_for(capability_id)
-        if self.safe_mode and manifest.activation is not ActivationPolicy.REQUIRED:
+        if (
+            self.safe_mode
+            and manifest.activation is not ActivationPolicy.REQUIRED
+            and not manifest.safe_mode_allowed
+        ):
             raise SafeModeViolationError(
                 f"Safe Mode 不允许激活可选模块 {manifest.module_id}"
             )
@@ -447,13 +504,17 @@ class ModuleRuntime:
     def _validate_safe_mode_dependencies(self) -> None:
         """拒绝 required 模块通过依赖间接加载可选 factory。"""
         for manifest in self._manifest_by_id.values():
-            if manifest.activation is not ActivationPolicy.REQUIRED:
+            if (
+                manifest.activation is not ActivationPolicy.REQUIRED
+                and not manifest.safe_mode_allowed
+            ):
                 continue
             optional_dependencies = [
                 dependency_id
                 for dependency_id in self._dependency_closure(manifest.module_id)
                 if self._manifest_by_id[dependency_id].activation
                 is not ActivationPolicy.REQUIRED
+                and not self._manifest_by_id[dependency_id].safe_mode_allowed
             ]
             if optional_dependencies:
                 raise ModuleDependencyError(

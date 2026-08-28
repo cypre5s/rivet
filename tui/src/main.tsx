@@ -27,7 +27,11 @@ let recovering = false;
 const renderApplication = () => {
   root.render(
     <KeymapProvider keymap={keymap}>
-      <RivetApp client={client} onRecover={() => void recoverWorker()} />
+      <RivetApp
+        client={client}
+        onRecover={() => void recoverWorker()}
+        onExit={() => void shutdown()}
+      />
     </KeymapProvider>,
   );
 };
