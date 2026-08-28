@@ -17,6 +17,7 @@ export function SessionScreen({
   theme,
   composer,
   selectedContextFiles,
+  selectedModuleIndex,
 }: {
   state: RivetState;
   mode: WorkMode;
@@ -26,6 +27,7 @@ export function SessionScreen({
   theme: RivetTheme;
   composer: ReactNode;
   selectedContextFiles: string[];
+  selectedModuleIndex: number;
 }) {
   return (
     <box flexGrow={1} flexDirection="column" backgroundColor={theme.background}>
@@ -37,6 +39,7 @@ export function SessionScreen({
             panel={openPanel}
             state={state}
             selectedContextFiles={selectedContextFiles}
+            selectedModuleIndex={selectedModuleIndex}
             presentation={layout.panelPresentation}
             theme={theme}
           />
@@ -50,6 +53,7 @@ export function SessionScreen({
           panel={openPanel}
           state={state}
           selectedContextFiles={selectedContextFiles}
+          selectedModuleIndex={selectedModuleIndex}
           presentation={layout.panelPresentation}
           theme={theme}
         />

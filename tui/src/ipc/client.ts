@@ -38,7 +38,13 @@ export interface WorkerClientOptions {
 }
 
 export class WorkerResponseError extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(
+    readonly code: string,
+    message: string,
+    readonly nextAction: string,
+    readonly retryable: boolean,
+    readonly traceEventId: string | null,
+  ) {
     super(message);
     this.name = "WorkerResponseError";
   }
@@ -203,6 +209,9 @@ export class WorkerClient {
       new WorkerResponseError(
         response.error?.code ?? "ipc.response_invalid",
         response.error?.summary ?? "worker request failed",
+        response.error?.next_action ?? "刷新状态后重试",
+        response.error?.retryable ?? false,
+        response.error?.trace_event_id ?? null,
       ),
     );
   }

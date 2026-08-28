@@ -7,6 +7,7 @@ import { COMMAND_REGISTRY } from "../ui/command-registry.ts";
 import { searchCommands } from "../ui/command-search.ts";
 import {
   commandArgumentCompletions,
+  moduleCommandUnavailableReason,
   slashQuery,
   type CommandArgumentRequest,
 } from "../ui/commands.ts";
@@ -96,21 +97,23 @@ export function useCommandOptions({
         transactions:
           state.transaction === "无" ? [] : [state.transaction],
         modules: state.modules,
+        moduleStatuses: state.moduleStatuses,
         files,
         contextFiles,
       },
     ).map((value) => {
-      const unavailableModuleMutation =
-        topOverlay.commandName === "modules" && value.includes(" ");
+      const unavailableReason =
+        topOverlay.commandName === "modules"
+          ? moduleCommandUnavailableReason(value, state.moduleStatuses)
+          : null;
       return {
         id: value,
         title: value,
-        ...(unavailableModuleMutation
-          ? {
-              available: false,
-              description: "当前 CLI 仅支持查看；生命周期由 Kernel 按需管理",
-            }
-          : {}),
+        ...(unavailableReason === null
+          ? topOverlay.commandName === "modules" && /^(disable|sleep)\b/.test(value)
+            ? { description: "高影响操作 · 执行前需要确认" }
+            : {}
+          : { available: false, description: unavailableReason }),
       };
     });
   }, [
@@ -118,6 +121,7 @@ export function useCommandOptions({
     contextFiles,
     files,
     state.modules,
+    state.moduleStatuses,
     state.sessions,
     state.transaction,
     topOverlay,

@@ -103,6 +103,132 @@ def test_init_config_modules_doctor_and_clean_are_offline(
     assert "credential_value" not in configured.stdout
 
 
+def test_module_lifecycle_cli_persists_policy_and_uses_stable_exit_codes(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    listed = _run(tmp_path, repository, "modules", "list", "--json")
+    shown = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "show",
+        "context.lsp",
+        "--json",
+    )
+    blocked = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "disable",
+        "context.syntax",
+        "--json",
+    )
+    disabled = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "disable",
+        "context.lsp",
+        "--json",
+    )
+    persisted = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "show",
+        "context.lsp",
+        "--json",
+    )
+    refused_wake = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "wake",
+        "context.lsp",
+        "--json",
+    )
+    enabled = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "enable",
+        "context.lsp",
+        "--json",
+    )
+    woken = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "wake",
+        "context.lsp",
+        "--json",
+    )
+    slept = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "sleep",
+        "context.lsp",
+        "--json",
+    )
+    disabled_again = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "disable",
+        "context.lsp",
+        "--json",
+    )
+    missing = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "show",
+        "unknown.module",
+        "--json",
+    )
+    invalid_timeout = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "sleep",
+        "context.lsp",
+        "--timeout",
+        "-1",
+    )
+
+    assert listed.returncode == 0, listed.stderr
+    assert shown.returncode == 0, shown.stderr
+    assert blocked.returncode == 5
+    assert "module.active_dependents" in blocked.stderr
+    assert disabled.returncode == 0, disabled.stderr
+    persisted_module = cast(
+        dict[str, object],
+        cast(dict[str, object], json.loads(persisted.stdout))["module"],
+    )
+    assert persisted_module["persisted_override"] is False
+    assert persisted_module["effective_enabled"] is False
+    assert refused_wake.returncode == 5
+    assert "module.dependency_disabled" in refused_wake.stderr
+    assert enabled.returncode == 0, enabled.stderr
+    assert cast(dict[str, object], json.loads(enabled.stdout))["current_state"] == (
+        "INACTIVE"
+    )
+    assert woken.returncode == 0, woken.stderr
+    assert cast(dict[str, object], json.loads(woken.stdout))["current_state"] == (
+        "ACTIVE"
+    )
+    assert slept.returncode == 0, slept.stderr
+    assert disabled_again.returncode == 0, disabled_again.stderr
+    assert missing.returncode == 3
+    assert "module.not_found" in missing.stderr
+    assert invalid_timeout.returncode == 2
+    assert "module.input_invalid" in invalid_timeout.stderr
+
+
 def test_model_command_without_key_is_classified_without_traceback(
     tmp_path: Path,
 ) -> None:

@@ -74,6 +74,31 @@ def test_apply_requires_transaction_id() -> None:
     assert captured.value.code == 2
 
 
+def test_modules_parser_exposes_lifecycle_operations_and_safety_options() -> None:
+    arguments = build_parser().parse_args(
+        (
+            "modules",
+            "disable",
+            "context.syntax",
+            "--cascade",
+            "--wait",
+            "--timeout",
+            "12",
+            "--yes",
+            "--json",
+        )
+    )
+
+    assert arguments.command == "modules"
+    assert arguments.module_command == "disable"
+    assert arguments.module_id == "context.syntax"
+    assert arguments.cascade is True
+    assert arguments.wait is True
+    assert arguments.timeout == 12
+    assert arguments.yes is True
+    assert arguments.json_output is True
+
+
 def test_internal_worker_uses_separate_hidden_parser() -> None:
     arguments = build_internal_parser().parse_args(("worker", "--stdio"))
 

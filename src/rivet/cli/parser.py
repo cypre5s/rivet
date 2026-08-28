@@ -106,8 +106,33 @@ def build_parser() -> ArgumentParser:
     )
     _add_runtime_aliases(resume_parser)
 
-    modules_parser = subparsers.add_parser("modules", help="查看按需模块状态")
+    modules_parser = subparsers.add_parser("modules", help="查看或控制按需模块")
     _add_runtime_aliases(modules_parser)
+    module_subparsers = modules_parser.add_subparsers(dest="module_command")
+    module_list_parser = module_subparsers.add_parser("list", help="列出模块状态")
+    _add_runtime_aliases(module_list_parser)
+    module_show_parser = module_subparsers.add_parser("show", help="查看模块详情")
+    module_show_parser.add_argument("module_id")
+    _add_runtime_aliases(module_show_parser)
+    module_enable_parser = module_subparsers.add_parser("enable", help="持久化启用模块")
+    module_enable_parser.add_argument("module_id")
+    module_enable_parser.add_argument("--with-dependencies", action="store_true")
+    _add_runtime_aliases(module_enable_parser)
+    module_wake_parser = module_subparsers.add_parser("wake", help="唤醒模块")
+    module_wake_parser.add_argument("module_id")
+    module_wake_parser.add_argument("--with-dependencies", action="store_true")
+    _add_runtime_aliases(module_wake_parser)
+    for operation, description in (
+        ("sleep", "安全休眠模块"),
+        ("disable", "安全休眠并持久化禁用模块"),
+    ):
+        lifecycle_parser = module_subparsers.add_parser(operation, help=description)
+        lifecycle_parser.add_argument("module_id")
+        lifecycle_parser.add_argument("--cascade", action="store_true")
+        lifecycle_parser.add_argument("--wait", action="store_true")
+        lifecycle_parser.add_argument("--timeout", type=float, default=30.0)
+        lifecycle_parser.add_argument("--yes", action="store_true")
+        _add_runtime_aliases(lifecycle_parser)
 
     doctor_parser = subparsers.add_parser("doctor", help="检测本地运行依赖")
     doctor_parser.add_argument(

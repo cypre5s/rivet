@@ -6,12 +6,14 @@ import {
   type CommandOutcome,
   type WorkMode,
 } from "./command-registry.ts";
+import type { ModuleStatus } from "../state/reducer.ts";
 
 export interface CommandSources {
   models: string[];
   sessions: string[];
   transactions: string[];
   modules: string[];
+  moduleStatuses?: ModuleStatus[];
   files: string[];
   contextFiles: string[];
 }
@@ -113,6 +115,29 @@ export function commandNames(): string[] {
   return COMMAND_REGISTRY.map((command) => command.name);
 }
 
+export function moduleCommandUnavailableReason(
+  value: string,
+  statuses: ModuleStatus[],
+): string | null {
+  const [operation, moduleId] = value.split(/\s+/, 2);
+  if (moduleId === undefined || !["enable", "disable", "wake", "sleep"].includes(operation ?? "")) {
+    return null;
+  }
+  const status = statuses.find((item) => item.moduleId === moduleId);
+  if (status === undefined) return null;
+  if (!status.manualControl) return "内部模块仅由 Kernel 控制";
+  if (
+    ["required", "eager"].includes(status.activation) &&
+    (operation === "disable" || operation === "sleep")
+  ) {
+    return "系统必需或常驻模块不能执行该操作";
+  }
+  if ((operation === "disable" || operation === "sleep") && status.leaseCount > 0) {
+    return `当前有 ${status.leaseCount} 个活动 Lease`;
+  }
+  return null;
+}
+
 function completionChoices(
   kind: (typeof COMMAND_REGISTRY)[number]["argumentKind"],
   sources: CommandSources,
@@ -124,13 +149,7 @@ function completionChoices(
     return sources.transactions;
   }
   if (kind === "module") {
-    return sources.modules.flatMap((module) => [
-      module,
-      `${module} enable`,
-      `${module} disable`,
-      `${module} wake`,
-      `${module} sleep`,
-    ]);
+    return moduleChoices(sources);
   }
   if (kind === "path" || kind === "optional-path") return sources.files;
   if (kind === "context") {
@@ -144,6 +163,66 @@ function completionChoices(
   if (kind === "theme") return ["dark", "light"];
   if (kind === "export") return ["trace", "evidence", "session"];
   return [];
+}
+
+function moduleChoices(sources: CommandSources): string[] {
+  const statuses = sources.moduleStatuses ?? [];
+  if (statuses.length === 0) {
+    return [
+      "list",
+      ...sources.modules.flatMap((moduleId) => [
+        `show ${moduleId}`,
+        `enable ${moduleId}`,
+        `wake ${moduleId}`,
+        `sleep ${moduleId}`,
+        `disable ${moduleId}`,
+      ]),
+    ];
+  }
+  const choices = ["list"];
+  for (const status of statuses) {
+    choices.push(`show ${status.moduleId}`);
+    if (
+      !status.manualControl ||
+      status.activation === "required" ||
+      status.activation === "eager"
+    ) {
+      if (["ACTIVE", "IDLE"].includes(status.runtimeState)) {
+        choices.push(
+          `sleep ${status.moduleId}`,
+          `disable ${status.moduleId}`,
+        );
+      }
+      continue;
+    }
+    if (!status.configuredEnabled) {
+      choices.push(
+        `enable ${status.moduleId}`,
+        `enable ${status.moduleId} --with-dependencies`,
+      );
+      continue;
+    }
+    if (["INACTIVE", "SLEEPING"].includes(status.runtimeState)) {
+      choices.push(
+        `wake ${status.moduleId}`,
+        `wake ${status.moduleId} --with-dependencies`,
+      );
+    }
+    if (["ACTIVE", "IDLE"].includes(status.runtimeState)) {
+      choices.push(
+        `sleep ${status.moduleId}`,
+        `sleep ${status.moduleId} --wait --timeout 30`,
+      );
+      if (status.dependents.length > 0) {
+        choices.push(`sleep ${status.moduleId} --cascade --yes`);
+      }
+    }
+    choices.push(`disable ${status.moduleId}`);
+    if (status.dependents.length > 0) {
+      choices.push(`disable ${status.moduleId} --cascade --yes`);
+    }
+  }
+  return choices;
 }
 
 function hasFiniteChoices(

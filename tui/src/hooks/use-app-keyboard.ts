@@ -135,6 +135,10 @@ export function useAppKeyboard(
       if (handleOverlayKey(key.name, key.shift)) key.preventDefault();
       return;
     }
+    if (state.openPanel === "Modules" && handleModulesPanelKey(key)) {
+      key.preventDefault();
+      return;
+    }
     const command = resolveKeyCommand({
       name: key.name.toLocaleLowerCase(),
       shift: key.shift,
@@ -245,11 +249,14 @@ export function useAppKeyboard(
       services.onExit?.();
       return;
     }
+    if (commandName === "modules") {
+      actions.executeInput("/modules list");
+      return;
+    }
     const panelByCommand: Partial<Record<string, PanelName>> = {
       context: "Context",
       diff: "Diff",
       evidence: "Evidence",
-      modules: "Modules",
       sessions: "Sessions",
       trace: "Trace",
     };
@@ -260,6 +267,54 @@ export function useAppKeyboard(
       return;
     }
     actions.executeInput(`/${commandName}`);
+  }
+
+  function handleModulesPanelKey(key: {
+    name: string;
+    ctrl: boolean;
+  }): boolean {
+    const modules = state.rivet.moduleStatuses;
+    if (key.ctrl || modules.length === 0) return false;
+    if (key.name === "up" || key.name === "down") {
+      const delta = key.name === "up" ? -1 : 1;
+      actions.setSelectedIndex((current) =>
+        clampIndex(current + delta, modules.length),
+      );
+      return true;
+    }
+    const module = modules[clampIndex(state.selectedIndex, modules.length)];
+    if (module === undefined || !["e", "w", "s", "d"].includes(key.name)) {
+      return false;
+    }
+    if (
+      !module.manualControl ||
+      module.activation === "required" ||
+      module.activation === "eager"
+    ) {
+      actions.setNotice("该模块受 Kernel 策略保护，不能手动控制");
+      return true;
+    }
+    const operation = { e: "enable", w: "wake", s: "sleep", d: "disable" }[
+      key.name
+    ];
+    if (operation === undefined) return false;
+    if (operation === "enable" && module.configuredEnabled) {
+      actions.setNotice("模块已经启用");
+      return true;
+    }
+    if (operation === "wake" && !module.configuredEnabled) {
+      actions.setNotice("模块尚未启用，请先执行 Enable");
+      return true;
+    }
+    if (
+      operation === "sleep" &&
+      !["ACTIVE", "IDLE"].includes(module.runtimeState)
+    ) {
+      actions.setNotice("模块当前没有运行，无需休眠");
+      return true;
+    }
+    actions.executeInput(`/modules ${operation} ${module.moduleId}`);
+    return true;
   }
 
   function handleOverlayKey(keyName: string, shift: boolean): boolean {

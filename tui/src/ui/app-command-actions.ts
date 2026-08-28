@@ -5,7 +5,7 @@ import type {
 
 import type { PasteAttachment } from "../components/composer.tsx";
 import type { ThemeName } from "../components/theme.ts";
-import type { WorkerClient } from "../ipc/client.ts";
+import { WorkerResponseError, type WorkerClient } from "../ipc/client.ts";
 import type { RivetAction, RivetState } from "../state/reducer.ts";
 import {
   commandNeedsArgument,
@@ -98,11 +98,18 @@ export function createAppCommandActions(
       );
       return;
     }
-    if (command?.dangerous) {
+    if (
+      command?.dangerous ||
+      (command?.name === "modules" && /^\s*(disable|sleep)\b/.test(value.slice(8)))
+    ) {
+      const confirmedOutcome =
+        command?.name === "modules" && outcome.kind === "worker"
+          ? { ...outcome, params: { ...outcome.params, confirmed: true } }
+          : outcome;
       environment.pushOverlay({
         kind: "confirm",
         command,
-        outcome,
+        outcome: confirmedOutcome,
         displayInput: value,
       });
       return;
@@ -121,6 +128,11 @@ export function createAppCommandActions(
       environment.setInput("");
       executeUiAction(outcome.action, outcome.argument);
       return;
+    }
+    if (command?.name === "modules") {
+      environment.setScreen("session");
+      environment.setOpenPanel("Modules");
+      environment.setSelectedIndex(0);
     }
     if (
       environment.client !== undefined &&
@@ -150,7 +162,11 @@ export function createAppCommandActions(
     void tracked.result
       .catch((error: unknown) => {
         environment.setInlineError(
-          error instanceof Error ? error.message : "任务提交失败",
+          error instanceof WorkerResponseError
+            ? `${error.code}：${error.message}；建议：${error.nextAction}`
+            : error instanceof Error
+              ? error.message
+              : "任务提交失败",
         );
       })
       .finally(() =>
@@ -247,14 +263,6 @@ export function createAppCommandActions(
     }
     if (action === "open-context") {
       manageContext(argument);
-      return;
-    }
-    if (action === "open-modules" && argument.trim().includes(" ")) {
-      environment.setScreen("session");
-      environment.setOpenPanel("Modules");
-      environment.setInlineError(
-        "当前 CLI 仅支持查看模块；生命周期由 Kernel 按需管理",
-      );
       return;
     }
     const panel = panelForAction(action, argument);

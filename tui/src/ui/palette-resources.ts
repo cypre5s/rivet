@@ -21,7 +21,10 @@ export function createPaletteResources(
   for (const [index, model] of models.entries()) {
     resources.push(resource("model", model, `选择 ${model}`, `model-${index}`));
   }
-  for (const [index, moduleId] of state.modules.slice(0, 8).entries()) {
+  const moduleIds = state.moduleStatuses.length
+    ? state.moduleStatuses.map((status) => status.moduleId)
+    : state.modules;
+  for (const [index, moduleId] of moduleIds.slice(0, 8).entries()) {
     resources.push(
       resource("modules", moduleId, `查看 ${moduleId}`, `module-${index}`),
     );

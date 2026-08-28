@@ -53,3 +53,7 @@ class ResourceLeakError(KernelError):
 
 class ModuleShutdownError(KernelError):
     """表示模块关闭已尽力完成但至少一项失败。"""
+
+
+class ModuleOverridePersistenceError(KernelError):
+    """表示模块启用覆盖无法原子读取或持久化。"""

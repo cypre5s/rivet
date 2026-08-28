@@ -314,7 +314,6 @@ async def test_recent_sessions_are_loaded_only_on_explicit_request(
         ("command.init", {}, ("init",)),
         ("command.resume", {"session_id": "session_one"}, ("resume", "session_one")),
         ("command.trace", {"run_id": "run_one"}, ("trace", "run_one")),
-        ("command.modules", {}, ("modules",)),
         ("command.doctor", {}, ("doctor",)),
         ("command.benchmark", {}, ("benchmark",)),
         ("command.config", {}, ("config",)),
@@ -355,6 +354,189 @@ async def test_published_worker_commands_share_the_formal_cli_parser(
     )
 
     assert arguments[0][-len(expected_tail) :] == expected_tail
+
+
+@pytest.mark.asyncio
+async def test_module_commands_use_long_lived_kernel_instead_of_subprocess(
+    tmp_path: Path,
+) -> None:
+    arguments: list[tuple[str, ...]] = []
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        """记录不应由模块控制调用的子进程。"""
+        arguments.append(argv)
+        return CommandExecution(0, b"{}", b"")
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        """捕获模块快照和生命周期事件。"""
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    listed = await application.handle(
+        _request("request_modules_list", "command.modules", {"operation": "list"}),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+    woke = await application.handle(
+        _request(
+            "request_modules_wake",
+            "module.operation",
+            {"module_id": "context.syntax", "operation": "wake"},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+    with pytest.raises(WorkerMethodError) as blocked:
+        await application.handle(
+            _request(
+                "request_modules_blocked",
+                "module.operation",
+                {"module_id": "context.syntax", "operation": "disable"},
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert isinstance(listed, dict)
+    assert isinstance(woke, dict)
+    assert woke["current_state"] == "ACTIVE"
+    assert blocked.value.code == "module.active_dependents"
+    assert blocked.value.trace_event_id is not None
+    assert arguments == []
+    assert any(event_type == "module.operation.completed" for event_type, _ in events)
+    blocked_payloads = [
+        payload
+        for event_type, payload in events
+        if event_type == "module.operation.blocked"
+    ]
+    assert blocked_payloads[-1]["human_message"] == "模块仍有已启用依赖者"
+    assert blocked_payloads[-1]["suggested_action"]
+    assert blocked_payloads[-1]["blockers"] == ["context.lsp"]
+    snapshots = [
+        payload for event_type, payload in events if event_type == "modules.snapshot"
+    ]
+    assert snapshots
+    assert isinstance(snapshots[-1]["modules"], list)
+    await application.close()
+    persisted_trace = (tmp_path / ".rivet" / "trace" / "events.ndjson").read_text(
+        encoding="utf-8"
+    )
+    assert "module.operation.requested" in persisted_trace
+    assert "module.operation.completed" in persisted_trace
+    assert "request_modules_wake" in persisted_trace
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params", "error_code"),
+    [
+        (
+            "module.operation",
+            {"operation": "reload", "module_id": "context.syntax"},
+            "module.operation_invalid",
+        ),
+        (
+            "module.operation",
+            {"operation": "wake", "module_id": "../escape"},
+            "module.id_invalid",
+        ),
+        (
+            "module.operation",
+            {
+                "operation": "sleep",
+                "module_id": "context.syntax",
+                "timeout_seconds": -1,
+            },
+            "module.timeout_invalid",
+        ),
+        (
+            "module.operation",
+            {
+                "operation": "enable",
+                "module_id": "context.syntax",
+                "cascade": True,
+            },
+            "module.options_invalid",
+        ),
+        (
+            "module.show",
+            {"module_id": "context.syntax", "wait": True},
+            "module.options_invalid",
+        ),
+        ("module.show", {}, "module.id_invalid"),
+    ],
+)
+async def test_module_ipc_rejects_unknown_or_malformed_requests(
+    tmp_path: Path,
+    method: str,
+    params: dict[str, JsonValue],
+    error_code: str,
+) -> None:
+    async def emit(_event_type: str, _payload: dict[str, JsonValue]) -> None:
+        """丢弃本测试不关心的事件。"""
+
+    application = CommandWorkerApplication(tmp_path)
+    try:
+        with pytest.raises(WorkerMethodError) as captured:
+            await application.handle(
+                _request("request_modules_invalid", method, params),
+                emit=emit,
+                cancel_event=asyncio.Event(),
+            )
+        assert captured.value.code == error_code
+    finally:
+        await application.close()
+
+
+@pytest.mark.asyncio
+async def test_module_persistence_survives_tui_disconnect_after_commit(
+    tmp_path: Path,
+) -> None:
+    async def disconnected_emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        """模拟 TUI 在操作过程中断开。"""
+        raise BrokenPipeError("fixture disconnected")
+
+    application = CommandWorkerApplication(tmp_path)
+    with pytest.raises(BrokenPipeError):
+        await application.handle(
+            _request(
+                "request_modules_disconnect",
+                "module.operation",
+                {"operation": "disable", "module_id": "context.lsp"},
+            ),
+            emit=disconnected_emit,
+            cancel_event=asyncio.Event(),
+        )
+    await application.close()
+
+    async def emit(_event_type: str, _payload: dict[str, JsonValue]) -> None:
+        """丢弃恢复查询的状态投影。"""
+
+    restarted = CommandWorkerApplication(tmp_path)
+    try:
+        shown = await restarted.handle(
+            _request(
+                "request_modules_after_disconnect",
+                "module.show",
+                {"module_id": "context.lsp"},
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+        assert isinstance(shown, dict)
+        module = shown["module"]
+        assert isinstance(module, dict)
+        assert module["persisted_override"] is False
+        assert module["effective_enabled"] is False
+    finally:
+        await restarted.close()
 
 
 @pytest.mark.asyncio

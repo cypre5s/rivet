@@ -131,6 +131,7 @@ export function dangerousImpact(command: string, state: RivetState): string {
   if (command === "abort") return `隔离事务 · ${state.transaction}`;
   if (command === "clean") return "仅带 Rivet ownership marker 的运行产物";
   if (command === "init") return "当前仓库的 .rivet 项目配置";
+  if (command === "modules") return "所选模块、活动 Lease 与依赖关系";
   return "当前命令声明的受控范围";
 }
 

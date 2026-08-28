@@ -343,7 +343,7 @@ class ResourceScope:
 
     async def close(self) -> None:
         """按逆注册顺序尽力清理全部资源并保持幂等。"""
-        if self._closed:
+        if self._closed and not self._resources:
             return
         self._closed = True
         first_error: Exception | None = None
@@ -353,7 +353,7 @@ class ResourceScope:
             except Exception as error:
                 if first_error is None:
                     first_error = error
-            finally:
+            else:
                 self._resources.pop(resource_id, None)
         if first_error is not None:
             raise ResourceCleanupError(

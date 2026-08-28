@@ -132,4 +132,47 @@ describe("Trace-driven reducer", () => {
     expect(state.sessionId).toBe("session_one");
     expect(state.sessions).toEqual(["session_one", "session_two"]);
   });
+
+  test("projects structured module snapshots and lifecycle updates", () => {
+    let state = reduceTraceEvent(
+      initialRivetState(),
+      event(0, "modules.snapshot", {
+        modules: [
+          {
+            module_id: "context.syntax",
+            manifest_default_enabled: true,
+            persisted_override: null,
+            configured_enabled: true,
+            effective_enabled: true,
+            runtime_state: "INACTIVE",
+            activation: "on_demand",
+            scope: "workspace",
+            manual_control: true,
+            sleep_policy: "automatic",
+            dependencies: ["context.lexical"],
+            dependents: ["context.lsp"],
+            provided_capabilities: ["context.search.syntax"],
+            lease_count: 0,
+            active_resource_count: 0,
+            last_error: null,
+          },
+        ],
+      }),
+    );
+
+    expect(state.moduleStatuses[0]?.moduleId).toBe("context.syntax");
+    expect(state.moduleStatuses[0]?.dependencies).toEqual(["context.lexical"]);
+    expect(state.modules).toEqual([]);
+
+    state = reduceTraceEvent(
+      state,
+      event(1, "module.operation.completed", {
+        module_id: "context.syntax",
+        current_state: "ACTIVE",
+        effective_enabled: true,
+      }),
+    );
+    expect(state.moduleStatuses[0]?.runtimeState).toBe("ACTIVE");
+    expect(state.modules).toEqual(["context.syntax"]);
+  });
 });

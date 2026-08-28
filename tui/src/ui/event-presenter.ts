@@ -16,6 +16,14 @@ const EVENT_TITLES: Record<string, string> = {
   "worker.stopping": "正在安全退出",
   "module.activated": "已启用按需模块",
   "module.slept": "按需模块已休眠",
+  "module.operation.requested": "模块操作已请求",
+  "module.operation.started": "正在执行模块操作",
+  "module.state.changed": "模块运行状态已更新",
+  "module.enablement.changed": "模块启用策略已更新",
+  "module.operation.completed": "模块操作已完成",
+  "module.operation.blocked": "模块操作被安全边界阻止",
+  "module.operation.failed": "模块操作失败",
+  "modules.snapshot": "模块状态已刷新",
   "context.selected": "已选择相关上下文",
   "workspace.tree_updated": "仓库文件清单已更新",
   "tool.started": "正在执行工具",
@@ -39,12 +47,16 @@ const EVENT_TITLES: Record<string, string> = {
 
 export function presentTraceEvent(event: IpcEvent): PresentedEvent {
   const payload = event.payload;
-  const explicitSummary = text(payload.summary);
+  const explicitSummary = text(payload.summary) || text(payload.human_message);
+  const suggestedAction = text(payload.suggested_action);
   const title = specializedTitle(event.event_type, payload) ?? EVENT_TITLES[event.event_type] ?? "运行状态已更新";
-  const detail = explicitSummary === event.event_type ? "" : explicitSummary;
+  const detailParts = [
+    explicitSummary === event.event_type ? "" : explicitSummary,
+    suggestedAction ? `建议：${suggestedAction}` : "",
+  ].filter(Boolean);
   return {
     title,
-    detail,
+    detail: detailParts.join(" · "),
     kind: eventKind(event.event_type),
     status: eventStatus(event.event_type, payload),
   };
@@ -61,6 +73,16 @@ function specializedTitle(
   if (eventType === "module.slept") {
     const moduleId = text(payload.module_id);
     return moduleId ? `${moduleId} 已休眠` : null;
+  }
+  if (eventType.startsWith("module.operation.")) {
+    const moduleId = text(payload.module_id);
+    const operation = moduleOperation(text(payload.operation));
+    if (!moduleId || !operation) return null;
+    if (eventType.endsWith("requested")) return `已请求${operation} ${moduleId}`;
+    if (eventType.endsWith("started")) return `正在${operation} ${moduleId}`;
+    if (eventType.endsWith("completed")) return `${moduleId} ${operation}完成`;
+    if (eventType.endsWith("blocked")) return `${moduleId} ${operation}被阻止`;
+    if (eventType.endsWith("failed")) return `${moduleId} ${operation}失败`;
   }
   if (eventType === "tool.started") {
     const tool = text(payload.tool) || text(payload.tool_name);
@@ -103,8 +125,19 @@ function eventStatus(
   if (eventType.endsWith("started") || status === "RUNNING") return "running";
   if (eventType.includes("cancel") || status === "CANCELLED") return "cancelled";
   if (status === "BLOCKED" || status === "INCONCLUSIVE") return "blocked";
+  if (eventType.endsWith("blocked")) return "blocked";
   if (eventType.includes("failed") || status === "FAILED") return "failed";
   return "success";
+}
+
+function moduleOperation(operation: string): string {
+  const labels: Record<string, string> = {
+    enable: "启用",
+    disable: "禁用",
+    wake: "唤醒",
+    sleep: "休眠",
+  };
+  return labels[operation] ?? "";
 }
 
 function text(value: JsonValue | undefined): string {

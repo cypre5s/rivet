@@ -9,7 +9,7 @@ from pathlib import Path
 from rivet.trace.errors import TraceDatabaseError
 from rivet.trace.models import LocatedTraceEvent, TraceState
 
-CURRENT_SCHEMA_VERSION = 1
+CURRENT_SCHEMA_VERSION = 2
 ALLOWED_PRAGMAS = frozenset({"journal_mode", "foreign_keys", "busy_timeout"})
 
 MIGRATION_VERSION_1 = """
@@ -73,6 +73,20 @@ CREATE TABLE IF NOT EXISTS run_metrics (
 );
 """
 
+MIGRATION_VERSION_2 = """
+CREATE TABLE IF NOT EXISTS module_overrides (
+    scope TEXT NOT NULL CHECK (scope IN ('application', 'workspace')),
+    workspace_id TEXT NOT NULL,
+    module_id TEXT NOT NULL,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    updated_at TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('cli', 'tui', 'recovery')),
+    PRIMARY KEY (scope, workspace_id, module_id)
+);
+CREATE INDEX IF NOT EXISTS module_overrides_workspace_idx
+    ON module_overrides(workspace_id, module_id);
+"""
+
 
 class TraceDatabase:
     """封装单 Writer 使用的同步 SQLite 连接与确定性索引更新。"""
@@ -127,6 +141,22 @@ class TraceDatabase:
                         """
                         INSERT INTO schema_migrations(version, applied_at)
                         VALUES (1, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                        """
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+            if current_version < 2:
+                connection.execute("BEGIN IMMEDIATE")
+                try:
+                    for statement in MIGRATION_VERSION_2.split(";"):
+                        if statement.strip():
+                            connection.execute(statement)
+                    connection.execute(
+                        """
+                        INSERT INTO schema_migrations(version, applied_at)
+                        VALUES (2, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                         """
                     )
                     connection.commit()
@@ -252,6 +282,64 @@ class TraceDatabase:
             .fetchall()
         )
         return {str(row[0]) for row in rows}
+
+    def module_overrides(self, workspace_id: str) -> dict[tuple[str, str], bool]:
+        """读取应用级与指定工作区的模块启用覆盖。"""
+        rows = (
+            self._require_connection()
+            .execute(
+                """
+                SELECT scope, module_id, enabled
+                FROM module_overrides
+                WHERE (scope = 'application' AND workspace_id = '')
+                   OR (scope = 'workspace' AND workspace_id = ?)
+                ORDER BY scope, module_id
+                """,
+                (workspace_id,),
+            )
+            .fetchall()
+        )
+        return {
+            (str(scope), str(module_id)): bool(enabled)
+            for scope, module_id, enabled in rows
+        }
+
+    def update_module_overrides(
+        self,
+        changes: tuple[tuple[str, str, str, bool | None, str], ...],
+    ) -> None:
+        """原子写入或删除一组生命周期启用覆盖。"""
+        if not changes:
+            return
+        connection = self._require_connection()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for scope, workspace_id, module_id, enabled, source in changes:
+                if enabled is None:
+                    connection.execute(
+                        """
+                        DELETE FROM module_overrides
+                        WHERE scope = ? AND workspace_id = ? AND module_id = ?
+                        """,
+                        (scope, workspace_id, module_id),
+                    )
+                    continue
+                connection.execute(
+                    """
+                    INSERT INTO module_overrides(
+                        scope, workspace_id, module_id, enabled, updated_at, source
+                    ) VALUES (?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), ?)
+                    ON CONFLICT(scope, workspace_id, module_id) DO UPDATE SET
+                        enabled = excluded.enabled,
+                        updated_at = excluded.updated_at,
+                        source = excluded.source
+                    """,
+                    (scope, workspace_id, module_id, int(enabled), source),
+                )
+            connection.commit()
+        except sqlite3.Error as error:
+            connection.rollback()
+            raise TraceDatabaseError("模块启用覆盖写入失败") from error
 
     def close(self) -> None:
         """幂等关闭 SQLite 连接。"""

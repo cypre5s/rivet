@@ -393,6 +393,7 @@ export function RivetApp({
           theme={theme}
           composer={composer}
           selectedContextFiles={contextFiles}
+          selectedModuleIndex={selectedIndex}
         />
       )}
       <AppOverlays

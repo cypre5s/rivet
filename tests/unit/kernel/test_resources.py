@@ -159,7 +159,11 @@ async def test_scope_cleanup_failure_continues_and_closed_scope_rejects_registra
         await scope.close()
 
     assert not directory.exists()
-    assert scope.counts().resource_count == 0
+    assert scope.counts().resource_count == 1
+    with pytest.raises(ResourceLeakError):
+        scope.assert_empty()
+    with pytest.raises(ResourceCleanupError, match="至少一项"):
+        await scope.close()
     with pytest.raises(ResourceScopeClosedError):
         scope.create_temp_directory(description="关闭后禁止")
 

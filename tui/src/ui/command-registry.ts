@@ -141,6 +141,62 @@ const ui = (action: UiCommandAction): CommandHandler => (argument) => ({
   argument,
 });
 
+const modulesCommand: CommandHandler = (argument) => {
+  const tokens = argument.trim().split(/\s+/).filter(Boolean);
+  const operations = new Set(["list", "show", "enable", "disable", "wake", "sleep"]);
+  let operation = tokens.shift() ?? "list";
+  if (!operations.has(operation)) {
+    tokens.unshift(operation);
+    operation = "show";
+  }
+  const params: Record<string, JsonValue> = { operation };
+  if (operation !== "list") {
+    const moduleId = tokens.shift();
+    if (moduleId === undefined || moduleId.startsWith("--")) {
+      throw new Error(`/modules ${operation} 需要模块 ID`);
+    }
+    params.module_id = moduleId;
+  }
+  while (tokens.length > 0) {
+    const option = tokens.shift();
+    if (
+      option === "--with-dependencies" &&
+      (operation === "enable" || operation === "wake")
+    ) params.with_dependencies = true;
+    else if (
+      option === "--cascade" &&
+      (operation === "disable" || operation === "sleep")
+    ) params.cascade = true;
+    else if (
+      option === "--wait" &&
+      (operation === "disable" || operation === "sleep")
+    ) params.wait = true;
+    else if (
+      option === "--yes" &&
+      (operation === "disable" || operation === "sleep")
+    ) params.confirmed = true;
+    else if (
+      option === "--timeout" &&
+      (operation === "disable" || operation === "sleep")
+    ) {
+      const timeout = Number(tokens.shift());
+      if (!Number.isFinite(timeout) || timeout < 0 || timeout > 300) {
+        throw new Error("/modules --timeout 必须是 0 到 300 秒");
+      }
+      params.timeout_seconds = timeout;
+    } else {
+      throw new Error(`/modules ${operation} 不支持参数：${option ?? ""}`);
+    }
+  }
+  const method =
+    operation === "list"
+      ? "module.list"
+      : operation === "show"
+        ? "module.show"
+        : "module.operation";
+  return { kind: "worker", method, params };
+};
+
 export const COMMAND_REGISTRY: readonly CommandDescriptor[] = [
   descriptor(
     "new", "会话", "新建会话", "清空当前视图并开始新会话", "", "none",
@@ -243,8 +299,8 @@ export const COMMAND_REGISTRY: readonly CommandDescriptor[] = [
     { aliases: ["模式"], shortcut: "Tab" },
   ),
   descriptor(
-    "modules", "模型与运行时", "按需模块", "查看已激活模块及生命周期",
-    "[MODULE]", "module", ui("open-modules"),
+    "modules", "模型与运行时", "按需模块", "查看并安全控制模块生命周期",
+    "[list|show|enable|disable|wake|sleep]", "module", modulesCommand,
     { aliases: ["模块"], shortcut: "Ctrl+X M" },
   ),
   descriptor(

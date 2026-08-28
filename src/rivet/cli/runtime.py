@@ -10,16 +10,27 @@ from rivet.kernel.module_api import ModuleInstance, ScopedModuleInstance
 from rivet.kernel.module_runtime import ModuleLease
 from rivet.kernel.resources import ResourceScope
 from rivet.modules.catalog import BUILTIN_MODULE_MANIFESTS
+from rivet.storage.module_overrides import SQLiteModuleOverrideStore
 from rivet.trace.paths import RuntimePaths
 
 
 def create_cli_kernel(repository: Path, *, safe_mode: bool) -> RivetKernel:
     """构造尚未启动且不会导入模块 factory 的正式 Kernel。"""
     paths = RuntimePaths.for_repository(repository)
+    override_store = SQLiteModuleOverrideStore(paths.module_database_path, repository)
+    persisted_overrides = override_store.load(BUILTIN_MODULE_MANIFESTS)
+    enabled_overrides = {
+        module_id: enabled
+        for module_id, enabled in persisted_overrides.items()
+        if enabled is not None
+    }
     return RivetKernel.from_manifests(
         BUILTIN_MODULE_MANIFESTS,
         journal_path=paths.runtime_root / "module-activation.json",
         safe_mode=safe_mode,
+        enabled_overrides=enabled_overrides,
+        persisted_overrides=persisted_overrides,
+        override_repository=override_store,
     )
 
 

@@ -147,11 +147,14 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderer.destroy());
   });
 
-  test("shows unsupported module mutations as unavailable instead of faking them", async () => {
+  test("routes module lifecycle mutations through the real worker request", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
     const setup = await testRender(
       <RivetApp
         initialState={readyState({ modules: ["reader.pdf"] })}
         noColor={true}
+        client={client}
       />,
       { width: 100, height: 28 },
     );
@@ -161,8 +164,23 @@ describe("Rivet OpenTUI experience", () => {
 
     const frame = setup.captureCharFrame();
     expect(frame).toContain("reader.pdf");
-    expect(frame).toContain("×");
-    expect(frame).toContain("当前 CLI 仅支持查看");
+    expect(frame).toContain("enable reader.pdf");
+    expect(frame).not.toContain("当前 CLI 仅支持查看");
+
+    await act(async () => setup.mockInput.pressArrow("down"));
+    await act(async () => setup.mockInput.pressEnter());
+    await act(async () => Bun.sleep(30));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("/modules enable reader.pdf");
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+    const request = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .find((item) => item.method === "module.operation");
+    expect(request?.params).toEqual({
+      operation: "enable",
+      module_id: "reader.pdf",
+    });
     await act(async () => setup.renderer.destroy());
   });
 
@@ -390,6 +408,62 @@ describe("Rivet OpenTUI experience", () => {
     expect(setup.captureCharFrame()).toContain("当前还没有上下文来源");
 
     await act(async () => setup.mockInput.pressEscape());
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("controls the selected module from the Modules panel through IPC", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          sessionId: "session_modules",
+          modules: ["reader.pdf"],
+          moduleStatuses: [
+            {
+              moduleId: "reader.pdf",
+              manifestDefaultEnabled: false,
+              persistedOverride: false,
+              configuredEnabled: false,
+              effectiveEnabled: false,
+              runtimeState: "INACTIVE",
+              activation: "on_demand",
+              scope: "workspace",
+              manualControl: true,
+              sleepPolicy: "automatic",
+              dependencies: [],
+              dependents: [],
+              providedCapabilities: ["reader.pdf.extract"],
+              leaseCount: 0,
+              activeResourceCount: 0,
+              lastError: null,
+            },
+          ],
+        })}
+        noColor={true}
+        client={client}
+      />,
+      { width: 120, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
+    await act(async () => setup.mockInput.pressKey("m"));
+    await setup.flush();
+
+    const panel = setup.captureCharFrame();
+    expect(panel).toContain("reader.pdf");
+    expect(panel).toContain("E 启用");
+    await act(async () => setup.mockInput.pressKey("e"));
+    await setup.flush();
+
+    const request = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .find(
+        (item) =>
+          item.method === "module.operation" &&
+          item.params.operation === "enable",
+      );
+    expect(request?.params.module_id).toBe("reader.pdf");
     await act(async () => setup.renderer.destroy());
   });
 

@@ -4,6 +4,7 @@ import {
   commandArgumentCompletions,
   commandArgumentRequest,
   fileMentionQuery,
+  moduleCommandUnavailableReason,
   parseCommandInput,
   replaceFileMention,
   slashQuery,
@@ -59,6 +60,9 @@ describe("TUI command input", () => {
     expect(() => parseCommandInput("/apply")).toThrow("需要事务 ID");
     expect(() => parseCommandInput("/unknown value")).toThrow("未知命令");
     expect(() =>
+      parseCommandInput("/modules enable context.syntax --cascade"),
+    ).toThrow("不支持参数");
+    expect(() =>
       parseCommandInput("/apply tx_other", {
         modelConfigured: true,
         currentModel: "deepseek-v4-pro",
@@ -101,11 +105,11 @@ describe("TUI command input", () => {
       "tests/app.test.ts",
     ]);
     expect(commandArgumentCompletions("modules", "reader", sources)).toEqual([
-      "reader.pdf",
-      "reader.pdf enable",
-      "reader.pdf disable",
-      "reader.pdf wake",
-      "reader.pdf sleep",
+      "show reader.pdf",
+      "enable reader.pdf",
+      "wake reader.pdf",
+      "sleep reader.pdf",
+      "disable reader.pdf",
     ]);
     expect(commandArgumentCompletions("context", "app", sources)).toEqual([
       "add src/app.ts",
@@ -117,5 +121,41 @@ describe("TUI command input", () => {
       query: "f",
     });
     expect(commandArgumentRequest("/ask explain this")).toBeNull();
+  });
+
+  test("keeps protected module actions visible with an explicit reason", () => {
+    const status = {
+      moduleId: "kernel.required",
+      manifestDefaultEnabled: true,
+      persistedOverride: null,
+      configuredEnabled: true,
+      effectiveEnabled: true,
+      runtimeState: "ACTIVE",
+      activation: "required",
+      scope: "application",
+      manualControl: true,
+      sleepPolicy: "never",
+      dependencies: [],
+      dependents: [],
+      providedCapabilities: ["kernel.required"],
+      leaseCount: 0,
+      activeResourceCount: 0,
+      lastError: null,
+    };
+    const completions = commandArgumentCompletions("modules", "required", {
+      models: [],
+      sessions: [],
+      transactions: [],
+      modules: [],
+      moduleStatuses: [status],
+      files: [],
+      contextFiles: [],
+    });
+
+    expect(completions).toContain("sleep kernel.required");
+    expect(completions).toContain("disable kernel.required");
+    expect(
+      moduleCommandUnavailableReason("sleep kernel.required", [status]),
+    ).toContain("系统必需");
   });
 });

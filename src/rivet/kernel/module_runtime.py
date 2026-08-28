@@ -6,14 +6,19 @@ import asyncio
 import importlib
 import json
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
 from rivet.contracts.common import CapabilityId, ModuleId
-from rivet.contracts.modules import ActivationPolicy, ModuleManifest, ModuleState
+from rivet.contracts.modules import (
+    ActivationPolicy,
+    ModuleManifest,
+    ModuleState,
+    SleepPolicy,
+)
 from rivet.kernel.capabilities import CapabilityRegistry
 from rivet.kernel.errors import (
     ActivationJournalError,
@@ -114,12 +119,14 @@ class _RuntimeModule:
     """保存单个模块的进程内状态与资源所有权。"""
 
     manifest: ModuleManifest
+    enabled: bool
     state: ModuleState
     lock: asyncio.Lock
     instance: ModuleInstance | None = None
     scope: ResourceScope | None = None
     lease_count: int = 0
     idle_task: asyncio.Task[None] | None = None
+    last_error: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,12 +136,19 @@ class ModuleRuntimeSnapshot:
     module_id: str
     state: ModuleState
     activation: ActivationPolicy
+    manifest_default_enabled: bool
+    effective_enabled: bool
     safe_mode_allowed: bool
+    manual_control: bool
+    scope: str
+    sleep_policy: SleepPolicy
     dependencies: tuple[str, ...]
+    dependents: tuple[str, ...]
     capabilities: tuple[str, ...]
     lease_count: int
     resource_counts: ResourceCounts
     quarantine_reason: str | None
+    last_error: str | None
 
 
 class ModuleLease:
@@ -182,6 +196,7 @@ class ModuleRuntime:
         *,
         journal: ActivationJournal,
         safe_mode: bool = False,
+        enabled_overrides: Mapping[str, bool] | None = None,
     ) -> None:
         self.journal = journal
         self.safe_mode = safe_mode
@@ -189,9 +204,20 @@ class ModuleRuntime:
         self._manifest_by_id = {manifest.module_id: manifest for manifest in manifests}
         self._registry = CapabilityRegistry(manifests)
         pending_module_ids = journal.pending_module_ids()
+        overrides = {} if enabled_overrides is None else dict(enabled_overrides)
+        unknown_overrides = sorted(set(overrides).difference(self._manifest_by_id))
+        if unknown_overrides:
+            raise ModuleDependencyError(
+                f"启用覆盖包含未知模块：{', '.join(unknown_overrides)}"
+            )
         self._modules = {
             manifest.module_id: _RuntimeModule(
                 manifest=manifest,
+                enabled=(
+                    True
+                    if manifest.activation is ActivationPolicy.REQUIRED
+                    else overrides.get(manifest.module_id, manifest.enabled)
+                ),
                 state=(
                     ModuleState.QUARANTINED
                     if manifest.module_id in pending_module_ids
@@ -201,6 +227,8 @@ class ModuleRuntime:
             )
             for manifest in manifests
         }
+        for module_id, node in self._modules.items():
+            self._registry.set_module_enabled(module_id, node.enabled)
         self._active_sequence: list[str] = []
         self._started = False
         self._shutting_down = False
@@ -214,7 +242,10 @@ class ModuleRuntime:
         self._started = True
         for module_id in self._activation_order:
             manifest = self._manifest_by_id[module_id]
-            if manifest.enabled and manifest.activation is ActivationPolicy.REQUIRED:
+            if self.effective_enabled(module_id) and manifest.activation in {
+                ActivationPolicy.REQUIRED,
+                ActivationPolicy.EAGER,
+            }:
                 await self._activate_module(module_id)
 
     async def resolve(self, capability_id: CapabilityId) -> ModuleInstance:
@@ -244,6 +275,118 @@ class ModuleRuntime:
             raise CapabilityNotFoundError(f"未知模块 {module_id}")
         return node.state
 
+    def manifest(self, module_id: ModuleId) -> ModuleManifest:
+        """返回静态 Manifest，未知 ID 使用稳定错误。"""
+        node = self._modules.get(module_id)
+        if node is None:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        return node.manifest
+
+    def configured_enabled(self, module_id: ModuleId) -> bool:
+        """返回 Manifest 与持久化覆盖合成后的启用策略。"""
+        node = self._modules.get(module_id)
+        if node is None:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        return node.enabled
+
+    def effective_enabled(self, module_id: ModuleId) -> bool:
+        """应用 Safe Mode 与系统约束后返回实际可激活策略。"""
+        node = self._modules.get(module_id)
+        if node is None:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        if node.manifest.activation is ActivationPolicy.REQUIRED:
+            return True
+        if self.safe_mode and not node.manifest.safe_mode_allowed:
+            return False
+        return node.enabled
+
+    def set_configured_enabled(self, module_id: ModuleId, enabled: bool) -> bool:
+        """仅供统一生命周期服务在持久化成功后更新运行策略。"""
+        node = self._modules.get(module_id)
+        if node is None:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        previous = node.enabled
+        node.enabled = enabled
+        self._registry.set_module_enabled(module_id, enabled)
+        return previous != enabled
+
+    def dependency_closure(self, module_id: ModuleId) -> tuple[str, ...]:
+        """公开按拓扑顺序排列的依赖闭包。"""
+        if module_id not in self._modules:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        return self._dependency_closure(module_id)
+
+    def dependent_closure(self, module_id: ModuleId) -> tuple[str, ...]:
+        """公开按拓扑顺序排列的递归依赖者闭包。"""
+        if module_id not in self._modules:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        included = {module_id}
+        changed = True
+        while changed:
+            changed = False
+            for candidate, manifest in self._manifest_by_id.items():
+                if candidate in included or not set(manifest.requires) & included:
+                    continue
+                included.add(candidate)
+                changed = True
+        return tuple(
+            candidate for candidate in self._activation_order if candidate in included
+        )
+
+    def active_dependents(self, module_id: ModuleId) -> tuple[str, ...]:
+        """列出当前持有实例的直接或间接依赖者。"""
+        closure = self.dependent_closure(module_id)
+        return tuple(
+            candidate
+            for candidate in closure
+            if candidate != module_id
+            and self._modules[candidate].state
+            in {ModuleState.ACTIVE, ModuleState.IDLE, ModuleState.ACTIVATING}
+        )
+
+    def enabled_dependents(self, module_id: ModuleId) -> tuple[str, ...]:
+        """列出仍配置为启用的直接或间接依赖者。"""
+        closure = self.dependent_closure(module_id)
+        return tuple(
+            candidate
+            for candidate in closure
+            if candidate != module_id and self._modules[candidate].enabled
+        )
+
+    def lease_blockers(self, module_id: ModuleId) -> tuple[str, ...]:
+        """返回不泄露任务内容的活动 Lease 摘要。"""
+        node = self._modules.get(module_id)
+        if node is None:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        if node.lease_count == 0:
+            return ()
+        return (f"{module_id} 存在 {node.lease_count} 个活动 Lease",)
+
+    async def wake_module(self, module_id: ModuleId) -> tuple[str, ...]:
+        """经正式激活路径唤醒模块，并回滚本次已激活依赖。"""
+        if module_id not in self._modules:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        closure = self._dependency_closure(module_id)
+        previous_active = {
+            candidate
+            for candidate in closure
+            if self._modules[candidate].state in {ModuleState.ACTIVE, ModuleState.IDLE}
+        }
+        try:
+            await self._activate_module(module_id)
+        except BaseException:
+            for candidate in reversed(closure):
+                if candidate in previous_active:
+                    continue
+                node = self._modules[candidate]
+                if node.state in {ModuleState.ACTIVE, ModuleState.IDLE}:
+                    with suppress(Exception):
+                        await self.sleep_module(candidate)
+            raise
+        return tuple(
+            candidate for candidate in closure if candidate not in previous_active
+        )
+
     def snapshots(self) -> tuple[ModuleRuntimeSnapshot, ...]:
         """按拓扑顺序返回当前运行时事实，不激活任何模块。"""
         snapshots: list[ModuleRuntimeSnapshot] = []
@@ -254,8 +397,18 @@ class ModuleRuntime:
                     module_id=module_id,
                     state=node.state,
                     activation=node.manifest.activation,
+                    manifest_default_enabled=node.manifest.enabled,
+                    effective_enabled=self.effective_enabled(module_id),
                     safe_mode_allowed=node.manifest.safe_mode_allowed,
+                    manual_control=node.manifest.manual_control,
+                    scope=node.manifest.scope.value,
+                    sleep_policy=node.manifest.sleep_policy,
                     dependencies=node.manifest.requires,
+                    dependents=tuple(
+                        candidate
+                        for candidate in self.dependent_closure(module_id)
+                        if candidate != module_id
+                    ),
                     capabilities=node.manifest.provides,
                     lease_count=node.lease_count,
                     resource_counts=(
@@ -268,6 +421,7 @@ class ModuleRuntime:
                         if node.state is ModuleState.QUARANTINED
                         else None
                     ),
+                    last_error=node.last_error,
                 )
             )
         return tuple(snapshots)
@@ -282,9 +436,18 @@ class ModuleRuntime:
         if node is None:
             raise CapabilityNotFoundError(f"未知模块 {module_id}")
         async with node.lock:
-            if node.manifest.activation is ActivationPolicy.REQUIRED:
+            if (
+                node.manifest.activation
+                in {
+                    ActivationPolicy.REQUIRED,
+                    ActivationPolicy.EAGER,
+                }
+                or node.manifest.sleep_policy is SleepPolicy.NEVER
+            ):
                 return False
             if node.lease_count:
+                return False
+            if self.active_dependents(module_id):
                 return False
             if node.state not in {ModuleState.ACTIVE, ModuleState.IDLE}:
                 return False
@@ -298,14 +461,21 @@ class ModuleRuntime:
                 if scope is not None:
                     await scope.close()
                     scope.assert_empty()
+            except asyncio.CancelledError:
+                if scope is not None:
+                    with suppress(Exception):
+                        await asyncio.shield(scope.close())
+                node.state = ModuleState.FAILED
+                node.last_error = "模块休眠被取消"
+                raise
             except Exception as error:
                 node.state = ModuleState.FAILED
+                node.last_error = "模块休眠或资源清理失败"
                 raise ModuleActivationError(f"模块 {module_id} 休眠失败") from error
-            finally:
-                node.instance = None
-                node.scope = None
-                with suppress(ValueError):
-                    self._active_sequence.remove(module_id)
+            node.instance = None
+            node.scope = None
+            with suppress(ValueError):
+                self._active_sequence.remove(module_id)
             return True
 
     def resource_counts(self) -> ResourceCounts:
@@ -328,7 +498,11 @@ class ModuleRuntime:
             except Exception as error:
                 if first_error is None:
                     first_error = error
-        active_module_ids = set(self._active_sequence)
+        active_module_ids = set(self._active_sequence) | {
+            module_id
+            for module_id, node in self._modules.items()
+            if node.instance is not None or node.scope is not None
+        }
         shutdown_order = tuple(
             module_id
             for module_id in reversed(self._activation_order)
@@ -339,10 +513,12 @@ class ModuleRuntime:
             async with node.lock:
                 instance = node.instance
                 scope = node.scope
+                cleanup_succeeded = True
                 try:
                     if instance is not None:
                         await instance.shutdown()
                 except Exception as error:
+                    cleanup_succeeded = False
                     if first_error is None:
                         first_error = error
                 try:
@@ -350,13 +526,17 @@ class ModuleRuntime:
                         await scope.close()
                         scope.assert_empty()
                 except Exception as error:
+                    cleanup_succeeded = False
                     if first_error is None:
                         first_error = error
-                node.instance = None
-                node.scope = None
                 node.lease_count = 0
-                if node.state is not ModuleState.QUARANTINED:
+                if cleanup_succeeded:
+                    node.instance = None
+                    node.scope = None
+                if cleanup_succeeded and node.state is not ModuleState.QUARANTINED:
                     node.state = ModuleState.INACTIVE
+                elif not cleanup_succeeded:
+                    node.state = ModuleState.FAILED
         self._active_sequence.clear()
         counts = self.resource_counts()
         if counts.resource_count and first_error is None:
@@ -382,14 +562,23 @@ class ModuleRuntime:
                 )
             if node.state is ModuleState.FAILED:
                 raise ModuleActivationError(f"模块 {module_id} 已处于 FAILED")
-            if not node.manifest.enabled:
+            if not self.effective_enabled(module_id):
                 raise ModuleActivationError(f"模块 {module_id} 已禁用")
+            if (
+                self.safe_mode
+                and node.manifest.activation is not ActivationPolicy.REQUIRED
+                and not node.manifest.safe_mode_allowed
+            ):
+                raise SafeModeViolationError(
+                    f"Safe Mode 不允许激活可选模块 {module_id}"
+                )
             for dependency_id in sorted(node.manifest.requires):
                 await self._activate_module(dependency_id)
 
             node.state = ModuleState.ACTIVATING
             self.journal.mark_pending(module_id)
             scope = ResourceScope(module_id)
+            instance: ModuleInstance | None = None
             try:
                 factory = self._load_factory(node.manifest.factory)
                 factory_result = factory()
@@ -398,21 +587,37 @@ class ModuleRuntime:
                 instance = factory_result
                 await instance.activate(scope)
             except asyncio.CancelledError:
-                await scope.close()
+                cleanup_failed = False
+                try:
+                    await scope.close()
+                except Exception:
+                    cleanup_failed = True
+                    node.instance = instance
+                    node.scope = scope
                 node.state = ModuleState.FAILED
-                self.journal.clear_pending(module_id)
+                node.last_error = "模块激活被取消"
+                if not cleanup_failed:
+                    self.journal.clear_pending(module_id)
                 raise
             except Exception as error:
-                with suppress(Exception):
+                cleanup_failed = False
+                try:
                     await scope.close()
+                except Exception:
+                    cleanup_failed = True
+                    node.instance = instance
+                    node.scope = scope
                 node.state = ModuleState.FAILED
-                self.journal.clear_pending(module_id)
+                node.last_error = "模块激活失败"
+                if not cleanup_failed:
+                    self.journal.clear_pending(module_id)
                 raise ModuleActivationError(f"模块 {module_id} 激活失败") from error
 
             self.journal.clear_pending(module_id)
             node.instance = instance
             node.scope = scope
             node.state = ModuleState.ACTIVE
+            node.last_error = None
             with suppress(ValueError):
                 self._active_sequence.remove(module_id)
             self._active_sequence.append(module_id)

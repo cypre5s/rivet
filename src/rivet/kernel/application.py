@@ -9,14 +9,24 @@ from rivet.contracts.common import CapabilityId
 from rivet.contracts.modules import ModuleManifest
 from rivet.kernel.manifests import ManifestLoader
 from rivet.kernel.module_api import ModuleInstance
+from rivet.kernel.module_lifecycle import (
+    InMemoryModuleOverrideRepository,
+    ModuleLifecycleService,
+    ModuleOverrideRepository,
+)
 from rivet.kernel.module_runtime import ActivationJournal, ModuleLease, ModuleRuntime
 
 
 class RivetKernel:
     """保持薄边界，只负责模块运行时启动、解析与关闭。"""
 
-    def __init__(self, runtime: ModuleRuntime) -> None:
+    def __init__(
+        self,
+        runtime: ModuleRuntime,
+        module_lifecycle: ModuleLifecycleService,
+    ) -> None:
         self.runtime = runtime
+        self.module_lifecycle = module_lifecycle
 
     @classmethod
     def from_manifests(
@@ -25,14 +35,24 @@ class RivetKernel:
         *,
         journal_path: Path,
         safe_mode: bool = False,
+        enabled_overrides: dict[str, bool] | None = None,
+        persisted_overrides: dict[str, bool | None] | None = None,
+        override_repository: ModuleOverrideRepository | None = None,
     ) -> RivetKernel:
         """从已验证 Manifest 构造无副作用 Kernel。"""
+        runtime = ModuleRuntime(
+            manifests,
+            journal=ActivationJournal(journal_path),
+            safe_mode=safe_mode,
+            enabled_overrides=enabled_overrides,
+        )
         return cls(
-            ModuleRuntime(
-                manifests,
-                journal=ActivationJournal(journal_path),
-                safe_mode=safe_mode,
-            )
+            runtime,
+            ModuleLifecycleService(
+                runtime,
+                override_repository or InMemoryModuleOverrideRepository(),
+                persisted_overrides=persisted_overrides,
+            ),
         )
 
     @classmethod

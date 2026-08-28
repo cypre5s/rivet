@@ -1,4 +1,4 @@
-import type { RivetState } from "../state/reducer.ts";
+import type { ModuleStatus, RivetState } from "../state/reducer.ts";
 import type { PanelName } from "../ui/command-registry.ts";
 import type { PanelPresentation } from "../ui/layout.ts";
 import type { RivetTheme } from "./theme.ts";
@@ -7,12 +7,14 @@ export function DetailPanel({
   panel,
   state,
   selectedContextFiles,
+  selectedModuleIndex,
   presentation,
   theme,
 }: {
   panel: PanelName;
   state: RivetState;
   selectedContextFiles: string[];
+  selectedModuleIndex: number;
   presentation: PanelPresentation;
   theme: RivetTheme;
 }) {
@@ -36,6 +38,7 @@ export function DetailPanel({
         panel={panel}
         state={state}
         selectedContextFiles={selectedContextFiles}
+        selectedModuleIndex={selectedModuleIndex}
         theme={theme}
       />
     </box>
@@ -46,11 +49,13 @@ function PanelContent({
   panel,
   state,
   selectedContextFiles,
+  selectedModuleIndex,
   theme,
 }: {
   panel: PanelName;
   state: RivetState;
   selectedContextFiles: string[];
+  selectedModuleIndex: number;
   theme: RivetTheme;
 }) {
   if (panel === "Diff") {
@@ -111,14 +116,50 @@ function PanelContent({
     );
   }
   if (panel === "Modules") {
-    return state.modules.length ? (
+    return state.moduleStatuses.length ? (
+      <scrollbox flexGrow={1} focused={true}>
+        {state.moduleStatuses.map((module, index) => (
+          <box key={module.moduleId} flexDirection="column" marginBottom={1}>
+            <text
+              fg={
+                index === selectedModuleIndex
+                  ? theme.accent
+                  : module.effectiveEnabled
+                    ? theme.textPrimary
+                    : theme.textMuted
+              }
+              content={`${index === selectedModuleIndex ? "›" : " "} ${module.runtimeState === "ACTIVE" ? "●" : "○"} ${module.moduleId}`}
+            />
+            <text
+              fg={theme.textSecondary}
+              content={`  ${module.configuredEnabled ? "enabled" : "disabled"} · ${module.runtimeState} · ${module.scope} · ${module.activation}`}
+            />
+            <text
+              fg={theme.textMuted}
+              content={`  依赖 ${module.dependencies.join(", ") || "无"} · Lease ${module.leaseCount} · Resource ${module.activeResourceCount}`}
+            />
+            <text
+              fg={theme.accent}
+              content={`  ${moduleActions(module).join("  ·  ")}`}
+            />
+            {module.lastError === null ? null : (
+              <text fg={theme.danger} content={`  最近错误：${module.lastError}`} />
+            )}
+          </box>
+        ))}
+        <text
+          fg={theme.textMuted}
+          content="↑↓ 选择 · E 启用 · W 唤醒 · S 休眠 · D 禁用"
+        />
+      </scrollbox>
+    ) : state.modules.length ? (
       <scrollbox flexGrow={1} focused={true}>
         {state.modules.map((module) => (
           <text key={module} fg={theme.textSecondary} content={`● ACTIVE  ${module}`} />
         ))}
       </scrollbox>
     ) : (
-      <EmptyState text="没有激活可选模块" action="模块会在需要时自动激活" theme={theme} />
+      <EmptyState text="模块状态尚未加载" action="执行 /modules list" theme={theme} />
     );
   }
   if (panel === "Sessions") {
@@ -148,6 +189,26 @@ function PanelContent({
       <text fg={theme.textSecondary} content={detail} />
     </box>
   );
+}
+
+function moduleActions(module: ModuleStatus): string[] {
+  if (!module.manualControl) return ["内部模块，仅由 Kernel 控制"];
+  if (["required", "eager"].includes(module.activation)) {
+    return ["系统常驻模块，只读"];
+  }
+  if (!module.configuredEnabled) {
+    return [`/modules enable ${module.moduleId}`];
+  }
+  const actions: string[] = [];
+  if (["INACTIVE", "SLEEPING"].includes(module.runtimeState)) {
+    actions.push(`/modules wake ${module.moduleId}`);
+  }
+  if (["ACTIVE", "IDLE"].includes(module.runtimeState)) {
+    actions.push(`/modules sleep ${module.moduleId}`);
+  }
+  actions.push(`/modules disable ${module.moduleId}`);
+  if (module.leaseCount > 0) actions.push(`阻塞：${module.leaseCount} 个活动 Lease`);
+  return actions;
 }
 
 function EmptyState({

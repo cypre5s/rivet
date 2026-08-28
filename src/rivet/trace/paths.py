@@ -20,6 +20,7 @@ class RuntimePaths:
     events_path: Path
     artifacts_root: Path
     cache_root: Path
+    module_database_path: Path
 
     @classmethod
     def for_repository(
@@ -38,6 +39,13 @@ class RuntimePaths:
                 raise RuntimePathError("XDG_CACHE_HOME 必须是绝对路径")
         else:
             xdg_cache_root = Path.home() / ".cache"
+        xdg_state_value = selected_environment.get("XDG_STATE_HOME")
+        if xdg_state_value:
+            xdg_state_root = Path(xdg_state_value)
+            if not xdg_state_root.is_absolute():
+                raise RuntimePathError("XDG_STATE_HOME 必须是绝对路径")
+        else:
+            xdg_state_root = Path.home() / ".local" / "state"
         runtime_root = resolved_repository / ".rivet"
         return cls(
             repository_root=resolved_repository,
@@ -46,6 +54,9 @@ class RuntimePaths:
             events_path=runtime_root / "trace" / "events.ndjson",
             artifacts_root=runtime_root / "artifacts",
             cache_root=xdg_cache_root.resolve() / "rivet",
+            module_database_path=(
+                xdg_state_root.resolve() / "rivet" / "module-state.sqlite3"
+            ),
         )
 
     def prepare(self) -> None:
@@ -58,6 +69,7 @@ class RuntimePaths:
             self.events_path.parent,
             self.artifacts_root,
             self.cache_root,
+            self.module_database_path.parent,
         ):
             directory.mkdir(parents=True, exist_ok=True, mode=0o700)
             directory.chmod(0o700)

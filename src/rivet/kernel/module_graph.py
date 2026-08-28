@@ -31,15 +31,6 @@ def stable_activation_order(
             raise ModuleDependencyError(
                 f"模块 {module_id} 缺少依赖：{', '.join(missing)}"
             )
-        disabled = sorted(
-            dependency
-            for dependency in manifest.requires
-            if not manifest_by_id[dependency].enabled
-        )
-        if manifest.enabled and disabled:
-            raise ModuleDependencyError(
-                f"启用模块 {module_id} 依赖已禁用模块：{', '.join(disabled)}"
-            )
         remaining_dependencies[module_id] = len(manifest.requires)
         for dependency in manifest.requires:
             dependents[dependency].add(module_id)

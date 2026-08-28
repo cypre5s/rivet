@@ -1,7 +1,11 @@
 import { describe, expect, test } from "bun:test";
 
 import type { IpcMessage } from "../contracts/ipc.ts";
-import { WorkerClient, type WorkerTransport } from "./client.ts";
+import {
+  WorkerClient,
+  WorkerResponseError,
+  type WorkerTransport,
+} from "./client.ts";
 import { decodeIpcLine } from "./codec.ts";
 
 class FakeTransport implements WorkerTransport {
@@ -119,6 +123,44 @@ describe("WorkerClient", () => {
     transport.emitStderr("诊断信息\n");
 
     expect(diagnostics).toEqual(["诊断信息\n"]);
+  });
+
+  test("preserves actionable worker error fields", async () => {
+    const transport = new FakeTransport();
+    const client = new WorkerClient(transport, {
+      requireHandshake: false,
+      requestIdFactory: () => "request_error_one",
+    });
+    const pending = client.request("module.operation", {});
+    transport.emit({
+      schema_version: 1,
+      message_type: "response",
+      protocol_version: 1,
+      request_id: "request_error_one",
+      ok: false,
+      result: null,
+      error: {
+        schema_version: 1,
+        code: "module.lease_blocked",
+        summary: "模块存在活动 Lease",
+        next_action: "等待任务结束后重试",
+        retryable: true,
+        run_id: null,
+        session_id: null,
+        transaction_id: null,
+        trace_event_id: "event_module_blocked",
+        cause_redacted: null,
+      },
+    });
+
+    const error = await pending.catch((reason: unknown) => reason);
+    expect(error).toBeInstanceOf(WorkerResponseError);
+    expect(error).toMatchObject({
+      code: "module.lease_blocked",
+      nextAction: "等待任务结束后重试",
+      retryable: true,
+      traceEventId: "event_module_blocked",
+    });
   });
 
   test("requests graceful worker shutdown before closing transport", async () => {

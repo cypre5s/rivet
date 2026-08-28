@@ -21,11 +21,21 @@ EmitEvent = Callable[[str, dict[str, JsonValue]], Awaitable[None]]
 class WorkerMethodError(RuntimeError):
     """表示业务方法拒绝，且不向 IPC 泄露异常细节。"""
 
-    def __init__(self, code: str, summary: str, next_action: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        summary: str,
+        next_action: str,
+        *,
+        retryable: bool = False,
+        trace_event_id: str | None = None,
+    ) -> None:
         super().__init__(summary)
         self.code = code
         self.summary = summary
         self.next_action = next_action
+        self.retryable = retryable
+        self.trace_event_id = trace_event_id
 
 
 class WorkerApplication(Protocol):
@@ -48,6 +58,15 @@ class ReadyPayloadProvider(Protocol):
 
     def ready_payload(self) -> dict[str, JsonValue]:
         """返回首屏可展示且无副作用的连接状态。"""
+        ...
+
+
+@runtime_checkable
+class ClosableWorkerApplication(Protocol):
+    """允许长驻业务应用在 Worker 断开时释放资源。"""
+
+    async def close(self) -> None:
+        """关闭应用持有的 Kernel、Trace 和其他资源。"""
         ...
 
 
@@ -198,6 +217,8 @@ class WorkerSession:
         if pending:
             await asyncio.gather(*(task for task, _ in pending), return_exceptions=True)
         self._pending.clear()
+        if isinstance(self._application, ClosableWorkerApplication):
+            await self._application.close()
 
     async def _handshake(self, request: IpcRequest) -> None:
         """返回协议能力后才把连接标记为可用。"""
@@ -249,6 +270,8 @@ class WorkerSession:
                 code=error.code,
                 summary=error.summary,
                 next_action=error.next_action,
+                retryable=error.retryable,
+                trace_event_id=error.trace_event_id,
             )
         except Exception:
             await self._send_error(
@@ -297,6 +320,8 @@ class WorkerSession:
         code: str,
         summary: str,
         next_action: str,
+        retryable: bool = False,
+        trace_event_id: str | None = None,
     ) -> None:
         """发送不含 Python 堆栈和原始输入的失败响应。"""
         response = IpcResponse(
@@ -306,7 +331,8 @@ class WorkerSession:
                 code=code,
                 summary=summary,
                 next_action=next_action,
-                retryable=False,
+                retryable=retryable,
+                trace_event_id=trace_event_id,
             ),
         )
         await self._write(response.model_dump_json() + "\n")

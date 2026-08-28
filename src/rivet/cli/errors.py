@@ -81,3 +81,22 @@ class CliCancellationError(CliError):
             next_action,
             exit_code=ExitCode.USER_CANCELLED,
         )
+
+
+class CliModuleError(CliError):
+    """表示模块生命周期策略、状态、资源或持久化失败。"""
+
+    def __init__(
+        self,
+        code: str,
+        summary: str,
+        next_action: str,
+        *,
+        exit_code: ExitCode,
+    ) -> None:
+        super().__init__(
+            code,
+            summary,
+            next_action,
+            exit_code=exit_code,
+        )

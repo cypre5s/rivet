@@ -30,6 +30,25 @@ export interface PermissionPrompt {
   timeoutSeconds: number;
 }
 
+export interface ModuleStatus {
+  moduleId: string;
+  manifestDefaultEnabled: boolean;
+  persistedOverride: boolean | null;
+  configuredEnabled: boolean;
+  effectiveEnabled: boolean;
+  runtimeState: string;
+  activation: string;
+  scope: string;
+  manualControl: boolean;
+  sleepPolicy: string;
+  dependencies: string[];
+  dependents: string[];
+  providedCapabilities: string[];
+  leaseCount: number;
+  activeResourceCount: number;
+  lastError: string | null;
+}
+
 export interface RivetState {
   connection: ConnectionState;
   repository: string;
@@ -46,6 +65,7 @@ export interface RivetState {
   verifyStatus: string;
   evidenceId: string;
   modules: string[];
+  moduleStatuses: ModuleStatus[];
   permission: PermissionPrompt | null;
   budget: { tokens: number; costUsd: number; elapsedMs: number };
   error: string | null;
@@ -84,6 +104,7 @@ export function initialRivetState(): RivetState {
     verifyStatus: "未验证",
     evidenceId: "无",
     modules: [],
+    moduleStatuses: [],
     permission: null,
     budget: { tokens: 0, costUsd: 0, elapsedMs: 0 },
     error: null,
@@ -184,8 +205,40 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       const moduleId = text(event.payload.module_id, "");
       return { ...next, modules: state.modules.filter((item) => item !== moduleId) };
     }
-    case "modules.snapshot":
-      return { ...next, modules: stringArray(event.payload.modules) };
+    case "module.state.changed":
+    case "module.enablement.changed":
+    case "module.operation.completed": {
+      const moduleId = text(event.payload.module_id, "");
+      if (!moduleId) return next;
+      const statuses = state.moduleStatuses.map((status) =>
+        status.moduleId === moduleId
+          ? {
+              ...status,
+              runtimeState: text(event.payload.current_state, status.runtimeState),
+              effectiveEnabled: boolean(
+                event.payload.effective_enabled,
+                status.effectiveEnabled,
+              ),
+            }
+          : status,
+      );
+      return {
+        ...next,
+        moduleStatuses: statuses,
+        modules: activeModuleIds(statuses),
+      };
+    }
+    case "modules.snapshot": {
+      const statuses = moduleStatusArray(event.payload.modules);
+      if (statuses.length === 0) {
+        return { ...next, modules: stringArray(event.payload.modules) };
+      }
+      return {
+        ...next,
+        moduleStatuses: statuses,
+        modules: activeModuleIds(statuses),
+      };
+    }
     case "permission.requested":
       return { ...next, permission: permissionPrompt(event.payload) };
     case "permission.resolved":
@@ -288,4 +341,40 @@ function boolean(value: JsonValue | undefined, fallback: boolean): boolean {
 
 function stringArray(value: JsonValue | undefined): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function moduleStatusArray(value: JsonValue | undefined): ModuleStatus[] {
+  if (!Array.isArray(value)) return [];
+  const statuses: ModuleStatus[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const moduleId = text(item.module_id, "");
+    if (!moduleId) continue;
+    statuses.push({
+      moduleId,
+      manifestDefaultEnabled: boolean(item.manifest_default_enabled, false),
+      persistedOverride:
+        typeof item.persisted_override === "boolean" ? item.persisted_override : null,
+      configuredEnabled: boolean(item.configured_enabled, false),
+      effectiveEnabled: boolean(item.effective_enabled, false),
+      runtimeState: text(item.runtime_state, "UNKNOWN"),
+      activation: text(item.activation, "unknown"),
+      scope: text(item.scope, "workspace"),
+      manualControl: boolean(item.manual_control, false),
+      sleepPolicy: text(item.sleep_policy, "unknown"),
+      dependencies: stringArray(item.dependencies),
+      dependents: stringArray(item.dependents),
+      providedCapabilities: stringArray(item.provided_capabilities),
+      leaseCount: number(item.lease_count, 0),
+      activeResourceCount: number(item.active_resource_count, 0),
+      lastError: typeof item.last_error === "string" ? item.last_error : null,
+    });
+  }
+  return statuses;
+}
+
+function activeModuleIds(statuses: ModuleStatus[]): string[] {
+  return statuses
+    .filter((status) => ["ACTIVE", "IDLE", "ACTIVATING"].includes(status.runtimeState))
+    .map((status) => status.moduleId);
 }

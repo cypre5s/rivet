@@ -16,7 +16,7 @@ from rivet.cli.config import ConfigOverrides, ResolvedConfig, load_config
 from rivet.cli.doctor import DoctorSection, doctor_json, inspect_doctor, render_doctor
 from rivet.cli.errors import CliConfigurationError, CliError, CliSecurityError
 from rivet.cli.exit_codes import ExitCode
-from rivet.cli.modules import load_module_status_mapping
+from rivet.cli.modules import run_module_command
 from rivet.cli.parser import build_internal_parser, build_parser
 from rivet.storage.git_exclude import configure_runtime_excludes
 from rivet.storage.ownership import SafeCleaner
@@ -114,16 +114,14 @@ def _dispatch(
         _print_payload(payload, json_output=json_output)
         return int(ExitCode.SUCCESS)
     if command == "modules":
-        _print_payload(
-            asyncio.run(
-                load_module_status_mapping(
-                    repository,
-                    safe_mode=config.safe_mode,
-                )
-            ),
-            json_output=json_output,
+        return asyncio.run(
+            run_module_command(
+                arguments,
+                repository=repository,
+                safe_mode=config.safe_mode,
+                json_output=json_output,
+            )
         )
-        return int(ExitCode.SUCCESS)
     if command == "doctor":
         section = cast(DoctorSection, arguments.section)
         report = inspect_doctor(repository, config, section=section)

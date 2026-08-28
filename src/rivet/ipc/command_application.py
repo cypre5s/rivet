@@ -13,13 +13,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import cast
+from typing import TypedDict, cast
 
 from pydantic import JsonValue
 
 from rivet.cli.config import load_config
 from rivet.cli.errors import CliConfigurationError
+from rivet.cli.modules import ModuleCommandController
 from rivet.contracts.ipc import IpcRequest
+from rivet.contracts.modules import ModuleOperationSource
 from rivet.ipc.worker import (
     BaseWorkerApplication,
     EmitEvent,
@@ -74,6 +76,16 @@ class _ProjectedTraceEvent:
     stream_id: str | None
 
 
+class _ModuleOptions(TypedDict):
+    """保存严格校验后的模块 IPC 选项。"""
+
+    cascade: bool
+    confirmed: bool
+    wait: bool
+    with_dependencies: bool
+    timeout_seconds: float
+
+
 class CommandWorkerApplication(BaseWorkerApplication):
     """串行运行 Agent 命令，同时允许权限响应并发到达。"""
 
@@ -90,6 +102,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
         self._runner = runner or self._run_subprocess
         self._command_lock = asyncio.Lock()
         self._permissions: dict[str, asyncio.Future[bool]] = {}
+        self._module_controller: ModuleCommandController | None = None
 
     def ready_payload(self) -> dict[str, JsonValue]:
         """返回首屏需要的真实模型状态，凭据只提供布尔值。"""
@@ -135,6 +148,9 @@ class CommandWorkerApplication(BaseWorkerApplication):
             return await self._list_repository_files(request, emit=emit)
         if request.method == "sessions.list":
             return await self._list_sessions(request, emit=emit)
+        if request.method in {"module.list", "module.show", "module.operation"}:
+            async with self._command_lock:
+                return await self._handle_module_request(request, emit=emit)
         command = request.method.removeprefix("command.")
         if (
             not request.method.startswith("command.")
@@ -146,6 +162,8 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 "检查客户端版本或使用已公布的方法",
             )
         async with self._command_lock:
+            if command == "modules":
+                return await self._handle_module_request(request, emit=emit)
             await emit(
                 "plan.updated",
                 {"phase": command.upper(), "summary": "命令已提交"},
@@ -186,6 +204,200 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 {"phase": "IDLE", "summary": f"{command} 已结束"},
             )
             return cast(JsonValue, payload)
+
+    async def close(self) -> None:
+        """关闭长驻模块控制器并清空未完成权限引用。"""
+        controller = self._module_controller
+        self._module_controller = None
+        if controller is not None:
+            await controller.close()
+        for future in self._permissions.values():
+            if not future.done():
+                future.cancel()
+        self._permissions.clear()
+
+    async def _handle_module_request(
+        self,
+        request: IpcRequest,
+        *,
+        emit: EmitEvent,
+    ) -> JsonValue:
+        """严格校验正式模块 IPC，并在 Worker 内持有真实 Runtime。"""
+        controller = await self._module_application()
+        operation = self._module_operation(request)
+        if operation == "list":
+            self._validate_module_read_options(request, operation)
+            payload = controller.list_mapping()
+        elif operation == "show":
+            self._validate_module_read_options(request, operation)
+            module_id = self._module_id(request)
+            try:
+                payload = controller.show_mapping(module_id)
+            except Exception as error:
+                from rivet.kernel.module_lifecycle import ModuleLifecycleError
+
+                if isinstance(error, ModuleLifecycleError):
+                    raise WorkerMethodError(
+                        error.code,
+                        error.human_message,
+                        error.suggested_action,
+                        retryable=error.retryable,
+                        trace_event_id=error.trace_event_id,
+                    ) from error
+                raise
+        else:
+            module_id = self._module_id(request)
+            options = self._module_options(request, operation)
+            try:
+                payload = await controller.operate(
+                    operation,
+                    module_id,
+                    source=ModuleOperationSource.TUI,
+                    request_id=request.request_id,
+                    with_dependencies=options["with_dependencies"],
+                    cascade=options["cascade"],
+                    wait=options["wait"],
+                    timeout_seconds=options["timeout_seconds"],
+                    confirmed=options["confirmed"],
+                    emit=emit,
+                )
+            except Exception as error:
+                from rivet.kernel.module_lifecycle import ModuleLifecycleError
+
+                if isinstance(error, ModuleLifecycleError):
+                    blockers = (
+                        f"；阻塞：{', '.join(error.blockers)}" if error.blockers else ""
+                    )
+                    raise WorkerMethodError(
+                        error.code,
+                        f"{error.human_message}{blockers}",
+                        error.suggested_action,
+                        retryable=error.retryable,
+                        trace_event_id=error.trace_event_id,
+                    ) from error
+                raise
+        listing = controller.list_mapping()
+        raw_modules = listing.get("modules", [])
+        await emit(
+            "modules.snapshot",
+            {
+                "modules": cast(JsonValue, raw_modules),
+                "summary": "模块状态已刷新",
+            },
+        )
+        return cast(JsonValue, payload)
+
+    async def _module_application(self) -> ModuleCommandController:
+        """惰性创建长驻控制器，打开面板不会唤醒可选模块。"""
+        if self._module_controller is None:
+            config = load_config(
+                self._repository,
+                environment=self._environment,
+            )
+            controller = ModuleCommandController(
+                self._repository,
+                safe_mode=config.safe_mode,
+            )
+            await controller.start()
+            self._module_controller = controller
+        return self._module_controller
+
+    @staticmethod
+    def _module_operation(request: IpcRequest) -> str:
+        """兼容 command.modules 与显式 module.* 方法并拒绝未知操作。"""
+        if request.method == "module.list":
+            operation: object = "list"
+        elif request.method == "module.show":
+            operation = "show"
+        else:
+            operation = request.params.get("operation", "list")
+        allowed = {"list", "show", "enable", "disable", "wake", "sleep"}
+        if not isinstance(operation, str) or operation not in allowed:
+            raise WorkerMethodError(
+                "module.operation_invalid",
+                "模块操作无效",
+                "使用 list/show/enable/disable/wake/sleep",
+            )
+        return operation
+
+    @staticmethod
+    def _module_id(request: IpcRequest) -> str:
+        """校验点分小写模块 ID，不允许把任意文本传入 Runtime。"""
+        module_id = request.params.get("module_id")
+        if (
+            not isinstance(module_id, str)
+            or not module_id
+            or len(module_id) > 128
+            or any(
+                not (character.islower() or character.isdigit() or character in "._")
+                for character in module_id
+            )
+        ):
+            raise WorkerMethodError(
+                "module.id_invalid",
+                "模块 ID 无效",
+                "从 Modules 面板选择有效模块",
+            )
+        return module_id
+
+    @staticmethod
+    def _validate_module_read_options(
+        request: IpcRequest,
+        operation: str,
+    ) -> None:
+        """拒绝 list/show 携带生命周期写选项。"""
+        allowed_keys = {"operation"}
+        if operation == "show":
+            allowed_keys.add("module_id")
+        if set(request.params).difference(allowed_keys):
+            raise WorkerMethodError(
+                "module.options_invalid",
+                "模块读取操作包含无关选项",
+                "删除写操作选项后重试",
+            )
+
+    @staticmethod
+    def _module_options(request: IpcRequest, operation: str) -> _ModuleOptions:
+        """严格读取布尔选项与有界等待时间。"""
+        allowed_keys = {"module_id", "operation"}
+        if operation in {"enable", "wake"}:
+            allowed_keys.add("with_dependencies")
+        else:
+            allowed_keys.update({"cascade", "confirmed", "timeout_seconds", "wait"})
+        if set(request.params).difference(allowed_keys):
+            raise WorkerMethodError(
+                "module.options_invalid",
+                "模块操作包含未知选项",
+                "刷新客户端并使用正式参数",
+            )
+        boolean_options: dict[str, bool] = {}
+        for key in ("cascade", "confirmed", "wait", "with_dependencies"):
+            value = request.params.get(key, False)
+            if not isinstance(value, bool):
+                raise WorkerMethodError(
+                    "module.options_invalid",
+                    "模块布尔选项无效",
+                    "使用命令面板生成正式参数",
+                )
+            boolean_options[key] = value
+        timeout = request.params.get("timeout_seconds", 30)
+        if (
+            isinstance(timeout, bool)
+            or not isinstance(timeout, (int, float))
+            or not 0 <= timeout <= 300
+        ):
+            raise WorkerMethodError(
+                "module.timeout_invalid",
+                "模块等待超时无效",
+                "使用 0 到 300 秒的有限超时",
+            )
+        return _ModuleOptions(
+            cascade=boolean_options["cascade"],
+            confirmed=boolean_options["confirmed"],
+            wait=boolean_options["wait"],
+            with_dependencies=boolean_options["with_dependencies"],
+            timeout_seconds=float(timeout),
+        )
 
     async def _list_repository_files(
         self,

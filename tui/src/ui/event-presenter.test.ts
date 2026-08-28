@@ -39,4 +39,20 @@ describe("trace event presentation", () => {
       kind: "status",
     });
   });
+
+  test("shows module failure reason and next action", () => {
+    const presented = presentTraceEvent(
+      event("module.operation.blocked", {
+        module_id: "context.syntax",
+        operation: "sleep",
+        human_message: "模块存在活动 Lease",
+        suggested_action: "等待任务结束后重试",
+      }),
+    );
+
+    expect(presented.title).toContain("context.syntax");
+    expect(presented.detail).toContain("模块存在活动 Lease");
+    expect(presented.detail).toContain("等待任务结束后重试");
+    expect(presented.status).toBe("blocked");
+  });
 });
