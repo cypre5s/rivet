@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, cast
@@ -17,6 +20,8 @@ from rivet.contracts.provider import (
 )
 from rivet.contracts.tools import ToolCall
 from rivet.providers.errors import ProviderProtocolError
+
+LOCAL_TOOL_CALL_ID_PATTERN = re.compile(r"^call_[a-z0-9][a-z0-9_-]{0,62}$")
 
 
 class _WireModel(BaseModel):
@@ -39,7 +44,7 @@ class WireFunctionCall(_WireModel):
 class WireToolCall(_WireModel):
     """描述非流式 Tool Call。"""
 
-    id: str
+    id: str = Field(min_length=1, max_length=256)
     type: Literal["function"]
     function: WireFunctionCall
 
@@ -96,7 +101,7 @@ class WireToolCallDelta(_WireModel):
     """描述按 index 聚合的流式 Tool Call 分片。"""
 
     index: int = Field(ge=0)
-    id: str | None = None
+    id: str | None = Field(default=None, min_length=1, max_length=256)
     type: Literal["function"] | None = None
     function: WireFunctionDelta | None = None
 
@@ -179,12 +184,40 @@ def _arguments(arguments: str) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], raw_arguments)
 
 
-def _tool_call(call: WireToolCall) -> ToolCall:
+def _local_tool_name(
+    wire_name: str,
+    tool_names: Mapping[str, str] | None,
+) -> str:
+    """在 Provider 提供映射时拒绝模型返回未声明的工具别名。"""
+    if tool_names is None:
+        return wire_name
+    try:
+        return tool_names[wire_name]
+    except KeyError as error:
+        raise _protocol_error(
+            "provider.tool_name_unknown",
+            "模型 Tool Call 使用了未声明的厂商工具名",
+        ) from error
+
+
+def _local_tool_call_id(wire_id: str) -> str:
+    """保留合规调用 ID，并把厂商大小写 ID 收敛为稳定本地标识。"""
+    if LOCAL_TOOL_CALL_ID_PATTERN.fullmatch(wire_id):
+        return wire_id
+    digest = hashlib.sha256(wire_id.encode("utf-8")).hexdigest()
+    return f"call_{digest[:63]}"
+
+
+def _tool_call(
+    call: WireToolCall,
+    *,
+    tool_names: Mapping[str, str] | None,
+) -> ToolCall:
     """构造仍需业务 Schema 校验的本地 ToolCall。"""
     try:
         return ToolCall(
-            tool_call_id=call.id,
-            tool_name=call.function.name,
+            tool_call_id=_local_tool_call_id(call.id),
+            tool_name=_local_tool_name(call.function.name, tool_names),
             arguments=_arguments(call.function.arguments),
         )
     except ValidationError as error:
@@ -223,6 +256,7 @@ def parse_non_streaming_response(
     document: object,
     *,
     created_at: datetime,
+    tool_names: Mapping[str, str] | None = None,
 ) -> ModelResponse:
     """严格解析非流式响应的唯一 index=0 choice。"""
     try:
@@ -237,7 +271,10 @@ def parse_non_streaming_response(
             "provider.choice_invalid", "模型响应必须包含唯一 index=0 choice"
         )
     choice = choices[0]
-    calls = tuple(_tool_call(call) for call in choice.message.tool_calls or ())
+    calls = tuple(
+        _tool_call(call, tool_names=tool_names)
+        for call in choice.message.tool_calls or ()
+    )
     try:
         return ModelResponse(
             provider_id="deepseek",
@@ -282,7 +319,7 @@ def _merge_once(current: str, fragment: str | None) -> str:
 class DeepSeekStreamAccumulator:
     """聚合 SSE JSON 中的 content、reasoning、usage 与多个 Tool Call。"""
 
-    def __init__(self) -> None:
+    def __init__(self, *, tool_names: Mapping[str, str] | None = None) -> None:
         self._provider_request_id: str | None = None
         self._model: str | None = None
         self._content_parts: list[str] = []
@@ -291,6 +328,7 @@ class DeepSeekStreamAccumulator:
         self._tool_calls: dict[int, _ToolCallFragments] = {}
         self._finish_reason: ModelFinishReason | None = None
         self._usage: TokenUsage | None = None
+        self._tool_names = tool_names
         self.done = False
 
     def consume(self, data: str) -> None:
@@ -368,8 +406,11 @@ class DeepSeekStreamAccumulator:
                 try:
                     calls.append(
                         ToolCall(
-                            tool_call_id=fragments.tool_call_id,
-                            tool_name=fragments.name,
+                            tool_call_id=_local_tool_call_id(fragments.tool_call_id),
+                            tool_name=_local_tool_name(
+                                fragments.name,
+                                self._tool_names,
+                            ),
                             arguments=_arguments(fragments.arguments),
                         )
                     )

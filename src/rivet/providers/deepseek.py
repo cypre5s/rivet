@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import httpx
@@ -44,6 +46,80 @@ from rivet.providers.sse import SSEDecoder
 Environment = Mapping[str, str]
 Sleeper = Callable[[float], Awaitable[None]]
 Clock = Callable[[], datetime]
+MAX_DEEPSEEK_TOOL_NAME_CHARS = 64
+
+
+@dataclass(frozen=True, slots=True)
+class _ToolNameAliases:
+    """在单次请求内双向映射本地点分工具名与厂商合法名称。"""
+
+    local_to_wire: dict[str, str]
+    wire_to_local: dict[str, str]
+
+    @classmethod
+    def from_definitions(
+        cls, definitions: tuple[ToolDefinition, ...]
+    ) -> _ToolNameAliases:
+        """优先保留可读名称，并为冲突或超长名称追加稳定摘要。"""
+        preferred = {
+            definition.name: definition.name.replace(".", "_")
+            for definition in definitions
+        }
+        preferred_counts: dict[str, int] = {}
+        for candidate in preferred.values():
+            preferred_counts[candidate] = preferred_counts.get(candidate, 0) + 1
+        local_to_wire: dict[str, str] = {}
+        wire_to_local: dict[str, str] = {}
+        for local_name in sorted(preferred):
+            candidate = preferred[local_name]
+            if (
+                len(candidate) > MAX_DEEPSEEK_TOOL_NAME_CHARS
+                or preferred_counts[candidate] > 1
+                or candidate in wire_to_local
+            ):
+                candidate = cls._unique_hashed_alias(
+                    local_name,
+                    preferred=preferred[local_name],
+                    used=wire_to_local,
+                )
+            local_to_wire[local_name] = candidate
+            wire_to_local[candidate] = local_name
+        return cls(local_to_wire=local_to_wire, wire_to_local=wire_to_local)
+
+    def to_wire(self, local_name: str) -> str:
+        """拒绝把本轮未声明的历史工具调用发送给厂商。"""
+        try:
+            return self.local_to_wire[local_name]
+        except KeyError as error:
+            raise ProviderRequestError(
+                "provider.tool_name_unmapped",
+                "历史 Tool Call 名称不在当前工具定义中",
+                retryable=False,
+            ) from error
+
+    @staticmethod
+    def _unique_hashed_alias(
+        local_name: str,
+        *,
+        preferred: str,
+        used: Mapping[str, str],
+    ) -> str:
+        """逐步扩展 SHA-256 摘要，确保别名有界且不发生静默碰撞。"""
+        digest = hashlib.sha256(local_name.encode("utf-8")).hexdigest()
+        for digest_chars in (*range(12, 61, 8), 64):
+            if digest_chars == 64:
+                candidate = digest
+            else:
+                prefix_chars = MAX_DEEPSEEK_TOOL_NAME_CHARS - digest_chars - 1
+                prefix = preferred[:prefix_chars].rstrip("_")
+                candidate = f"{prefix}_{digest[:digest_chars]}"
+            if candidate not in used:
+                return candidate
+        raise ProviderRequestError(
+            "provider.tool_alias_collision",
+            "工具名称无法建立唯一厂商别名",
+            retryable=False,
+        )
 
 
 class DeepSeekProvider:
@@ -76,16 +152,30 @@ class DeepSeekProvider:
 
     def build_request_body(self, request: ModelRequest) -> dict[str, object]:
         """把本地消息与工具契约转换为 DeepSeek JSON 请求。"""
+        aliases = _ToolNameAliases.from_definitions(request.tools)
+        return self._build_request_body(request, aliases=aliases)
+
+    def _build_request_body(
+        self,
+        request: ModelRequest,
+        *,
+        aliases: _ToolNameAliases,
+    ) -> dict[str, object]:
+        """使用同一请求级别名映射序列化定义与历史调用。"""
         body: dict[str, object] = {
             "model": request.model,
-            "messages": [self._message(message) for message in request.messages],
+            "messages": [
+                self._message(message, aliases=aliases) for message in request.messages
+            ],
             "stream": request.stream,
             "max_tokens": request.max_tokens,
             "thinking": {"type": request.thinking.value},
             "reasoning_effort": self._reasoning_effort(request.reasoning_effort),
         }
         if request.tools:
-            body["tools"] = [self._tool_definition(tool) for tool in request.tools]
+            body["tools"] = [
+                self._tool_definition(tool, aliases=aliases) for tool in request.tools
+            ]
         if request.stream:
             body["stream_options"] = {"include_usage": True}
         return body
@@ -150,9 +240,14 @@ class DeepSeekProvider:
         request: ModelRequest,
     ) -> ModelResponse:
         """执行单次 HTTP 请求并解析流式或非流式响应。"""
-        body = self.build_request_body(request)
+        aliases = _ToolNameAliases.from_definitions(request.tools)
+        body = self._build_request_body(request, aliases=aliases)
         if request.stream:
-            return await self._complete_stream(client, body)
+            return await self._complete_stream(
+                client,
+                body,
+                wire_to_local=aliases.wire_to_local,
+            )
         response = await client.post("chat/completions", json=body)
         self._raise_for_status(response)
         try:
@@ -163,16 +258,22 @@ class DeepSeekProvider:
                 "模型响应不是有效 JSON",
                 retryable=False,
             ) from error
-        return parse_non_streaming_response(document, created_at=self._clock())
+        return parse_non_streaming_response(
+            document,
+            created_at=self._clock(),
+            tool_names=aliases.wire_to_local,
+        )
 
     async def _complete_stream(
         self,
         client: httpx.AsyncClient,
         body: dict[str, object],
+        *,
+        wire_to_local: Mapping[str, str],
     ) -> ModelResponse:
         """在响应上下文中增量解码 SSE，并确保取消时释放连接。"""
         decoder = SSEDecoder()
-        accumulator = DeepSeekStreamAccumulator()
+        accumulator = DeepSeekStreamAccumulator(tool_names=wire_to_local)
         async with client.stream("POST", "chat/completions", json=body) as response:
             self._raise_for_status(response)
             async for chunk in response.aiter_bytes():
@@ -239,7 +340,11 @@ class DeepSeekProvider:
             )
 
     @staticmethod
-    def _message(message: Message) -> dict[str, object]:
+    def _message(
+        message: Message,
+        *,
+        aliases: _ToolNameAliases,
+    ) -> dict[str, object]:
         """序列化消息并只回传当前 Provider 的不透明思考状态。"""
         if isinstance(message, (SystemMessage, UserMessage)):
             return {"role": message.role, "content": message.content}
@@ -255,7 +360,8 @@ class DeepSeekProvider:
         }
         if message.tool_calls:
             serialized["tool_calls"] = [
-                DeepSeekProvider._tool_call(call) for call in message.tool_calls
+                DeepSeekProvider._tool_call(call, aliases=aliases)
+                for call in message.tool_calls
             ]
         opaque_state = message.opaque_state
         if opaque_state is not None and opaque_state.provider_id == "deepseek":
@@ -267,13 +373,17 @@ class DeepSeekProvider:
         return serialized
 
     @staticmethod
-    def _tool_call(call: ToolCall) -> dict[str, object]:
+    def _tool_call(
+        call: ToolCall,
+        *,
+        aliases: _ToolNameAliases,
+    ) -> dict[str, object]:
         """把本地 Tool Call 转回兼容协议格式。"""
         return {
             "id": call.tool_call_id,
             "type": "function",
             "function": {
-                "name": call.tool_name,
+                "name": aliases.to_wire(call.tool_name),
                 "arguments": json.dumps(
                     call.arguments,
                     ensure_ascii=False,
@@ -284,12 +394,16 @@ class DeepSeekProvider:
         }
 
     @staticmethod
-    def _tool_definition(definition: ToolDefinition) -> dict[str, object]:
+    def _tool_definition(
+        definition: ToolDefinition,
+        *,
+        aliases: _ToolNameAliases,
+    ) -> dict[str, object]:
         """把本地工具定义包装为 function tool。"""
         return {
             "type": "function",
             "function": {
-                "name": definition.name,
+                "name": aliases.to_wire(definition.name),
                 "description": definition.description,
                 "parameters": definition.input_schema,
             },
