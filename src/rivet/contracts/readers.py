@@ -1,0 +1,66 @@
+"""定义多格式 Reader 的请求、分级支持与不可信输出契约。"""
+
+from __future__ import annotations
+
+from enum import StrEnum
+from typing import Literal
+
+from pydantic import Field, JsonValue
+
+from rivet.contracts.common import (
+    ArtifactReference,
+    CapabilityId,
+    ContractModel,
+    MediaType,
+    RepositoryPath,
+    SemVer,
+    Sha256Digest,
+    SourceSpan,
+)
+
+
+class ReaderStatus(StrEnum):
+    """区分成功、降级、不支持、截断和失败读取。"""
+
+    SUCCESS = "SUCCESS"
+    DEGRADED = "DEGRADED"
+    UNSUPPORTED = "UNSUPPORTED_CONTENT"
+    TRUNCATED = "TRUNCATED"
+    FAILED = "FAILED"
+
+
+class SupportLevel(StrEnum):
+    """表示 A 原生抽取、B 通用降级和 C 明确不支持。"""
+
+    NATIVE = "A"
+    FALLBACK = "B"
+    UNSUPPORTED = "C"
+
+
+class ReaderRequest(ContractModel):
+    """限定 Reader 输入路径、大小、时间与递归预算。"""
+
+    source_path: RepositoryPath
+    max_bytes: int = Field(default=50 * 1024 * 1024, gt=0)
+    timeout_seconds: int = Field(default=30, gt=0)
+    max_depth: int = Field(default=3, ge=0)
+    preferred_capability: CapabilityId | None = None
+
+
+class ReaderResult(ContractModel):
+    """为任意文件返回结构化状态、内容、来源和警告。"""
+
+    status: ReaderStatus
+    media_type: MediaType
+    detected_format: str = Field(min_length=1, max_length=128)
+    reader_id: CapabilityId
+    reader_version: SemVer
+    support_level: SupportLevel
+    content: str = Field(default="", max_length=4_000_000)
+    metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    warnings: tuple[str, ...] = ()
+    artifacts: tuple[ArtifactReference, ...] = ()
+    truncated: bool = False
+    source_sha256: Sha256Digest
+    source_spans: tuple[SourceSpan, ...] = ()
+    untrusted: Literal[True] = True
