@@ -7,12 +7,19 @@ from dataclasses import asdict
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from rivet.contracts.guard import Permission, PermissionScope
+from rivet.guard.sandbox import BubblewrapSandbox
 from rivet.kernel.resources import ResourceScope
 from rivet.tools.files import FileReader, TransactionFileWriter
 from rivet.tools.git import GitService
 from rivet.tools.paths import WorkspaceBoundary
-from rivet.tools.process import ProcessRunner
-from rivet.tools.registry import RawToolOutput, RegisteredTool, ToolRegistry
+from rivet.tools.process import ProcessExecutor, ProcessRunner
+from rivet.tools.registry import (
+    RawToolOutput,
+    RegisteredTool,
+    ToolAuthorizer,
+    ToolRegistry,
+)
 from rivet.tools.search import SearchService
 from rivet.tools.workspace import WorkspaceInspector
 
@@ -156,12 +163,14 @@ def build_workspace_tool_registry(
     scope: ResourceScope,
     model_preview_chars: int = 8_192,
     tui_preview_chars: int = 65_536,
+    authorizer: ToolAuthorizer | None = None,
+    process_executor: ProcessExecutor | None = None,
 ) -> ToolRegistry:
     """构造并按正式 CLI 语义顺序注册全部本地工具。"""
     reader = FileReader(boundary)
     writer = TransactionFileWriter(boundary)
     inspector = WorkspaceInspector(boundary)
-    process_runner = ProcessRunner(boundary, scope=scope)
+    process_runner = process_executor or BubblewrapSandbox(boundary, scope=scope)
     read_only_runner = ProcessRunner(
         boundary,
         scope=scope,
@@ -172,6 +181,7 @@ def build_workspace_tool_registry(
     registry = ToolRegistry(
         model_preview_chars=model_preview_chars,
         tui_preview_chars=tui_preview_chars,
+        authorizer=authorizer,
     )
 
     async def workspace_info(arguments: BaseModel) -> RawToolOutput:
@@ -282,52 +292,137 @@ def build_workspace_tool_registry(
             "读取工作区和 Git HEAD 概览",
             WorkspaceInfoArguments,
             workspace_info,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
         ),
         (
             "workspace.list",
             "受限列出工作区目录",
             WorkspaceListArguments,
             workspace_list,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
         ),
         (
             "file.read_text",
             "读取有大小限制的文本文件",
             FileReadTextArguments,
             file_read_text,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
         ),
         (
             "file.read_range",
             "读取文本文件的一基行范围",
             FileReadRangeArguments,
             file_read_range,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
         ),
-        ("file.write_transaction", "原子覆盖事务文件", FileWriteArguments, file_write),
+        (
+            "file.write_transaction",
+            "原子覆盖事务文件",
+            FileWriteArguments,
+            file_write,
+            Permission.WRITE,
+            PermissionScope.SPECIFIC_PATHS,
+            "path",
+        ),
         (
             "file.replace_transaction",
             "按预期次数替换事务文本",
             FileReplaceArguments,
             file_replace,
+            Permission.WRITE,
+            PermissionScope.SPECIFIC_PATHS,
+            "path",
         ),
         (
             "file.create_transaction",
             "原子创建事务文件",
             FileCreateArguments,
             file_create,
+            Permission.WRITE,
+            PermissionScope.SPECIFIC_PATHS,
+            "path",
         ),
         (
             "file.delete_transaction",
             "删除事务普通文件",
             FileDeleteArguments,
             file_delete,
+            Permission.WRITE,
+            PermissionScope.SPECIFIC_PATHS,
+            "path",
         ),
-        ("search.text", "使用 ripgrep 搜索文本", SearchTextArguments, search_text),
-        ("search.files", "使用 ripgrep 搜索文件名", SearchFilesArguments, search_files),
-        ("git.status", "读取 Git 工作树状态", GitStatusArguments, git_status),
-        ("git.diff", "读取 Git 补丁", GitDiffArguments, git_diff),
-        ("git.show", "读取 Git revision", GitShowArguments, git_show),
-        ("process.run", "以 argv 执行受限本地进程", ProcessRunArguments, process_run),
+        (
+            "search.text",
+            "使用 ripgrep 搜索文本",
+            SearchTextArguments,
+            search_text,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
+        ),
+        (
+            "search.files",
+            "使用 ripgrep 搜索文件名",
+            SearchFilesArguments,
+            search_files,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
+        ),
+        (
+            "git.status",
+            "读取 Git 工作树状态",
+            GitStatusArguments,
+            git_status,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
+        ),
+        (
+            "git.diff",
+            "读取 Git 补丁",
+            GitDiffArguments,
+            git_diff,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
+        ),
+        (
+            "git.show",
+            "读取 Git revision",
+            GitShowArguments,
+            git_show,
+            Permission.READ,
+            PermissionScope.WORKSPACE,
+            None,
+        ),
+        (
+            "process.run",
+            "以 argv 执行受限本地进程",
+            ProcessRunArguments,
+            process_run,
+            Permission.EXECUTE,
+            PermissionScope.TRANSACTION,
+            None,
+        ),
     )
-    for name, description, input_model, handler in registrations:
+    for (
+        name,
+        description,
+        input_model,
+        handler,
+        permission,
+        permission_scope,
+        path_argument,
+    ) in registrations:
         registry.register(
             RegisteredTool.from_model(
                 name=name,
@@ -335,6 +430,9 @@ def build_workspace_tool_registry(
                 description=description,
                 input_model=input_model,
                 handler=handler,
+                permission=permission,
+                permission_scope=permission_scope,
+                path_argument=path_argument,
             )
         )
     return registry

@@ -28,7 +28,7 @@ def main(argv: Sequence[str] | None = None) -> None:
     doctor_parser.add_argument("--repository", type=Path, default=Path.cwd())
     doctor_parser.add_argument(
         "--section",
-        choices=("lsp", "readers"),
+        choices=("lsp", "readers", "sandbox"),
         default="lsp",
     )
     read_parser = subparsers.add_parser("read", help="安全读取本地文件")
@@ -49,7 +49,18 @@ def main(argv: Sequence[str] | None = None) -> None:
             raise SystemExit(exit_code)
     elif command == "doctor":
         section = cast(str, arguments.section)
-        if section == "readers":
+        if section == "sandbox":
+            from rivet.guard.doctor import SandboxDoctor
+
+            sandbox_report = SandboxDoctor().inspect()
+            if cast(bool, arguments.json_output):
+                print(sandbox_report.to_json())
+            else:
+                print(f"bubblewrap: {sandbox_report.status}")
+                print(sandbox_report.next_action)
+            if not sandbox_report.ready:
+                raise SystemExit(1)
+        elif section == "readers":
             from rivet.readers.doctor import ReaderDoctor
 
             reader_report = ReaderDoctor().inspect()

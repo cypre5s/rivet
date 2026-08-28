@@ -5,6 +5,11 @@ from pydantic import BaseModel
 from rivet.contracts.common import ArtifactReference, ErrorDetail, SourceSpan
 from rivet.contracts.context import ContextBudget, ContextItem, ContextSelection
 from rivet.contracts.events import TraceEventEnvelope
+from rivet.contracts.guard import (
+    AuthorizationDecision,
+    CapabilityLease,
+    PermissionRequest,
+)
 from rivet.contracts.ipc import IpcEvent, IpcRequest, IpcResponse
 from rivet.contracts.messages import (
     AssistantMessage,
@@ -40,6 +45,9 @@ CONTRACT_MODELS: tuple[type[BaseModel], ...] = (
     ContextItem,
     ContextSelection,
     TraceEventEnvelope,
+    AuthorizationDecision,
+    CapabilityLease,
+    PermissionRequest,
     IpcEvent,
     IpcRequest,
     IpcResponse,

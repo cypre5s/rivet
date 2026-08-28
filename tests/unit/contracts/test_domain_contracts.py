@@ -13,7 +13,13 @@ from rivet.contracts.readers import (
     SupportLevel,
 )
 from rivet.contracts.transactions import AcceptanceSpec
-from rivet.contracts.verification import Verdict, VerificationStatus
+from rivet.contracts.verification import (
+    Verdict,
+    VerificationKind,
+    VerificationResult,
+    VerificationStatus,
+    VerificationStep,
+)
 
 
 def test_module_manifest_rejects_duplicate_capabilities() -> None:
@@ -103,12 +109,29 @@ def test_acceptance_spec_rejects_allowed_and_forbidden_overlap() -> None:
 
 
 def test_verdict_rejects_forged_passed_flag() -> None:
+    step = VerificationStep(
+        step_id="verification_contract",
+        kind=VerificationKind.TARGETED,
+        name="契约失败步骤",
+        required=True,
+        command=("pytest",),
+        timeout_seconds=30,
+    )
+    result = VerificationResult(
+        step=step,
+        status=VerificationStatus.FAILED,
+        exit_code=1,
+        duration_ms=1,
+    )
+
     with pytest.raises(ValidationError):
         Verdict(
             transaction_id="tx_example",
             acceptance_sha256="sha256:" + ("c" * 64),
+            evidence_id="evidence_example",
+            evidence_manifest_path="evidence/attempt_0001/manifest.json",
             status=VerificationStatus.FAILED,
             passed=True,
-            results=(),
+            results=(result,),
             decided_at=datetime(2026, 8, 28, tzinfo=UTC),
         )

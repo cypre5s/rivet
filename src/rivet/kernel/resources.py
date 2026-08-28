@@ -280,8 +280,22 @@ class ResourceScope:
             cleanup_worktree,
             is_active=path.exists,
             description=description,
+            handle=path,
         )
         return path
+
+    def release_worktree(self, path: Path) -> None:
+        """在 Worktree 已清理后同步移除其资源登记。"""
+        if path.exists():
+            raise ResourceCleanupError("仍存在的 Worktree 不得提前移除资源登记")
+        resolved = path.resolve(strict=False)
+        for resource_id, resource in tuple(self._resources.items()):
+            if resource.kind is not ResourceKind.WORKTREE:
+                continue
+            handle = resource.handle
+            if isinstance(handle, Path) and handle.resolve(strict=False) == resolved:
+                self._resources.pop(resource_id, None)
+                return
 
     def counts(self) -> ResourceCounts:
         """返回当前仍登记且活动的资源计数。"""

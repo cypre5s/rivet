@@ -9,7 +9,7 @@ import signal
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Protocol
 
 from rivet.kernel.resources import ResourceScope
 from rivet.tools.errors import ProcessToolError
@@ -36,6 +36,21 @@ class ProcessRunResult:
     stderr_total_bytes: int
     stdout_sha256: str
     stderr_sha256: str
+
+
+class ProcessExecutor(Protocol):
+    """抽象裸进程原语与失败关闭沙箱共有的执行接口。"""
+
+    async def run(
+        self,
+        argv: tuple[str, ...],
+        *,
+        cwd: str = ".",
+        timeout_seconds: float,
+        environment: Mapping[str, str] | None = None,
+    ) -> ProcessRunResult:
+        """执行一个无 shell argv 并返回有界结果。"""
+        ...
 
 
 @dataclass(frozen=True, slots=True)

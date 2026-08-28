@@ -11,6 +11,7 @@ from pydantic import Field, StringConstraints, model_validator
 from rivet.contracts.common import (
     AcceptanceId,
     ContractModel,
+    EvidenceId,
     GitCommit,
     NonEmptyText,
     PatchId,
@@ -79,6 +80,7 @@ class PatchSet(ContractModel):
     patch_id: PatchId
     transaction_id: TransactionId
     base_commit: GitCommit
+    acceptance_sha256: Sha256Digest
     patch_sha256: Sha256Digest
     changed_files: tuple[RepositoryPath, ...]
     changed_symbols: tuple[str, ...] = ()
@@ -91,7 +93,41 @@ class TransactionRecord(ContractModel):
 
     transaction_id: TransactionId
     state: TransactionState
+    repository_identity: Sha256Digest
+    repository_fingerprint: Sha256Digest
+    head_commit: GitCommit
     base_commit: GitCommit
+    branch: str | None = Field(default=None, min_length=1, max_length=255)
+    detached_head: bool
+    dirty: bool
+    dirty_snapshot_hash: GitCommit | None = None
+    has_submodules: bool
+    submodule_status_sha256: Sha256Digest
+    git_config_summary: tuple[str, ...] = ()
     acceptance_sha256: Sha256Digest | None = None
+    current_patch_id: PatchId | None = None
+    evidence_id: EvidenceId | None = None
+    evidence_manifest_path: RepositoryPath | None = None
+    evidence_manifest_sha256: Sha256Digest | None = None
     created_at: Timestamp
     updated_at: Timestamp
+
+    @model_validator(mode="after")
+    def _validate_evidence_attestation(self) -> Self:
+        """要求三个证据绑定字段同时存在，并覆盖可交付状态。"""
+        evidence_fields = (
+            self.evidence_id,
+            self.evidence_manifest_path,
+            self.evidence_manifest_sha256,
+        )
+        if any(value is not None for value in evidence_fields) and not all(
+            value is not None for value in evidence_fields
+        ):
+            raise ValueError("事务证据绑定字段必须同时存在")
+        if self.state in {
+            TransactionState.VERIFIED,
+            TransactionState.REJECTED,
+            TransactionState.APPLIED,
+        } and not all(value is not None for value in evidence_fields):
+            raise ValueError("已判定事务必须绑定 Evidence manifest")
+        return self

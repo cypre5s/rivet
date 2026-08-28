@@ -76,15 +76,38 @@ class Verdict(ContractModel):
 
     transaction_id: TransactionId
     acceptance_sha256: Sha256Digest
+    evidence_id: EvidenceId
+    evidence_manifest_path: RepositoryPath
     status: VerificationStatus
     passed: bool
-    results: tuple[VerificationResult, ...]
+    results: tuple[VerificationResult, ...] = Field(min_length=1)
     decided_at: Timestamp
 
     @model_validator(mode="after")
     def _validate_passed_flag(self) -> Self:
-        """保证只有 PASSED 状态可序列化为 passed=true。"""
-        if self.passed != (self.status is VerificationStatus.PASSED):
+        """按 required 结果重算状态，并拒绝重复步骤或自由结论。"""
+        step_ids = [result.step.step_id for result in self.results]
+        if len(step_ids) != len(set(step_ids)):
+            raise ValueError("Verdict.results 不得包含重复步骤")
+        required_statuses = tuple(
+            result.status for result in self.results if result.step.required
+        )
+        if not required_statuses:
+            raise ValueError("Verdict 必须包含 required 验证结果")
+        if any(status is VerificationStatus.CANCELLED for status in required_statuses):
+            computed = VerificationStatus.CANCELLED
+        elif any(status is VerificationStatus.FAILED for status in required_statuses):
+            computed = VerificationStatus.FAILED
+        elif any(
+            status in {VerificationStatus.INCONCLUSIVE, VerificationStatus.BLOCKED}
+            for status in required_statuses
+        ):
+            computed = VerificationStatus.INCONCLUSIVE
+        else:
+            computed = VerificationStatus.PASSED
+        if self.status is not computed:
+            raise ValueError("Verdict.status 必须由 required 结果程序化计算")
+        if self.passed != (computed is VerificationStatus.PASSED):
             raise ValueError("Verdict.passed 必须由程序化状态决定")
         return self
 

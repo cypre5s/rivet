@@ -85,6 +85,27 @@ async def test_scope_runs_worktree_cleanup_once(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_scope_releases_only_removed_worktree(tmp_path: Path) -> None:
+    scope = ResourceScope("transaction.worktree.release")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    async def cleanup(path: Path) -> None:
+        """为意外关闭保留可执行清理动作。"""
+        path.rmdir()
+
+    scope.register_worktree(worktree, cleanup=cleanup, description="事务 Worktree")
+
+    with pytest.raises(ResourceCleanupError, match="仍存在"):
+        scope.release_worktree(worktree)
+    worktree.rmdir()
+    scope.release_worktree(worktree)
+
+    scope.assert_empty()
+    await scope.close()
+
+
+@pytest.mark.asyncio
 async def test_scope_releases_only_finished_tasks_and_waited_processes() -> None:
     scope = ResourceScope("context.lsp.release")
     task = scope.create_task(asyncio.sleep(3_600), description="测试读取任务")

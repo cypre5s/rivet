@@ -8,10 +8,12 @@ from pathlib import Path
 import pytest
 from pydantic import BaseModel, ConfigDict
 
+from rivet.contracts.guard import AuthorizationDecision, AuthorizationStatus
 from rivet.contracts.tools import ToolCall, ToolDefinition
 from rivet.kernel.agent_tools import AgentTool
 from rivet.kernel.resources import ResourceScope
 from rivet.tools.paths import WorkspaceBoundary
+from rivet.tools.process import ProcessRunner
 from rivet.tools.registry import ToolInvocationContext
 from rivet.tools.toolset import WORKSPACE_TOOL_NAMES, build_workspace_tool_registry
 from rivet.trace.paths import RuntimePaths
@@ -36,6 +38,15 @@ async def _plain_executor(arguments: BaseModel) -> str:
 async def _call_executor(call: ToolCall, arguments: BaseModel) -> str:
     """提供保留 call id 的无副作用工具函数。"""
     return call.tool_call_id + arguments.model_dump_json()
+
+
+def _allow_test_tool(_request: object) -> AuthorizationDecision:
+    """仅为工具适配测试提供显式的无交互批准。"""
+    return AuthorizationDecision(
+        status=AuthorizationStatus.ALLOWED,
+        code="guard.test_authorized",
+        summary="测试显式授权",
+    )
 
 
 def _definition() -> ToolDefinition:
@@ -116,11 +127,14 @@ async def test_registry_records_trace_and_keeps_model_view_smaller(
     transaction.mkdir()
     trace = await _start_trace(tmp_path, repository)
     scope = ResourceScope("tools.trace")
+    boundary = WorkspaceBoundary(repository, transaction)
     registry = build_workspace_tool_registry(
-        WorkspaceBoundary(repository, transaction),
+        boundary,
         scope=scope,
         model_preview_chars=32,
         tui_preview_chars=256,
+        authorizer=_allow_test_tool,
+        process_executor=ProcessRunner(boundary, scope=scope),
     )
     call = ToolCall(
         tool_call_id="call_process_trace",
@@ -133,6 +147,7 @@ async def test_registry_records_trace_and_keeps_model_view_smaller(
     context = ToolInvocationContext(
         run_id="run_tool_trace",
         session_id="session_tool_trace",
+        transaction_id="tx_tool_trace",
         trace=trace,
     )
 
@@ -161,8 +176,12 @@ async def test_registry_redacts_secret_from_all_views_and_artifact(
     transaction.mkdir()
     trace = await _start_trace(tmp_path, repository)
     scope = ResourceScope("tools.redaction")
+    boundary = WorkspaceBoundary(repository, transaction)
     registry = build_workspace_tool_registry(
-        WorkspaceBoundary(repository, transaction), scope=scope
+        boundary,
+        scope=scope,
+        authorizer=_allow_test_tool,
+        process_executor=ProcessRunner(boundary, scope=scope),
     )
     secret = "sk-" + ("z" * 32)
     call = ToolCall(
@@ -176,6 +195,7 @@ async def test_registry_redacts_secret_from_all_views_and_artifact(
     context = ToolInvocationContext(
         run_id="run_tool_redaction",
         session_id="session_tool_redaction",
+        transaction_id="tx_tool_redaction",
         trace=trace,
     )
 
@@ -184,6 +204,7 @@ async def test_registry_redacts_secret_from_all_views_and_artifact(
         view.output_capture.stdout.artifact.path
     )
 
+    assert view.result.success
     assert secret not in view.model_text
     assert secret not in view.tui_text
     assert secret not in view.result.model_dump_json()
@@ -203,8 +224,12 @@ async def test_process_tool_can_write_transaction_but_not_main_root(
     transaction.mkdir()
     scope = ResourceScope("tools.process.transaction")
     trace = await _start_trace(tmp_path, repository)
+    boundary = WorkspaceBoundary(repository, transaction)
     registry = build_workspace_tool_registry(
-        WorkspaceBoundary(repository, transaction), scope=scope
+        boundary,
+        scope=scope,
+        authorizer=_allow_test_tool,
+        process_executor=ProcessRunner(boundary, scope=scope),
     )
     call = ToolCall(
         tool_call_id="call_process_write",
@@ -221,6 +246,7 @@ async def test_process_tool_can_write_transaction_but_not_main_root(
     context = ToolInvocationContext(
         run_id="run_process_write",
         session_id="session_process_write",
+        transaction_id="tx_process_write",
         trace=trace,
     )
 

@@ -12,6 +12,14 @@ from typing import cast
 from pydantic import BaseModel, JsonValue, ValidationError
 
 from rivet.contracts.common import RunId, SessionId, TransactionId
+from rivet.contracts.guard import (
+    AuthorizationDecision,
+    AuthorizationStatus,
+    Permission,
+    PermissionRequest,
+    PermissionScope,
+    TaintSource,
+)
 from rivet.contracts.tools import (
     ToolCall,
     ToolDefinition,
@@ -28,6 +36,7 @@ from rivet.trace.store import TraceStore
 
 Clock = Callable[[], datetime]
 ToolHandler = Callable[[BaseModel], Awaitable["RawToolOutput"]]
+ToolAuthorizer = Callable[[PermissionRequest], AuthorizationDecision]
 
 
 def _utc_now() -> datetime:
@@ -57,6 +66,9 @@ class RegisteredTool:
     capability_id: str
     input_model: type[BaseModel]
     handler: ToolHandler
+    permission: Permission = Permission.READ
+    permission_scope: PermissionScope = PermissionScope.WORKSPACE
+    path_argument: str | None = None
 
     @classmethod
     def from_model(
@@ -67,6 +79,9 @@ class RegisteredTool:
         description: str,
         input_model: type[BaseModel],
         handler: ToolHandler,
+        permission: Permission = Permission.READ,
+        permission_scope: PermissionScope = PermissionScope.WORKSPACE,
+        path_argument: str | None = None,
     ) -> RegisteredTool:
         """从拒绝额外字段的 Pydantic 模型生成工具定义。"""
         if input_model.model_config.get("extra") != "forbid":
@@ -81,17 +96,21 @@ class RegisteredTool:
             capability_id=capability_id,
             input_model=input_model,
             handler=handler,
+            permission=permission,
+            permission_scope=permission_scope,
+            path_argument=path_argument,
         )
 
 
 @dataclass(frozen=True, slots=True)
 class ToolInvocationContext:
-    """提供 Trace 关联身份和可选事务身份。"""
+    """提供 Trace 关联身份、事务身份和权限来源污点。"""
 
     run_id: RunId
     session_id: SessionId
     trace: TraceStore
     transaction_id: TransactionId | None = None
+    taint_sources: tuple[TaintSource, ...] = (TaintSource.USER_INSTRUCTION,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +134,7 @@ class ToolRegistry:
         clock: Clock = _utc_now,
         event_builder: TraceEventBuilder | None = None,
         redactor: SecretRedactor | None = None,
+        authorizer: ToolAuthorizer | None = None,
     ) -> None:
         if model_preview_chars <= 0 or tui_preview_chars < model_preview_chars:
             raise ValueError("工具视图预算必须为正且 TUI 不小于模型视图")
@@ -125,6 +145,7 @@ class ToolRegistry:
         self._clock = clock
         self._event_builder = event_builder or TraceEventBuilder(clock=clock)
         self._redactor = redactor or SecretRedactor()
+        self._authorizer = authorizer
 
     @property
     def names(self) -> tuple[str, ...]:
@@ -226,9 +247,47 @@ class ToolRegistry:
                 raise WorkspaceToolError(
                     "tool.validation_failed", "工具参数未通过本地 Schema"
                 ) from error
+            decision = self._authorize(registered, arguments, context)
+            if decision.status is not AuthorizationStatus.ALLOWED:
+                authorization_event = self._event_builder.build(
+                    event_type=(
+                        "guard.authorization_prompted"
+                        if decision.status is AuthorizationStatus.PROMPT
+                        else "guard.authorization_denied"
+                    ),
+                    run_id=context.run_id,
+                    session_id=context.session_id,
+                    transaction_id=context.transaction_id,
+                    parent_event_id=started_event.event_id,
+                    result_summary=decision.summary,
+                    payload={
+                        "tool_name": call.tool_name,
+                        "permission": registered.permission.value,
+                        "decision_code": decision.code,
+                    },
+                )
+                await context.trace.emit(authorization_event)
+                raise WorkspaceToolError(decision.code, decision.summary)
             raw_output = await registered.handler(arguments)
             success = True
         except WorkspaceToolError as error:
+            if error.code.startswith("sandbox.") or error.code in {
+                "guard.command_denied",
+                "guard.environment_denied",
+            }:
+                violation_event = self._event_builder.build(
+                    event_type="sandbox.violation",
+                    run_id=context.run_id,
+                    session_id=context.session_id,
+                    transaction_id=context.transaction_id,
+                    parent_event_id=started_event.event_id,
+                    result_summary=error.summary,
+                    payload={
+                        "tool_name": call.tool_name,
+                        "violation_code": error.code,
+                    },
+                )
+                await context.trace.emit(violation_event)
             raw_output = RawToolOutput(stderr=error.summary.encode("utf-8"))
             tool_error = ToolError(
                 code=error.code,
@@ -318,6 +377,48 @@ class ToolRegistry:
         )
         await context.trace.emit(completed_event)
         return ToolInvocationView(result, model_text, tui_text, output_capture)
+
+    def _authorize(
+        self,
+        registered: RegisteredTool,
+        arguments: BaseModel,
+        context: ToolInvocationContext,
+    ) -> AuthorizationDecision:
+        """把工具元数据转成权限请求，并让敏感工具在无策略时失败。"""
+        if self._authorizer is None:
+            if registered.permission is Permission.READ:
+                return AuthorizationDecision(
+                    status=AuthorizationStatus.ALLOWED,
+                    code="guard.read_auto_approved",
+                    summary="安全工作区读取已自动批准",
+                )
+            return AuthorizationDecision(
+                status=AuthorizationStatus.DENIED,
+                code="guard.authorization_unavailable",
+                summary="敏感工具缺少权限策略",
+            )
+        paths: tuple[str, ...] = ()
+        if registered.permission_scope is PermissionScope.SPECIFIC_PATHS:
+            if registered.path_argument is None:
+                raise WorkspaceToolError(
+                    "guard.path_scope_invalid", "具体路径工具缺少路径参数声明"
+                )
+            path_value = getattr(arguments, registered.path_argument, None)
+            if not isinstance(path_value, str):
+                raise WorkspaceToolError(
+                    "guard.path_scope_invalid", "具体路径工具参数不是单一路径"
+                )
+            paths = (path_value,)
+        request = PermissionRequest(
+            permission=registered.permission,
+            scope=registered.permission_scope,
+            reason=f"调用工具 {registered.definition.name}",
+            run_id=context.run_id,
+            transaction_id=context.transaction_id,
+            paths=paths,
+            taint_sources=context.taint_sources,
+        )
+        return self._authorizer(request)
 
     @staticmethod
     def _render_bytes(content: bytes) -> str:

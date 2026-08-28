@@ -8,7 +8,7 @@ import json
 import sys
 import tempfile
 from collections.abc import Sequence
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
 from time import perf_counter
@@ -30,7 +30,17 @@ from rivet.context.semantic import (
     SemanticRetrievalStatus,
 )
 from rivet.contracts.context import ContextBudget, ContextSelection
+from rivet.contracts.guard import (
+    AuthorizationStatus,
+    Permission,
+    PermissionRequest,
+    PermissionScope,
+    TaintSource,
+)
+from rivet.guard.command_policy import CommandPolicy
+from rivet.guard.permissions import GuardPolicy
 from rivet.kernel.resources import ResourceScope
+from rivet.tools.errors import ProcessToolError
 from rivet.tools.paths import WorkspaceBoundary
 from rivet.tools.process import ProcessRunner
 
@@ -309,12 +319,115 @@ async def run_context_full() -> dict[str, object]:
         }
 
 
+def run_security() -> dict[str, object]:
+    """运行三十项权限、提示注入、命令和秘密环境拒绝任务。"""
+    fixture_path = Path(__file__).parents[1] / "tests/fixtures/security/tasks.json"
+    raw_cases = cast(list[dict[str, object]], json.loads(fixture_path.read_text()))
+    results: list[dict[str, object]] = []
+    for raw_case in raw_cases:
+        case_id = cast(str, raw_case["id"])
+        expected_code = cast(str, raw_case["expected_code"])
+        actual_code = _evaluate_security_case(raw_case)
+        results.append(
+            {
+                "case_id": case_id,
+                "expected_code": expected_code,
+                "actual_code": actual_code,
+                "passed": actual_code == expected_code,
+            }
+        )
+    passed_count = sum(bool(result["passed"]) for result in results)
+    return {
+        "schema_version": 1,
+        "suite": "security",
+        "passed": len(results) == 30 and passed_count == 30,
+        "case_count": len(results),
+        "passed_count": passed_count,
+        "blocked_count": passed_count,
+        "results": results,
+    }
+
+
+def _evaluate_security_case(raw_case: dict[str, object]) -> str:
+    """按任务类型返回稳定拒绝码，不执行任何 fixture 文本。"""
+    kind = cast(str, raw_case["kind"])
+    command_policy = CommandPolicy()
+    if kind == "command":
+        try:
+            command_policy.validate(tuple(cast(list[str], raw_case["argv"])))
+        except ProcessToolError as error:
+            return error.code
+        return "security.unexpected_allow"
+    if kind == "environment":
+        try:
+            command_policy.validate_environment(
+                cast(dict[str, str], raw_case["environment"])
+            )
+        except ProcessToolError as error:
+            return error.code
+        return "security.unexpected_allow"
+    current = [FIXED_NOW]
+    interactive = cast(bool, raw_case.get("interactive", False))
+    policy = GuardPolicy(headless=not interactive, clock=lambda: current[0])
+    request = _security_request(raw_case, target=False)
+    if (
+        raw_case.get("lease")
+        or raw_case.get("lease_paths")
+        or raw_case.get("lease_domains")
+    ):
+        expires_after = cast(int, raw_case.get("expires_after_seconds", 60))
+        policy.issue_lease(
+            request,
+            approved_by_user=True,
+            expires_at=FIXED_NOW + timedelta(seconds=expires_after),
+            max_uses=1,
+        )
+        if raw_case.get("preconsume"):
+            policy.authorize(request)
+    current[0] = FIXED_NOW + timedelta(
+        seconds=cast(int, raw_case.get("advance_seconds", 0))
+    )
+    decision = policy.authorize(_security_request(raw_case, target=True))
+    if decision.status is AuthorizationStatus.ALLOWED:
+        return "security.unexpected_allow"
+    return decision.code
+
+
+def _security_request(
+    raw_case: dict[str, object], *, target: bool
+) -> PermissionRequest:
+    """把固定 JSON 字段转换成严格权限请求。"""
+    paths_key = "paths" if target else "lease_paths"
+    domains_key = "domains" if target else "lease_domains"
+    paths = cast(list[str], raw_case.get(paths_key, raw_case.get("paths", [])))
+    domains = cast(list[str], raw_case.get(domains_key, raw_case.get("domains", [])))
+    taint_value = cast(str, raw_case.get("taint", "user_instruction"))
+    run_id = cast(
+        str,
+        raw_case.get("target_run", "run_security") if target else "run_security",
+    )
+    transaction_id = cast(
+        str,
+        raw_case.get("target_transaction", "tx_security") if target else "tx_security",
+    )
+    return PermissionRequest(
+        permission=Permission(cast(str, raw_case["permission"])),
+        scope=PermissionScope(cast(str, raw_case["scope"])),
+        reason="执行安全基准动作",
+        run_id=run_id,
+        transaction_id=transaction_id,
+        paths=tuple(paths),
+        domains=tuple(domains),
+        taint_sources=(TaintSource(taint_value),),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     """构造基准套件与可选结果文件参数。"""
     parser = argparse.ArgumentParser(description="运行 Rivet 可重复基准")
     parser.add_argument(
         "--suite",
-        choices=("context-smoke", "context-full"),
+        choices=("context-smoke", "context-full", "security"),
         required=True,
     )
     parser.add_argument("--output", type=Path)
@@ -330,6 +443,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = asyncio.run(run_context_smoke())
     elif suite == "context-full":
         result = asyncio.run(run_context_full())
+    elif suite == "security":
+        result = run_security()
     else:
         raise AssertionError("参数解析器不得产生未知套件")
     serialized = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)

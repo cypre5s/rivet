@@ -67,6 +67,10 @@ ResourceId = Annotated[
         pattern=rf"^resource_{IDENTIFIER_SUFFIX_PATTERN}$", max_length=85
     ),
 ]
+LeaseId = Annotated[
+    str,
+    StringConstraints(pattern=rf"^lease_{IDENTIFIER_SUFFIX_PATTERN}$", max_length=82),
+]
 VerificationStepId = Annotated[
     str,
     StringConstraints(
