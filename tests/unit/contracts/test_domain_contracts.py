@@ -70,6 +70,7 @@ def test_context_item_records_source_reason_and_cost() -> None:
 def test_reader_result_is_explicitly_untrusted_and_structured() -> None:
     result = ReaderResult(
         status=ReaderStatus.SUCCESS,
+        source_path="docs/input.txt",
         media_type="text/plain",
         detected_format="text",
         reader_id="reader.text",

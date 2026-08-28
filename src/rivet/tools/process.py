@@ -151,6 +151,9 @@ class ProcessRunner:
             if process.returncode is None:
                 await self._terminate_tree(process)
         stdout_capture, stderr_capture = await asyncio.gather(stdout_task, stderr_task)
+        self._scope.release_task(stdout_task)
+        self._scope.release_task(stderr_task)
+        self._scope.release_process(process)
         return ProcessRunResult(
             argv=argv,
             cwd=relative_cwd,
