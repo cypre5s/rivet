@@ -696,6 +696,31 @@ class TransactionManager:
         self._register_worktree(worktree)
         return record
 
+    def suspend(self, transaction_id: str) -> TransactionRecord:
+        """验证持久化记录后把活动 Worktree 移交给下次恢复。"""
+        store = self._require_store()
+        record = store.load_record(transaction_id)
+        if record.state in TERMINAL_STATES:
+            raise TransactionError(
+                "transaction.suspend_terminal",
+                "终态事务不需要挂起恢复",
+            )
+        if self._verification_worktrees:
+            raise TransactionError(
+                "transaction.suspend_verification_active",
+                "验证临时 Worktree 尚未清理",
+            )
+        worktree = self._active_worktree(record)
+        resolved = worktree.resolve(strict=False)
+        if resolved not in self._registered_worktrees:
+            raise TransactionError(
+                "transaction.suspend_unregistered",
+                "事务 Worktree 未登记到当前运行",
+            )
+        self._scope.transfer_persisted_worktree(resolved)
+        self._registered_worktrees.remove(resolved)
+        return record
+
     async def cleanup_orphans(self) -> tuple[Path, ...]:
         """只清理扫描中确认缺少活动记录的 cache Worktree。"""
         report = await self.scan_recovery()

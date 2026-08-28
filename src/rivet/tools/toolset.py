@@ -165,6 +165,7 @@ def build_workspace_tool_registry(
     tui_preview_chars: int = 65_536,
     authorizer: ToolAuthorizer | None = None,
     process_executor: ProcessExecutor | None = None,
+    read_only: bool = False,
 ) -> ToolRegistry:
     """构造并按正式 CLI 语义顺序注册全部本地工具。"""
     reader = FileReader(boundary)
@@ -423,6 +424,8 @@ def build_workspace_tool_registry(
         permission_scope,
         path_argument,
     ) in registrations:
+        if read_only and permission is not Permission.READ:
+            continue
         registry.register(
             RegisteredTool.from_model(
                 name=name,

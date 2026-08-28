@@ -15,7 +15,8 @@ htmlcov/
 *.log
 *.sqlite
 *.sqlite3
-.rivet/
+.rivet/*
+!.rivet/project.toml
 .rivet-dev/
 artifacts/local/
 reports/local/

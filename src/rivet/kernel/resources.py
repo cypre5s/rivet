@@ -297,6 +297,20 @@ class ResourceScope:
                 self._resources.pop(resource_id, None)
                 return
 
+    def transfer_persisted_worktree(self, path: Path) -> None:
+        """把仍存在但已有持久化所有者的 Worktree 移交给恢复层。"""
+        resolved = path.resolve(strict=False)
+        for resource_id, resource in tuple(self._resources.items()):
+            if resource.kind is not ResourceKind.WORKTREE:
+                continue
+            handle = resource.handle
+            if isinstance(handle, Path) and handle.resolve(strict=False) == resolved:
+                if not path.is_dir():
+                    raise ResourceCleanupError("持久化 Worktree 必须仍为目录")
+                self._resources.pop(resource_id, None)
+                return
+        raise ResourceCleanupError("待移交 Worktree 未登记到当前资源域")
+
     def counts(self) -> ResourceCounts:
         """返回当前仍登记且活动的资源计数。"""
         active_resources = tuple(

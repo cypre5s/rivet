@@ -176,7 +176,7 @@ class ProjectDetector:
                 "verification.project_config_invalid",
                 "项目验证配置无法解析",
             ) from error
-        if set(payload) - {"schema_version", "verification"}:
+        if set(payload) - {"schema_version", "rivet", "verification"}:
             raise VerificationError(
                 "verification.project_config_unknown_field",
                 "项目验证配置包含未知顶层字段",

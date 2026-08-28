@@ -2,4 +2,4 @@
 
 from rivet import main
 
-main()
+raise SystemExit(main())

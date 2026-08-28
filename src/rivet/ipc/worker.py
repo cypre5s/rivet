@@ -189,7 +189,13 @@ class WorkerSession:
             {
                 "status": "ready",
                 "protocol_version": 1,
-                "capabilities": ["events", "cancel", "snapshot"],
+                "capabilities": [
+                    "events",
+                    "cancel",
+                    "snapshot",
+                    "commands",
+                    "permissions",
+                ],
             },
         )
         await self.emit(
@@ -297,7 +303,13 @@ async def run_stdio_worker(repository: Path) -> int:
             sys.stdout.buffer.write(message.encode("utf-8"))
             sys.stdout.buffer.flush()
 
-    session = WorkerSession(repository, write_message=write_message)
+    from rivet.ipc.command_application import CommandWorkerApplication
+
+    session = WorkerSession(
+        repository,
+        write_message=write_message,
+        application=CommandWorkerApplication(repository),
+    )
     try:
         while not session.shutdown_requested:
             line = await asyncio.to_thread(read_bounded_ipc_line, sys.stdin.buffer)
