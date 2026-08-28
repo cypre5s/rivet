@@ -1,4 +1,4 @@
-"""验证 TUI 无终端 smoke 仍展示完整工作台状态。"""
+"""验证 TUI 无终端 smoke 仍保留全部按需工作台状态。"""
 
 from __future__ import annotations
 
@@ -22,15 +22,18 @@ def test_tui_smoke_model_contains_required_panels() -> None:
 
     payload = cast(dict[str, object], json.loads(completed.stdout.decode()))
     assert completed.returncode == 0, completed.stderr.decode()
-    assert payload["layout"] == "three-column"
+    assert payload["layout"] == "wide"
     assert payload["no_color"] is True
     assert payload["inspector_tabs"] == [
         "Plan",
         "Context",
+        "Files",
         "Diff",
         "Verify",
         "Evidence",
         "Modules",
+        "Trace",
+        "Sessions",
     ]
     assert payload["permission_visible"] is True
     assert payload["command_methods"] == [

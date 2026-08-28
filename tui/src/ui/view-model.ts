@@ -4,10 +4,13 @@ import { computeLayout } from "./layout.ts";
 export const INSPECTOR_TABS = [
   "Plan",
   "Context",
+  "Files",
   "Diff",
   "Verify",
   "Evidence",
   "Modules",
+  "Trace",
+  "Sessions",
 ] as const;
 
 export interface ViewOptions {

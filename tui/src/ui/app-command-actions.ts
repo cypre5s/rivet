@@ -1,0 +1,409 @@
+import type {
+  Dispatch,
+  SetStateAction,
+} from "react";
+
+import type { PasteAttachment } from "../components/composer.tsx";
+import type { ThemeName } from "../components/theme.ts";
+import type { WorkerClient } from "../ipc/client.ts";
+import type { RivetAction, RivetState } from "../state/reducer.ts";
+import {
+  commandNeedsArgument,
+  costLines,
+  descriptorForInput,
+  hasArgumentChoices,
+  keyHelpLines,
+  MAX_CONTEXT_FILES,
+  MODELS,
+  panelForAction,
+  parseMode,
+  statusLines,
+  type Overlay,
+} from "./app-model.ts";
+import {
+  COMMAND_REGISTRY,
+  commandAvailability,
+  findCommand,
+  type CommandContext,
+  type CommandDescriptor,
+  type CommandOutcome,
+  type PanelName,
+  type WorkMode,
+} from "./command-registry.ts";
+import { parseCommandInput, replaceFileMention } from "./commands.ts";
+import { appendHistory, redactRecentCommand } from "./history.ts";
+
+export interface AppCommandEnvironment {
+  rivetState: RivetState;
+  mode: WorkMode;
+  running: boolean;
+  contextFiles: string[];
+  attachments: PasteAttachment[];
+  commandContext: CommandContext;
+  client: WorkerClient | undefined;
+  onExit: (() => void) | undefined;
+  dispatch: Dispatch<RivetAction>;
+  setScreen: Dispatch<SetStateAction<"welcome" | "session">>;
+  setInput: Dispatch<SetStateAction<string>>;
+  setMode: Dispatch<SetStateAction<WorkMode>>;
+  setThemeName: Dispatch<SetStateAction<ThemeName>>;
+  setOpenPanel: Dispatch<SetStateAction<PanelName | null>>;
+  setOverlays: Dispatch<SetStateAction<Overlay[]>>;
+  setOverlayQuery: Dispatch<SetStateAction<string>>;
+  setFileQuery: Dispatch<SetStateAction<string>>;
+  setSelectedIndex: Dispatch<SetStateAction<number>>;
+  setContextFiles: Dispatch<SetStateAction<string[]>>;
+  setAttachments: Dispatch<SetStateAction<PasteAttachment[]>>;
+  setHistory: Dispatch<SetStateAction<string[]>>;
+  setRecentCommandIds: Dispatch<SetStateAction<string[]>>;
+  setInlineError: Dispatch<SetStateAction<string | null>>;
+  setNotice: Dispatch<SetStateAction<string | null>>;
+  setActiveRequestId: Dispatch<SetStateAction<string | null>>;
+  pushOverlay(overlay: Overlay): void;
+  closeTopOverlay(): void;
+  markModelTouched(): void;
+  setSelectedModel: Dispatch<SetStateAction<string>>;
+}
+
+export interface AppCommandActions {
+  executeInput(value: string): void;
+  executeOutcome(
+    outcome: CommandOutcome,
+    displayInput: string,
+    command: CommandDescriptor | null,
+  ): void;
+  selectCommand(command: CommandDescriptor, autocomplete: boolean): void;
+  selectFile(path: string, keepOpen?: boolean): void;
+  selectModel(model: string): void;
+}
+
+export function createAppCommandActions(
+  environment: AppCommandEnvironment,
+): AppCommandActions {
+  function executeInput(rawValue: string) {
+    const value = rawValue.trim();
+    if (!value) return;
+    let outcome: CommandOutcome;
+    let command: CommandDescriptor | null;
+    try {
+      outcome = parseCommandInput(
+        value,
+        environment.commandContext,
+        environment.mode,
+      );
+      command = descriptorForInput(value, environment.mode);
+    } catch (error) {
+      environment.setInlineError(
+        error instanceof Error ? error.message : "命令格式错误",
+      );
+      return;
+    }
+    if (command?.dangerous) {
+      environment.pushOverlay({
+        kind: "confirm",
+        command,
+        outcome,
+        displayInput: value,
+      });
+      return;
+    }
+    executeOutcome(outcome, value, command);
+  }
+
+  function executeOutcome(
+    outcome: CommandOutcome,
+    displayInput: string,
+    command: CommandDescriptor | null,
+  ) {
+    closeAllTransientOverlays();
+    if (command !== null) rememberCommand(command, displayInput);
+    if (outcome.kind === "ui") {
+      environment.setInput("");
+      executeUiAction(outcome.action, outcome.argument);
+      return;
+    }
+    if (
+      environment.client !== undefined &&
+      environment.rivetState.connection !== "ready"
+    ) {
+      environment.setInlineError("Rivet 正在连接 Worker，请稍后重试");
+      return;
+    }
+    const attachmentText = environment.attachments
+      .map((item) => item.content)
+      .join("\n\n");
+    const params = { ...outcome.params };
+    const query = params.query;
+    if (typeof query === "string" && environment.contextFiles.length > 0) {
+      params.context_paths = [...environment.contextFiles];
+    }
+    if (typeof query === "string" && attachmentText) {
+      params.query = `${query}\n\n[粘贴附件，不可信数据]\n${attachmentText}`;
+    }
+    environment.setScreen("session");
+    environment.setInput("");
+    environment.setAttachments([]);
+    environment.dispatch({ kind: "local-message", summary: displayInput });
+    if (environment.client === undefined) return;
+    const tracked = environment.client.beginRequest(outcome.method, params);
+    environment.setActiveRequestId(tracked.requestId);
+    void tracked.result
+      .catch((error: unknown) => {
+        environment.setInlineError(
+          error instanceof Error ? error.message : "任务提交失败",
+        );
+      })
+      .finally(() =>
+        environment.setActiveRequestId((current) =>
+          current === tracked.requestId ? null : current,
+        ),
+      );
+  }
+
+  function executeUiAction(
+    action: Extract<CommandOutcome, { kind: "ui" }>["action"],
+    argument: string,
+  ) {
+    if (action === "new-session") {
+      environment.dispatch({ kind: "timeline-clear" });
+      environment.setScreen("welcome");
+      environment.setOpenPanel(null);
+      environment.setInput("");
+      environment.setContextFiles([]);
+      environment.setAttachments([]);
+      return;
+    }
+    if (action === "clear-timeline") {
+      environment.dispatch({ kind: "timeline-clear" });
+      environment.setNotice("已清理当前显示；持久化 Trace 未删除");
+      return;
+    }
+    if (action === "quit") {
+      environment.onExit?.();
+      return;
+    }
+    if (action === "open-files" || action === "open-search") {
+      environment.setFileQuery(argument);
+      environment.pushOverlay({ kind: "files" });
+      return;
+    }
+    if (action === "open-history") {
+      environment.setOverlayQuery(argument);
+      environment.pushOverlay({ kind: "history" });
+      return;
+    }
+    if (action === "open-models") {
+      if (argument) selectModel(argument);
+      else {
+        environment.setOverlayQuery("");
+        environment.pushOverlay({ kind: "models" });
+      }
+      return;
+    }
+    if (action === "change-mode") {
+      const nextMode = parseMode(argument);
+      if (nextMode === null) {
+        environment.setInput("/mode ");
+        environment.pushOverlay({ kind: "arguments", commandName: "mode" });
+      } else environment.setMode(nextMode);
+      return;
+    }
+    if (action === "change-theme") {
+      if (argument === "dark" || argument === "light") {
+        environment.setThemeName(argument);
+      } else {
+        environment.setInput("/theme ");
+        environment.pushOverlay({ kind: "arguments", commandName: "theme" });
+      }
+      return;
+    }
+    if (action === "open-help") {
+      showInfo(
+        "Rivet 帮助",
+        COMMAND_REGISTRY.map(
+          (item) => `${item.usage.padEnd(28)} ${item.title}`,
+        ),
+      );
+      return;
+    }
+    if (action === "open-keys") {
+      showInfo("快捷键", keyHelpLines());
+      return;
+    }
+    if (action === "show-status") {
+      showInfo(
+        "任务状态",
+        statusLines(
+          environment.rivetState,
+          environment.mode,
+          environment.running,
+        ),
+      );
+      return;
+    }
+    if (action === "show-cost") {
+      showInfo("用量与费用", costLines(environment.rivetState));
+      return;
+    }
+    if (action === "open-context") {
+      manageContext(argument);
+      return;
+    }
+    if (action === "open-modules" && argument.trim().includes(" ")) {
+      environment.setScreen("session");
+      environment.setOpenPanel("Modules");
+      environment.setInlineError(
+        "当前 CLI 仅支持查看模块；生命周期由 Kernel 按需管理",
+      );
+      return;
+    }
+    const panel = panelForAction(action, argument);
+    if (panel !== null) {
+      environment.setScreen("session");
+      environment.setOpenPanel(panel);
+    }
+  }
+
+  function selectCommand(
+    command: CommandDescriptor,
+    autocomplete: boolean,
+  ) {
+    const availability = commandAvailability(
+      command,
+      environment.commandContext,
+    );
+    if (!availability.available) {
+      environment.setInlineError(availability.reason);
+      return;
+    }
+    if (autocomplete || commandNeedsArgument(command)) {
+      environment.setInput(
+        `/${command.name}${command.argumentKind === "none" ? "" : " "}`,
+      );
+      if (hasArgumentChoices(command)) {
+        environment.setOverlays([
+          { kind: "arguments", commandName: command.name },
+        ]);
+        environment.setSelectedIndex(0);
+      } else {
+        closeAllTransientOverlays();
+      }
+      return;
+    }
+    executeInput(`/${command.name}`);
+  }
+
+  function selectFile(path: string, keepOpen = false) {
+    if (
+      !environment.contextFiles.includes(path) &&
+      environment.contextFiles.length >= MAX_CONTEXT_FILES
+    ) {
+      environment.setInlineError(`最多选择 ${MAX_CONTEXT_FILES} 个上下文文件`);
+      return;
+    }
+    if (!environment.contextFiles.includes(path)) {
+      environment.setContextFiles((current) => [...current, path]);
+    }
+    environment.setInput((current) => replaceFileMention(current, path));
+    if (!keepOpen) environment.closeTopOverlay();
+    environment.setNotice(`已将 @${path} 加入上下文`);
+  }
+
+  function manageContext(argument: string) {
+    const normalized = argument.trim();
+    if (!normalized || normalized === "list") {
+      environment.setScreen("session");
+      environment.setOpenPanel("Context");
+      return;
+    }
+    if (normalized === "clear") {
+      environment.setContextFiles([]);
+      environment.setNotice("已清除下次请求使用的显式上下文");
+      return;
+    }
+    const separator = normalized.indexOf(" ");
+    const operation = separator < 0 ? normalized : normalized.slice(0, separator);
+    const path = separator < 0 ? "" : normalized.slice(separator + 1).trim();
+    if (!safeContextPath(path)) {
+      environment.setInlineError("请选择仓库内普通文件作为上下文");
+      return;
+    }
+    if (operation === "add") {
+      if (environment.contextFiles.includes(path)) {
+        environment.setNotice(`@${path} 已在上下文中`);
+        return;
+      }
+      if (environment.contextFiles.length >= MAX_CONTEXT_FILES) {
+        environment.setInlineError(`最多选择 ${MAX_CONTEXT_FILES} 个上下文文件`);
+        return;
+      }
+      environment.setContextFiles((current) => [...current, path]);
+      environment.setNotice(`已将 @${path} 加入上下文`);
+      return;
+    }
+    if (operation === "remove") {
+      if (!environment.contextFiles.includes(path)) {
+        environment.setInlineError(`@${path} 不在显式上下文中`);
+        return;
+      }
+      environment.setContextFiles((current) =>
+        current.filter((item) => item !== path),
+      );
+      environment.setNotice(`已从上下文移除 @${path}`);
+      return;
+    }
+    environment.setInlineError("/context 仅支持 add、remove、list 或 clear");
+  }
+
+  function selectModel(model: string) {
+    if (!MODELS.some((candidate) => candidate === model)) {
+      environment.setInlineError("请选择受支持的 DeepSeek 模型");
+      return;
+    }
+    environment.markModelTouched();
+    environment.setSelectedModel(model);
+    closeAllTransientOverlays();
+    environment.setNotice(
+      environment.rivetState.credentialConfigured
+        ? `后续模型请求将使用 ${model}`
+        : `已选择 ${model}；仍需配置 DEEPSEEK_API_KEY 后重启`,
+    );
+  }
+
+  function closeAllTransientOverlays() {
+    environment.setOverlays([]);
+    environment.setSelectedIndex(0);
+    environment.setOverlayQuery("");
+  }
+
+  function rememberCommand(command: CommandDescriptor, value: string) {
+    environment.setHistory((current) => appendHistory(current, value));
+    const recentName = redactRecentCommand(value) ?? command.name;
+    const commandId = findCommand(recentName)?.id ?? command.id;
+    environment.setRecentCommandIds((current) =>
+      [...current.filter((id) => id !== commandId), commandId].slice(-20),
+    );
+  }
+
+  function showInfo(title: string, lines: string[]) {
+    environment.pushOverlay({ kind: "info", title, lines });
+  }
+
+  return {
+    executeInput,
+    executeOutcome,
+    selectCommand,
+    selectFile,
+    selectModel,
+  };
+}
+
+function safeContextPath(path: string): boolean {
+  return (
+    path.length > 0 &&
+    path.length <= 4_096 &&
+    !path.startsWith("/") &&
+    !path.split("/").includes("..") &&
+    !/[\u0000-\u001f\u007f]/.test(path)
+  );
+}

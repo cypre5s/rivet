@@ -14,10 +14,13 @@ describe("observable workbench model", () => {
     expect(INSPECTOR_TABS).toEqual([
       "Plan",
       "Context",
+      "Files",
       "Diff",
       "Verify",
       "Evidence",
       "Modules",
+      "Trace",
+      "Sessions",
     ]);
     expect(view.header).toMatchObject({
       model: "未连接",
@@ -25,6 +28,6 @@ describe("observable workbench model", () => {
       transaction: "无",
     });
     expect(view.noColor).toBeTrue();
-    expect(view.layout.mode).toBe("three-column");
+    expect(view.layout.mode).toBe("wide");
   });
 });

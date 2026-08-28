@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import type { IpcEvent } from "../contracts/ipc.ts";
+import type { IpcEvent, JsonValue } from "../contracts/ipc.ts";
 import {
   initialRivetState,
   reduceRivetState,
@@ -10,7 +10,7 @@ import {
 function event(
   sequence: number,
   eventType: string,
-  payload: Record<string, string | number | boolean | null> = {},
+  payload: Record<string, JsonValue> = {},
 ): IpcEvent {
   return {
     schema_version: 1,
@@ -26,7 +26,12 @@ function event(
 describe("Trace-driven reducer", () => {
   test("projects plan, context, diff, evidence, modules and budget", () => {
     const events = [
-      event(0, "worker.ready", { repository: "/repo", model: "deepseek" }),
+      event(0, "worker.ready", {
+        repository: "/repo",
+        branch: "main",
+        model: "deepseek",
+        credential_configured: true,
+      }),
       event(1, "plan.updated", { phase: "VERIFY", summary: "执行验证" }),
       event(2, "context.selected", { path: "src/app.py", reason: "错误栈" }),
       event(3, "patch.updated", { diff: "@@ -1 +1 @@" }),
@@ -39,6 +44,8 @@ describe("Trace-driven reducer", () => {
 
     expect(state.connection).toBe("ready");
     expect(state.repository).toBe("/repo");
+    expect(state.branch).toBe("main");
+    expect(state.credentialConfigured).toBeTrue();
     expect(state.plan.phase).toBe("VERIFY");
     expect(state.context).toEqual([{ path: "src/app.py", reason: "错误栈" }]);
     expect(state.diff).toContain("@@");
@@ -46,6 +53,8 @@ describe("Trace-driven reducer", () => {
     expect(state.modules).toEqual(["reader.pdf"]);
     expect(state.budget.tokens).toBe(120);
     expect(state.timeline).toHaveLength(7);
+    expect(state.timeline[0]?.title).toBe("Rivet 已就绪");
+    expect(state.timeline[0]?.title).not.toContain("worker.ready");
   });
 
   test("opens and resolves permission modal from events", () => {
@@ -99,5 +108,28 @@ describe("Trace-driven reducer", () => {
     expect(state.connection).toBe("ready");
     expect(state.repository).toBe("/repo");
     expect(state.lastSequence).toBe(0);
+  });
+
+  test("merges duplicate ready events and tracks session snapshots", () => {
+    let state = reduceTraceEvent(
+      initialRivetState(),
+      event(0, "worker.ready", { repository: "/repo" }),
+    );
+    state = reduceTraceEvent(
+      state,
+      event(1, "worker.ready", { repository: "/repo" }),
+    );
+    state = reduceTraceEvent(
+      state,
+      event(2, "session.updated", { session_id: "session_one" }),
+    );
+    state = reduceTraceEvent(
+      state,
+      event(3, "sessions.snapshot", { sessions: ["session_two"] }),
+    );
+
+    expect(state.timeline.filter((item) => item.eventType === "worker.ready")).toHaveLength(1);
+    expect(state.sessionId).toBe("session_one");
+    expect(state.sessions).toEqual(["session_one", "session_two"]);
   });
 });

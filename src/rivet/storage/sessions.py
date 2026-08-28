@@ -32,6 +32,8 @@ from rivet.contracts.common import (
 from rivet.contracts.messages import Message
 
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
+MAX_SESSION_LIST_ENTRIES = 10_000
+MAX_SESSION_LIST_LIMIT = 100
 SESSION_ID_PATTERN = re.compile(r"^session_[a-z0-9][a-z0-9_-]{0,62}$")
 CommandName = Annotated[
     str,
@@ -240,6 +242,36 @@ class SessionStore:
         )
         self.save(recovered)
         return recovered
+
+    def list_recent_ids(self, *, limit: int = 20) -> tuple[str, ...]:
+        """按修改时间列出经过完整校验的近期会话标识。"""
+        if isinstance(limit, bool) or not 1 <= limit <= MAX_SESSION_LIST_LIMIT:
+            raise ValueError("checkpoint 列表上限无效")
+        self._validate_state_directories()
+        if not self._sessions.exists():
+            return ()
+        if not self._sessions.is_dir():
+            raise ValueError("checkpoint 状态目录无效")
+        candidates: list[tuple[int, str]] = []
+        try:
+            for index, path in enumerate(self._sessions.iterdir()):
+                if index >= MAX_SESSION_LIST_ENTRIES:
+                    raise ValueError("checkpoint 文件数量超过上限")
+                if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+                    continue
+                session_id = path.stem
+                if not SESSION_ID_PATTERN.fullmatch(session_id):
+                    continue
+                try:
+                    checkpoint = self.load(session_id)
+                    modified_ns = path.stat().st_mtime_ns
+                except (KeyError, OSError, ValueError):
+                    continue
+                candidates.append((modified_ns, checkpoint.session_id))
+        except OSError as error:
+            raise ValueError("checkpoint 状态目录无法读取") from error
+        candidates.sort(key=lambda item: (-item[0], item[1]))
+        return tuple(session_id for _, session_id in candidates[:limit])
 
     def _prepare(self) -> None:
         """只在显式保存时创建目录并拒绝任一级符号链接。"""

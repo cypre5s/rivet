@@ -1,26 +1,51 @@
 import type { RivetState } from "../state/reducer.ts";
+import type { WorkMode } from "../ui/command-registry.ts";
 import type { RivetTheme } from "./theme.ts";
 
-export function Header({ state, theme }: { state: RivetState; theme: RivetTheme }) {
+export function Header({
+  state,
+  mode,
+  running,
+  theme,
+}: {
+  state: RivetState;
+  mode: WorkMode;
+  running: boolean;
+  theme: RivetTheme;
+}) {
+  const transaction = state.transaction === "无" ? "" : `transaction ${state.transaction}`;
+  const usage = usageLabel(state);
   return (
     <box
-      height={3}
-      border={true}
-      borderColor={theme.border}
-      backgroundColor={theme.panel}
-      paddingX={1}
+      height={2}
+      backgroundColor={theme.background}
+      paddingX={2}
+      paddingTop={1}
       flexDirection="row"
       justifyContent="space-between"
     >
-      <text fg={theme.accent} content="Rivet" />
       <text
-        fg={theme.text}
-        content={`模型 ${state.model}  阶段 ${state.plan.phase}  事务 ${state.transaction}`}
+        fg={running ? theme.warning : theme.accent}
+        content={`Rivet · ${mode} · ${running ? "RUNNING" : state.plan.phase}`}
       />
-      <text
-        fg={theme.muted}
-        content={`token ${state.budget.tokens}  $${state.budget.costUsd.toFixed(4)}  ${state.budget.elapsedMs}ms`}
-      />
+      <text fg={theme.textSecondary} content={transaction} />
+      <text fg={theme.textMuted} content={usage} />
     </box>
   );
+}
+
+function usageLabel(state: RivetState): string {
+  const parts: string[] = [];
+  if (state.budget.tokens > 0) {
+    parts.push(`${formatTokens(state.budget.tokens)} tok`);
+  }
+  if (state.budget.costUsd > 0) parts.push(`$${state.budget.costUsd.toFixed(3)}`);
+  if (state.budget.elapsedMs > 0) {
+    parts.push(`${(state.budget.elapsedMs / 1_000).toFixed(1)}s`);
+  }
+  return parts.join(" · ");
+}
+
+function formatTokens(value: number): string {
+  return value >= 1_000 ? `${(value / 1_000).toFixed(1)}k` : value.toString();
 }

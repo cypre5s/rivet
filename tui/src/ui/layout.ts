@@ -1,33 +1,56 @@
-export type LayoutMode = "single" | "split" | "three-column";
-export type PanelId = "repository" | "timeline" | "inspector";
+export type LayoutMode = "minimal" | "compact" | "drawer" | "wide";
+export type LogoSize = "text" | "small" | "large";
+export type PanelPresentation = "fullscreen" | "drawer" | "sidebar";
 
 export interface LayoutDecision {
   mode: LayoutMode;
-  visiblePanels: PanelId[];
-  inspectorOverlay: boolean;
+  logoSize: LogoSize;
+  panelPresentation: PanelPresentation;
+  contentWidth: number | `${number}%`;
+  showShortcutHints: boolean;
+  showTip: boolean;
 }
 
 export function computeLayout(width: number, height: number): LayoutDecision {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
     throw new Error("terminal dimensions must be positive");
   }
-  if (width < 100) {
+  if (width < 60) {
     return {
-      mode: "single",
-      visiblePanels: ["timeline"],
-      inspectorOverlay: true,
+      mode: "minimal",
+      logoSize: "text",
+      panelPresentation: "fullscreen",
+      contentWidth: "100%",
+      showShortcutHints: false,
+      showTip: false,
     };
   }
-  if (width < 160) {
+  if (width < 80) {
     return {
-      mode: "split",
-      visiblePanels: ["repository", "timeline"],
-      inspectorOverlay: true,
+      mode: "compact",
+      logoSize: "small",
+      panelPresentation: "fullscreen",
+      contentWidth: "94%",
+      showShortcutHints: height >= 18,
+      showTip: height >= 18,
+    };
+  }
+  if (width < 120) {
+    return {
+      mode: "drawer",
+      logoSize: width >= 96 && height >= 24 ? "large" : "small",
+      panelPresentation: "drawer",
+      contentWidth: width >= 100 ? 76 : "88%",
+      showShortcutHints: height >= 18,
+      showTip: height >= 22,
     };
   }
   return {
-    mode: "three-column",
-    visiblePanels: ["repository", "timeline", "inspector"],
-    inspectorOverlay: false,
+    mode: "wide",
+    logoSize: "large",
+    panelPresentation: "sidebar",
+    contentWidth: 82,
+    showShortcutHints: true,
+    showTip: height >= 22,
   };
 }

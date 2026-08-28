@@ -1,19 +1,22 @@
 import type { IpcEvent, JsonValue } from "../contracts/ipc.ts";
+import {
+  presentTraceEvent,
+  type TimelineKind,
+  type TimelineStatus,
+} from "../ui/event-presenter.ts";
+import type { PanelName } from "../ui/command-registry.ts";
 
 export type ConnectionState = "connecting" | "ready" | "crashed";
-export type InspectorTab =
-  | "Plan"
-  | "Context"
-  | "Diff"
-  | "Verify"
-  | "Evidence"
-  | "Modules";
+export type InspectorTab = PanelName;
 
 export interface TimelineItem {
   eventId: string;
   eventType: string;
   sequence: number;
-  summary: string;
+  title: string;
+  detail: string;
+  kind: TimelineKind;
+  status: TimelineStatus;
 }
 
 export interface PermissionPrompt {
@@ -30,7 +33,11 @@ export interface PermissionPrompt {
 export interface RivetState {
   connection: ConnectionState;
   repository: string;
+  branch: string;
   model: string;
+  credentialConfigured: boolean;
+  sessionId: string | null;
+  sessions: string[];
   transaction: string;
   plan: { phase: string; summary: string };
   context: Array<{ path: string; reason: string }>;
@@ -54,7 +61,9 @@ export type RivetAction =
       state: "ready" | "crashed" | "closed";
       summary: string;
     }
-  | { kind: "local-error"; summary: string };
+  | { kind: "local-error"; summary: string }
+  | { kind: "local-message"; summary: string }
+  | { kind: "timeline-clear" };
 
 const MAX_TIMELINE_ITEMS = 500;
 
@@ -62,7 +71,11 @@ export function initialRivetState(): RivetState {
   return {
     connection: "connecting",
     repository: "未连接",
+    branch: "",
     model: "未连接",
+    credentialConfigured: false,
+    sessionId: null,
+    sessions: [],
     transaction: "无",
     plan: { phase: "IDLE", summary: "等待任务" },
     context: [],
@@ -95,6 +108,11 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
         connection: "ready",
         repository: text(event.payload.repository, state.repository),
         model: text(event.payload.model, state.model),
+        branch: text(event.payload.branch, state.branch),
+        credentialConfigured: boolean(
+          event.payload.credential_configured,
+          state.credentialConfigured,
+        ),
         error: null,
       };
     case "worker.crashed":
@@ -124,6 +142,22 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       };
     case "workspace.tree_updated":
       return { ...next, fileTree: stringArray(event.payload.paths) };
+    case "session.updated": {
+      const sessionId = text(event.payload.session_id, "");
+      if (!sessionId) return next;
+      return {
+        ...next,
+        sessionId,
+        sessions: [sessionId, ...state.sessions.filter((item) => item !== sessionId)],
+      };
+    }
+    case "sessions.snapshot": {
+      const sessions = stringArray(event.payload.sessions);
+      if (state.sessionId !== null && !sessions.includes(state.sessionId)) {
+        sessions.unshift(state.sessionId);
+      }
+      return { ...next, sessions };
+    }
     case "transaction.started":
       return {
         ...next,
@@ -150,6 +184,8 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       const moduleId = text(event.payload.module_id, "");
       return { ...next, modules: state.modules.filter((item) => item !== moduleId) };
     }
+    case "modules.snapshot":
+      return { ...next, modules: stringArray(event.payload.modules) };
     case "permission.requested":
       return { ...next, permission: permissionPrompt(event.payload) };
     case "permission.resolved":
@@ -175,6 +211,22 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
 
 export function reduceRivetState(state: RivetState, action: RivetAction): RivetState {
   if (action.kind === "trace") return reduceTraceEvent(state, action.event);
+  if (action.kind === "timeline-clear") return { ...state, timeline: [] };
+  if (action.kind === "local-message") {
+    const item: TimelineItem = {
+      eventId: `local_user_${state.lastSequence}_${state.timeline.length}`,
+      eventType: "user.message",
+      sequence: state.lastSequence,
+      title: action.summary,
+      detail: "",
+      kind: "user",
+      status: "success",
+    };
+    return {
+      ...state,
+      timeline: [...state.timeline, item].slice(-MAX_TIMELINE_ITEMS),
+    };
+  }
   if (action.kind === "local-error") {
     return { ...state, error: action.summary };
   }
@@ -189,14 +241,22 @@ export function reduceRivetState(state: RivetState, action: RivetAction): RivetS
 }
 
 function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem[] {
-  const appended = [
+  const presented = presentTraceEvent(event);
+  if (
+    event.event_type === "worker.ready" &&
+    timeline.some((item) => item.eventType === "worker.ready")
+  ) {
+    return timeline;
+  }
+  const item: TimelineItem = {
+    eventId: event.event_id,
+    eventType: event.event_type,
+    sequence: event.sequence,
+    ...presented,
+  };
+  const appended: TimelineItem[] = [
     ...timeline,
-    {
-      eventId: event.event_id,
-      eventType: event.event_type,
-      sequence: event.sequence,
-      summary: text(event.payload.summary, event.event_type),
-    },
+    item,
   ];
   return appended.slice(-MAX_TIMELINE_ITEMS);
 }
@@ -220,6 +280,10 @@ function text(value: JsonValue | undefined, fallback: string): string {
 
 function number(value: JsonValue | undefined, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function boolean(value: JsonValue | undefined, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
 }
 
 function stringArray(value: JsonValue | undefined): string[] {

@@ -1,0 +1,42 @@
+import { describe, expect, test } from "bun:test";
+
+import type { IpcEvent } from "../contracts/ipc.ts";
+import { presentTraceEvent } from "./event-presenter.ts";
+
+function event(eventType: string, payload: IpcEvent["payload"] = {}): IpcEvent {
+  return {
+    schema_version: 1,
+    message_type: "event",
+    protocol_version: 1,
+    event_id: "event_presenter",
+    event_type: eventType,
+    sequence: 0,
+    payload,
+  };
+}
+
+describe("trace event presentation", () => {
+  test("turns internal event names into restrained user language", () => {
+    expect(presentTraceEvent(event("worker.ready")).title).toBe("Rivet 已就绪");
+    expect(
+      presentTraceEvent(event("tool.started", { tool: "search_text" })),
+    ).toMatchObject({ title: "正在执行 search_text", status: "running" });
+    expect(
+      presentTraceEvent(
+        event("module.activated", { module_id: "context.syntax" }),
+      ).title,
+    ).toBe("已启用 context.syntax");
+    expect(
+      presentTraceEvent(
+        event("verification.completed", { status: "PASSED" }),
+      ),
+    ).toMatchObject({ title: "验证通过", status: "success" });
+  });
+
+  test("keeps unknown events generic instead of exposing raw protocol names", () => {
+    expect(presentTraceEvent(event("future.internal.event"))).toMatchObject({
+      title: "运行状态已更新",
+      kind: "status",
+    });
+  });
+});

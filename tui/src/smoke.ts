@@ -3,6 +3,15 @@ import { initialRivetState, reduceTraceEvent } from "./state/reducer.ts";
 import { buildViewModel } from "./ui/view-model.ts";
 import { parseCommandInput } from "./ui/commands.ts";
 
+const commandContext = {
+  modelConfigured: true,
+  currentModel: "deepseek-v4-pro",
+  hasSession: true,
+  transactionId: "tx_one",
+  verificationStatus: "PASSED",
+  evidenceId: "evidence_one",
+};
+
 const permissionEvent: IpcEvent = {
   schema_version: 1,
   message_type: "event",
@@ -26,6 +35,17 @@ const view = buildViewModel(state, {
   height: 50,
   noColor: process.env.NO_COLOR !== undefined,
 });
+const commandMethods = [
+  "/ask q",
+  "/plan q",
+  "/fix q",
+  "/verify",
+  "/diff",
+  "/apply tx_one",
+].map((command) => {
+  const outcome = parseCommandInput(command, commandContext);
+  return outcome.kind === "worker" ? outcome.method : outcome.action;
+});
 
 process.stdout.write(
   `${JSON.stringify({
@@ -33,13 +53,6 @@ process.stdout.write(
     no_color: view.noColor,
     inspector_tabs: view.inspectorTabs,
     permission_visible: view.permission !== null,
-    command_methods: [
-      "/ask q",
-      "/plan q",
-      "/fix q",
-      "/verify",
-      "/diff",
-      "/apply tx_one",
-    ].map((command) => parseCommandInput(command).method),
+    command_methods: commandMethods,
   })}\n`,
 );

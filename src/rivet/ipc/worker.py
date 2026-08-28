@@ -6,7 +6,7 @@ import asyncio
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Protocol, runtime_checkable
 
 from pydantic import JsonValue
 
@@ -42,11 +42,29 @@ class WorkerApplication(Protocol):
         ...
 
 
+@runtime_checkable
+class ReadyPayloadProvider(Protocol):
+    """允许业务应用为握手提供不含秘密的轻量状态。"""
+
+    def ready_payload(self) -> dict[str, JsonValue]:
+        """返回首屏可展示且无副作用的连接状态。"""
+        ...
+
+
 class BaseWorkerApplication:
     """提供不执行 Agent 副作用的健康检查与初始快照。"""
 
     def __init__(self, repository: Path) -> None:
         self._repository = repository.resolve(strict=True)
+
+    def ready_payload(self) -> dict[str, JsonValue]:
+        """返回不探测网络或子进程的基础首屏状态。"""
+        return {
+            "branch": _read_git_branch(self._repository),
+            "credential_configured": False,
+            "model": "未配置",
+            "repository": str(self._repository),
+        }
 
     async def handle(
         self,
@@ -198,10 +216,15 @@ class WorkerSession:
                 ],
             },
         )
-        await self.emit(
-            "worker.ready",
-            {"repository": str(self._repository), "model": "未配置"},
-        )
+        payload: dict[str, JsonValue] = {
+            "branch": _read_git_branch(self._repository),
+            "credential_configured": False,
+            "model": "未配置",
+            "repository": str(self._repository),
+        }
+        if isinstance(self._application, ReadyPayloadProvider):
+            payload.update(self._application.ready_payload())
+        await self.emit("worker.ready", payload)
 
     async def _run_request(
         self, request: IpcRequest, cancel_event: asyncio.Event
@@ -331,3 +354,28 @@ def read_bounded_ipc_line(stream: BinaryIO) -> bytes:
         remainder = stream.readline(MAX_IPC_LINE_BYTES + 1)
         if not remainder or remainder.endswith((b"\n", b"\r")):
             return line
+
+
+def _read_git_branch(repository: Path) -> str:
+    """只读取 Git HEAD 文本，不为首屏启动子进程。"""
+    marker = repository / ".git"
+    head_path = marker / "HEAD"
+    try:
+        if marker.is_file() and not marker.is_symlink():
+            marker_text = marker.read_text(encoding="utf-8").strip()
+            prefix = "gitdir: "
+            if not marker_text.startswith(prefix):
+                return ""
+            git_directory = Path(marker_text.removeprefix(prefix))
+            if not git_directory.is_absolute():
+                git_directory = (repository / git_directory).resolve(strict=True)
+            head_path = git_directory / "HEAD"
+        if head_path.is_symlink() or not head_path.is_file():
+            return ""
+        head = head_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return ""
+    reference_prefix = "ref: refs/heads/"
+    if head.startswith(reference_prefix):
+        return head.removeprefix(reference_prefix)[:128]
+    return "detached" if head else ""

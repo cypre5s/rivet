@@ -3,16 +3,18 @@ import { describe, expect, test } from "bun:test";
 import {
   CTRL_C_EXIT_WINDOW_MS,
   resolveCtrlCAction,
+  resolveCtrlCIntent,
   resolveKeyCommand,
+  resolveLeaderCommand,
 } from "./keymap.ts";
 
 describe("Rivet keymap", () => {
   test("maps the required global keys", () => {
     expect(resolveKeyCommand({ name: "tab", shift: false, ctrl: false })).toBe(
-      "focus.next",
+      "mode.next",
     );
     expect(resolveKeyCommand({ name: "tab", shift: true, ctrl: false })).toBe(
-      "focus.previous",
+      "mode.previous",
     );
     expect(resolveKeyCommand({ name: "p", shift: false, ctrl: true })).toBe(
       "palette.open",
@@ -24,6 +26,9 @@ describe("Rivet keymap", () => {
       "task.cancel",
     );
     expect(resolveKeyCommand({ name: "r", shift: false, ctrl: true })).toBe(
+      "history.open",
+    );
+    expect(resolveKeyCommand({ name: "r", shift: true, ctrl: true })).toBe(
       "worker.recover",
     );
     expect(resolveKeyCommand({ name: "return", shift: false, ctrl: false })).toBe(
@@ -32,6 +37,11 @@ describe("Rivet keymap", () => {
     expect(resolveKeyCommand({ name: "escape", shift: false, ctrl: false })).toBe(
       "overlay.close",
     );
+  });
+
+  test("maps Leader keys without treating unknown input as a command", () => {
+    expect(resolveLeaderCommand("V")).toBe("verify");
+    expect(resolveLeaderCommand("?")).toBeNull();
   });
 });
 
@@ -42,5 +52,20 @@ describe("Ctrl+C lifecycle", () => {
     expect(resolveCtrlCAction(1000, 1000 + CTRL_C_EXIT_WINDOW_MS + 1)).toBe(
       "cancel",
     );
+  });
+
+  test("implements cancel, clear and double-press exit intents", () => {
+    expect(
+      resolveCtrlCIntent(null, 1_000, { running: true, inputEmpty: true }),
+    ).toBe("cancel-task");
+    expect(
+      resolveCtrlCIntent(null, 1_000, { running: false, inputEmpty: false }),
+    ).toBe("clear-input");
+    expect(
+      resolveCtrlCIntent(null, 1_000, { running: false, inputEmpty: true }),
+    ).toBe("prompt-exit");
+    expect(
+      resolveCtrlCIntent(1_000, 1_100, { running: true, inputEmpty: true }),
+    ).toBe("exit");
   });
 });

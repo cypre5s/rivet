@@ -117,6 +117,41 @@ async def test_worker_handshake_ping_snapshot_duplicate_and_shutdown(
 
 
 @pytest.mark.asyncio
+async def test_worker_ready_uses_read_only_branch_and_boolean_credential_state(
+    tmp_path: Path,
+) -> None:
+    lines: list[str] = []
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "HEAD").write_text(
+        "ref: refs/heads/feature/tui\n",
+        encoding="utf-8",
+    )
+
+    async def write(message: str) -> None:
+        """捕获完整协议行。"""
+        lines.append(message)
+
+    session = WorkerSession(tmp_path, write_message=write)
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.close()
+
+    ready = next(
+        message
+        for message in _messages(lines)
+        if message.get("event_type") == "worker.ready"
+    )
+    payload = cast(dict[str, object], ready["payload"])
+    assert payload["branch"] == "feature/tui"
+    assert payload["credential_configured"] is False
+    assert set(payload) == {
+        "branch",
+        "credential_configured",
+        "model",
+        "repository",
+    }
+
+
+@pytest.mark.asyncio
 async def test_worker_rejects_unknown_method_and_sanitizes_internal_error(
     tmp_path: Path,
 ) -> None:

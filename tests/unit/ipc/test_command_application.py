@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -77,6 +78,283 @@ async def test_ask_routes_to_json_cli_and_emits_result(tmp_path: Path) -> None:
     assert arguments[0][-2:] == ("ask", "解释")
     assert any(event_type == "agent.completed" for event_type, _ in events)
     assert any(event_type == "budget.updated" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
+async def test_explicit_context_paths_are_validated_and_reach_the_formal_cli(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "src" / "service.py"
+    source.parent.mkdir()
+    source.write_text("VALUE = 1\n", encoding="utf-8")
+    arguments: list[tuple[str, ...]] = []
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        """记录包含上下文路径的正式 CLI argv。"""
+        arguments.append(argv)
+        return CommandExecution(0, b"{}", b"")
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        """捕获显式上下文事件。"""
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    await application.handle(
+        _request(
+            "request_context",
+            "command.ask",
+            {"context_paths": ["src/service.py"], "query": "解释服务"},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert "用户显式选择的仓库文件" in arguments[0][-1]
+    assert "@src/service.py" in arguments[0][-1]
+    assert (
+        "context.selected",
+        {"path": "src/service.py", "reason": "用户显式选择"},
+    ) in events
+
+
+@pytest.mark.asyncio
+async def test_explicit_context_rejects_symlink_and_control_character_paths(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path.parent / "outside-context.py"
+    outside.write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "outside-link.py").symlink_to(outside)
+
+    async def emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        """丢弃拒绝路径时的状态事件。"""
+
+    application = CommandWorkerApplication(tmp_path)
+    for path in ("outside-link.py", "bad\x1b-name.py"):
+        with pytest.raises(WorkerMethodError) as captured:
+            await application.handle(
+                _request(
+                    f"request_{len(path)}",
+                    "command.ask",
+                    {"context_paths": [path], "query": "解释"},
+                ),
+                emit=emit,
+                cancel_event=asyncio.Event(),
+            )
+        assert captured.value.code == "context.path_invalid"
+
+
+def test_ready_payload_exposes_only_model_and_credential_presence(
+    tmp_path: Path,
+) -> None:
+    application = CommandWorkerApplication(
+        tmp_path,
+        environment={
+            "DEEPSEEK_API_KEY": "configured-placeholder",
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        },
+    )
+
+    payload = application.ready_payload()
+    serialized = json.dumps(payload)
+
+    assert payload["credential_configured"] is True
+    assert payload["model"] == "deepseek-v4-pro"
+    assert "configured-placeholder" not in serialized
+    assert "api_key" not in serialized.casefold()
+
+
+@pytest.mark.asyncio
+async def test_workspace_files_is_on_demand_git_aware_and_secret_safe(
+    tmp_path: Path,
+) -> None:
+    subprocess.run(
+        ("git", "init", "--quiet", str(tmp_path)),
+        check=True,
+        capture_output=True,
+    )
+    (tmp_path / ".gitignore").write_text("ignored.py\n", encoding="utf-8")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    (tmp_path / "ignored.py").write_text("ignored\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("placeholder\n", encoding="utf-8")
+    (tmp_path / ".ssh").mkdir()
+    (tmp_path / ".ssh" / "config").write_text("placeholder\n", encoding="utf-8")
+    (tmp_path / "bad\x1b-name.py").write_text("placeholder\n", encoding="utf-8")
+    (tmp_path / "outside-link").symlink_to(tmp_path.parent)
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        """捕获按需文件树事件。"""
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(tmp_path, environment={})
+    result = await application.handle(
+        _request(
+            "request_files",
+            "workspace.files",
+            {"limit": 20, "query": ""},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert isinstance(result, dict)
+    paths = result["paths"]
+    assert isinstance(paths, list)
+    assert "src/app.py" in paths
+    assert "ignored.py" not in paths
+    assert ".env" not in paths
+    assert ".ssh/config" not in paths
+    assert "bad\x1b-name.py" not in paths
+    assert "outside-link" not in paths
+    assert events[0][0] == "workspace.tree_updated"
+
+    fuzzy_result = await application.handle(
+        _request(
+            "request_fuzzy_files",
+            "workspace.files",
+            {"limit": 20, "query": "sap"},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+    assert isinstance(fuzzy_result, dict)
+    fuzzy_paths = fuzzy_result["paths"]
+    assert isinstance(fuzzy_paths, list)
+    assert "src/app.py" in fuzzy_paths
+
+
+@pytest.mark.asyncio
+async def test_workspace_file_output_is_drained_with_bounded_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subprocess.run(
+        ("git", "init", "--quiet", str(tmp_path)),
+        check=True,
+        capture_output=True,
+    )
+    for index in range(20):
+        (tmp_path / f"long-repository-file-{index:02d}.py").write_text(
+            "pass\n",
+            encoding="utf-8",
+        )
+
+    async def emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        """丢弃有界文件清单事件。"""
+
+    monkeypatch.setattr(command_application, "MAX_COMMAND_OUTPUT_BYTES", 64)
+    application = CommandWorkerApplication(tmp_path, environment={})
+
+    with pytest.raises(WorkerMethodError) as captured:
+        await application.handle(
+            _request("request_files", "workspace.files", {"limit": 20, "query": ""}),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert captured.value.code == "workspace.files_too_large"
+
+
+@pytest.mark.asyncio
+async def test_recent_sessions_are_loaded_only_on_explicit_request(
+    tmp_path: Path,
+) -> None:
+    from rivet.storage.sessions import SessionCheckpoint, SessionStatus, SessionStore
+
+    SessionStore(tmp_path).save(
+        SessionCheckpoint(
+            session_id="session_recent",
+            run_id="run_recent",
+            command="ask",
+            query="解释",
+            status=SessionStatus.COMPLETED,
+        )
+    )
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        """捕获按需会话快照。"""
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(tmp_path)
+    result = await application.handle(
+        _request("request_sessions", "sessions.list", {"limit": 20}),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert result == {"sessions": ["session_recent"]}
+    assert events == [
+        (
+            "sessions.snapshot",
+            {
+                "sessions": ["session_recent"],
+                "summary": "已加载 1 个近期会话",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "params", "expected_tail"),
+    [
+        ("command.read", {"file": "README.md"}, ("read", "README.md")),
+        ("command.init", {}, ("init",)),
+        ("command.resume", {"session_id": "session_one"}, ("resume", "session_one")),
+        ("command.trace", {"run_id": "run_one"}, ("trace", "run_one")),
+        ("command.modules", {}, ("modules",)),
+        ("command.doctor", {}, ("doctor",)),
+        ("command.benchmark", {}, ("benchmark",)),
+        ("command.config", {}, ("config",)),
+        ("command.clean", {}, ("clean",)),
+        ("command.verify", {"transaction_id": "tx_one"}, ("verify", "tx_one")),
+        ("command.diff", {"transaction_id": "tx_one"}, ("diff", "tx_one")),
+        ("command.apply", {"transaction_id": "tx_one"}, ("apply", "tx_one")),
+        ("command.abort", {"transaction_id": "tx_one"}, ("abort", "tx_one")),
+    ],
+)
+async def test_published_worker_commands_share_the_formal_cli_parser(
+    tmp_path: Path,
+    method: str,
+    params: dict[str, JsonValue],
+    expected_tail: tuple[str, ...],
+) -> None:
+    arguments: list[tuple[str, ...]] = []
+
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        """记录无 shell argv 并返回合法空结果。"""
+        arguments.append(argv)
+        return CommandExecution(0, b"{}", b"")
+
+    async def emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        """丢弃投影事件。"""
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    await application.handle(
+        _request("request_command", method, params),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert arguments[0][-len(expected_tail) :] == expected_tail
 
 
 @pytest.mark.asyncio

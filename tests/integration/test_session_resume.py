@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -132,3 +133,26 @@ def test_session_store_rejects_symlink_state_directory(tmp_path: Path) -> None:
                 status=SessionStatus.RUNNING,
             )
         )
+
+
+def test_session_store_lists_only_valid_recent_checkpoints(tmp_path: Path) -> None:
+    store = SessionStore(tmp_path)
+    for session_id in ("session_older", "session_newer"):
+        store.save(
+            SessionCheckpoint(
+                session_id=session_id,
+                run_id=f"run_{session_id}",
+                command="ask",
+                query="解释",
+                status=SessionStatus.COMPLETED,
+            )
+        )
+    sessions = tmp_path / ".rivet" / "sessions"
+    os.utime(sessions / "session_older.json", ns=(1, 1))
+    os.utime(sessions / "session_newer.json", ns=(2, 2))
+    (sessions / "session_broken.json").write_text("{}", encoding="utf-8")
+
+    assert store.list_recent_ids() == ("session_newer", "session_older")
+    assert store.list_recent_ids(limit=1) == ("session_newer",)
+    with pytest.raises(ValueError, match="上限"):
+        store.list_recent_ids(limit=0)
