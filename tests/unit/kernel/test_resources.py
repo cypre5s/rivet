@@ -9,7 +9,12 @@ from pathlib import Path
 
 import pytest
 
-from rivet.kernel.errors import ResourceCleanupError
+from rivet.contracts.modules import ResourceKind
+from rivet.kernel.errors import (
+    ResourceCleanupError,
+    ResourceLeakError,
+    ResourceScopeClosedError,
+)
 from rivet.kernel.resources import ResourceScope
 
 
@@ -130,4 +135,81 @@ async def test_scope_releases_only_finished_tasks_and_waited_processes() -> None
     scope.release_process(process)
 
     scope.assert_empty()
+    await scope.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_cleanup_failure_continues_and_closed_scope_rejects_registration(
+    tmp_path: Path,
+) -> None:
+    class FailingConnection:
+        """在关闭时制造可控资源故障。"""
+
+        def close(self) -> None:
+            """抛出固定关闭故障。"""
+            raise RuntimeError("fixture close failure")
+
+    scope = ResourceScope("test.cleanup_failure")
+    scope.register_connection(FailingConnection(), description="失败连接")
+    directory = scope.create_temp_directory(root=tmp_path, description="仍需清理")
+
+    with pytest.raises(ResourceLeakError):
+        scope.assert_empty()
+    with pytest.raises(ResourceCleanupError, match="至少一项"):
+        await scope.close()
+
+    assert not directory.exists()
+    assert scope.counts().resource_count == 0
+    with pytest.raises(ResourceScopeClosedError):
+        scope.create_temp_directory(description="关闭后禁止")
+
+
+@pytest.mark.asyncio
+async def test_worktree_transfer_requires_registered_existing_directory(
+    tmp_path: Path,
+) -> None:
+    scope = ResourceScope("test.worktree_transfer")
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    async def cleanup(path: Path) -> None:
+        """为测试提供正常清理回调。"""
+        path.rmdir()
+
+    scope.register_worktree(worktree, cleanup=cleanup, description="持久事务")
+    scope.transfer_persisted_worktree(worktree)
+    scope.assert_empty()
+    with pytest.raises(ResourceCleanupError, match="未登记"):
+        scope.transfer_persisted_worktree(worktree)
+    await scope.close()
+
+
+@pytest.mark.asyncio
+async def test_process_kind_and_missing_worktree_directory_are_rejected(
+    tmp_path: Path,
+) -> None:
+    scope = ResourceScope("test.invalid_resources")
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "pass",
+    )
+    await process.wait()
+    with pytest.raises(ValueError, match="process 或 sidecar"):
+        scope.register_process(
+            process,
+            description="错误类型",
+            kind=ResourceKind.CLIENT,
+        )
+
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+
+    async def cleanup(_path: Path) -> None:
+        """保留目录以测试移交时的二次检查。"""
+
+    scope.register_worktree(worktree, cleanup=cleanup, description="待移交")
+    worktree.rmdir()
+    with pytest.raises(ResourceCleanupError, match="必须仍为目录"):
+        scope.transfer_persisted_worktree(worktree)
     await scope.close()

@@ -99,3 +99,20 @@ def test_configuration_only_reports_credential_presence(tmp_path: Path) -> None:
     assert public["credential_configured"] is True
     assert credential not in repr(resolved)
     assert credential not in str(public)
+
+
+def test_project_configuration_rejects_symlink_runtime_directory(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    external = tmp_path / "external"
+    repository.mkdir()
+    external.mkdir()
+    (external / "project.toml").write_text(
+        "schema_version = 1\n[rivet]\nsafe_mode = true\n",
+        encoding="utf-8",
+    )
+    (repository / ".rivet").symlink_to(external, target_is_directory=True)
+
+    with pytest.raises(CliConfigurationError, match="符号链接"):
+        load_config(repository, environment={})

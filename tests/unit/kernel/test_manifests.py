@@ -55,6 +55,26 @@ def test_loader_rejects_unknown_field(tmp_path: Path) -> None:
         ManifestLoader().load_paths((manifest_path,))
 
 
+def test_loader_rejects_missing_directory_non_toml_and_duplicate_id(
+    tmp_path: Path,
+) -> None:
+    loader = ManifestLoader()
+    with pytest.raises(ManifestError, match="目录不存在"):
+        loader.load_directory(tmp_path / "missing")
+
+    text_path = tmp_path / "manifest.txt"
+    text_path.write_text("not toml", encoding="utf-8")
+    with pytest.raises(ManifestError, match="TOML"):
+        loader.load_paths((text_path,))
+
+    first = tmp_path / "first.toml"
+    second = tmp_path / "second.toml"
+    _write_manifest(first, 1)
+    _write_manifest(second, 1)
+    with pytest.raises(ManifestError, match="重复声明"):
+        loader.load_paths((first, second))
+
+
 def test_loader_returns_stable_path_order(tmp_path: Path) -> None:
     _write_manifest(tmp_path / "z.toml", 2)
     _write_manifest(tmp_path / "a.toml", 1)

@@ -151,6 +151,12 @@ def _user_config_path(environment: Mapping[str, str]) -> Path:
 
 def _load_document(path: Path, *, project: bool) -> dict[str, object]:
     """读取有界 TOML，只提取 `[rivet]` 非秘密字段。"""
+    if project and path.parent.is_symlink():
+        raise CliConfigurationError(
+            "config.file_invalid",
+            "项目配置目录不能是符号链接",
+            "替换为仓库内受控 .rivet 目录",
+        )
     if not path.exists():
         return {}
     if path.is_symlink() or not path.is_file():

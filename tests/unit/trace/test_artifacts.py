@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import errno
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from rivet.trace.artifacts import TraceArtifactStore
+from rivet.trace.errors import TraceWriteError
 from rivet.trace.paths import RuntimePaths
 from rivet.trace.redaction import REDACTED_TEXT, SecretRedactor
 
@@ -39,3 +44,51 @@ def test_capture_separates_preview_and_redacted_full_log(tmp_path: Path) -> None
     assert capture.stdout.preview_truncated
     assert capture.stdout.artifact.sha256.startswith("sha256:")
     assert stderr_path.is_file()
+
+
+def test_disk_full_is_classified_and_removes_temporary_file(tmp_path: Path) -> None:
+    paths = RuntimePaths.for_repository(
+        tmp_path,
+        environment={"XDG_CACHE_HOME": str(tmp_path / "cache")},
+    )
+    artifacts = TraceArtifactStore(paths, SecretRedactor(environment={}))
+
+    with (
+        patch.object(
+            Path,
+            "write_bytes",
+            side_effect=OSError(errno.ENOSPC, "fixture disk full"),
+        ),
+        pytest.raises(TraceWriteError, match="artifact"),
+    ):
+        artifacts.capture(
+            run_id="run_artifact_full",
+            event_id="event_artifact_full",
+            stdout="content",
+            stderr="",
+        )
+
+    assert not tuple(paths.runtime_root.rglob("*.tmp"))
+
+
+def test_disk_full_while_creating_directory_is_classified(tmp_path: Path) -> None:
+    paths = RuntimePaths.for_repository(
+        tmp_path,
+        environment={"XDG_CACHE_HOME": str(tmp_path / "cache")},
+    )
+    artifacts = TraceArtifactStore(paths, SecretRedactor(environment={}))
+
+    with (
+        patch.object(
+            Path,
+            "mkdir",
+            side_effect=OSError(errno.ENOSPC, "fixture disk full"),
+        ),
+        pytest.raises(TraceWriteError, match="artifact"),
+    ):
+        artifacts.capture(
+            run_id="run_artifact_directory_full",
+            event_id="event_artifact_directory_full",
+            stdout="content",
+            stderr="",
+        )

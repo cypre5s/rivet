@@ -14,20 +14,93 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
         with:
-          python-version-file: .python-version
+          python-version: "3.13.15"
+          enable-cache: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: tools/lsp/package-lock.json
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: uv sync --all-extras --dev --locked
+      - run: bun install --cwd tui --frozen-lockfile
+      - run: npm ci --prefix tools/lsp --ignore-scripts --no-audit --no-fund
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run basedpyright
+      - run: uv run pytest -q --cov=src/rivet --cov-report=term-missing
+      - run: uv run coverage report --fail-under=80
+
+  tui-quality:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: bun install --cwd tui --frozen-lockfile
+      - run: bun test --cwd tui
+      - run: bun run --cwd tui typecheck
+
+  architecture:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13.15"
+          enable-cache: true
+      - run: uv sync --dev --locked
+      - run: uv run python scripts/verify_architecture.py
+      - run: uv run python scripts/verify_ipc_contracts.py
+      - run: uv run python scripts/verify_dependencies.py
+      - run: uv lock --check
+
+  security:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13.15"
+          enable-cache: true
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: uv sync --all-extras --dev --locked
+      - run: bun install --cwd tui --frozen-lockfile
+      - run: uv run pytest tests/security tests/integration/test_bubblewrap.py -q
+      - run: uv run python scripts/run_benchmark.py --suite security
+      - run: uv run python scripts/verify_secrets.py --worktree --history
+      - run: uv run python scripts/verify_licenses.py
+      - run: uv pip check
+
+  e2e-smoke:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13.15"
           enable-cache: true
       - uses: actions/setup-node@v6
         with:
           node-version: "24"
           cache: npm
           cache-dependency-path: tools/lsp/package-lock.json
-      - run: uv sync --dev --locked
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.0
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: uv sync --all-extras --dev --locked
       - run: npm ci --prefix tools/lsp --ignore-scripts --no-audit --no-fund
-      - run: uv run ruff check .
-      - run: uv run ruff format --check .
-      - run: uv run basedpyright
-      - run: uv run pytest -q
-      - run: uv run python scripts/verify_architecture.py
-      - run: uv run python scripts/verify_ipc_contracts.py
-      - run: uv run python scripts/verify_dependencies.py
-      - run: uv run python scripts/verify_secrets.py --worktree --staged
+      - run: bun install --cwd tui --frozen-lockfile
+      - run: uv run pytest tests/e2e -q
+      - run: uv run python scripts/run_benchmark.py --suite all

@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import os
+from contextlib import suppress
 from pathlib import Path
 
 from rivet.contracts.common import ArtifactReference, EventId, RunId
+from rivet.trace.errors import TraceWriteError
 from rivet.trace.models import CapturedStream, OutputCapture
 from rivet.trace.paths import RuntimePaths
 from rivet.trace.redaction import SecretRedactor
@@ -69,12 +71,17 @@ class TraceArtifactStore:
 
         relative_path = Path("artifacts") / run_id / f"{event_id}.{stream_name}.log"
         target_path = self._paths.runtime_root / relative_path
-        target_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        target_path.parent.chmod(0o700)
         temporary_path = target_path.with_suffix(f"{target_path.suffix}.tmp")
-        temporary_path.write_bytes(encoded)
-        temporary_path.chmod(0o600)
-        os.replace(temporary_path, target_path)
+        try:
+            target_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            target_path.parent.chmod(0o700)
+            temporary_path.write_bytes(encoded)
+            temporary_path.chmod(0o600)
+            os.replace(temporary_path, target_path)
+        except OSError as error:
+            with suppress(OSError):
+                temporary_path.unlink()
+            raise TraceWriteError("Trace artifact 无法原子写入") from error
         digest = hashlib.sha256(encoded).hexdigest()
         return CapturedStream(
             preview=preview,

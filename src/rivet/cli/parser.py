@@ -115,7 +115,15 @@ def build_parser() -> ArgumentParser:
     benchmark_parser = subparsers.add_parser("benchmark", help="运行本地评测套件")
     benchmark_parser.add_argument(
         "--suite",
-        choices=("context-smoke", "context-full", "security"),
+        choices=(
+            "context-smoke",
+            "context-full",
+            "security",
+            "functional",
+            "faults",
+            "performance",
+            "all",
+        ),
         default="context-smoke",
     )
     _add_runtime_aliases(benchmark_parser)

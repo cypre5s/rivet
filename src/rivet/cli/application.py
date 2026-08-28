@@ -168,13 +168,14 @@ def _initialize(arguments: Namespace) -> int:
     """在明确目录中创建最小、无凭据且可跟踪的项目配置。"""
     path_argument = cast(Path | None, arguments.path)
     repository_argument = cast(Path, arguments.repository)
-    target = (path_argument or repository_argument).resolve(strict=False)
-    if not target.is_dir():
+    candidate = path_argument or repository_argument
+    if candidate.is_symlink() or not candidate.is_dir():
         raise CliConfigurationError(
             "init.path_invalid",
-            "初始化目标必须是已存在目录",
+            "初始化目标必须是已存在普通目录且不能是符号链接",
             "创建目录后重试 rivet init",
         )
+    target = candidate.resolve(strict=True)
     runtime_root = target / ".rivet"
     if runtime_root.is_symlink():
         raise CliConfigurationError(

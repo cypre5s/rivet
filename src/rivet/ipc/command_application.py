@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import sys
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
@@ -32,6 +34,8 @@ class CommandExecution:
     return_code: int
     stdout: bytes
     stderr: bytes
+    stdout_truncated: bool = False
+    stderr_truncated: bool = False
 
 
 class CommandWorkerApplication(BaseWorkerApplication):
@@ -238,28 +242,74 @@ class CommandWorkerApplication(BaseWorkerApplication):
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
         )
+        if process.stdout is None or process.stderr is None:
+            await self._terminate_process_group(process)
+            raise WorkerMethodError(
+                "ipc.command_pipe_missing",
+                "命令输出管道不可用",
+                "使用 headless 命令诊断本地运行环境",
+            )
+        stdout_task = asyncio.create_task(self._read_bounded(process.stdout))
+        stderr_task = asyncio.create_task(self._read_bounded(process.stderr))
         try:
-            stdout, stderr = await process.communicate()
+            await process.wait()
         except asyncio.CancelledError:
-            if process.returncode is None:
-                process.terminate()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=2)
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
+            await self._terminate_process_group(process)
+            await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
             raise
-        if (
-            len(stdout) > MAX_COMMAND_OUTPUT_BYTES
-            or len(stderr) > MAX_COMMAND_OUTPUT_BYTES
-        ):
+        stdout_result, stderr_result = await asyncio.gather(
+            stdout_task,
+            stderr_task,
+        )
+        stdout, stdout_truncated = stdout_result
+        stderr, stderr_truncated = stderr_result
+        if stdout_truncated or stderr_truncated:
             raise WorkerMethodError(
                 "ipc.command_output_too_large",
                 "命令输出超过 Worker 上限",
                 "使用 headless 命令检查完整 Trace 或 Evidence",
             )
-        return CommandExecution(process.returncode or 0, stdout, stderr)
+        return CommandExecution(
+            process.returncode or 0,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        )
+
+    @staticmethod
+    async def _read_bounded(
+        stream: asyncio.StreamReader,
+    ) -> tuple[bytes, bool]:
+        """持续 drain 子进程输出，但内存只保留固定上限。"""
+        content = bytearray()
+        truncated = False
+        while chunk := await stream.read(65_536):
+            remaining = MAX_COMMAND_OUTPUT_BYTES - len(content)
+            if remaining > 0:
+                content.extend(chunk[:remaining])
+            if len(chunk) > remaining:
+                truncated = True
+        return bytes(content), truncated
+
+    @staticmethod
+    async def _terminate_process_group(process: asyncio.subprocess.Process) -> None:
+        """按 TERM、有界等待、KILL、wait 回收整个命令会话。"""
+        if process.returncode is not None:
+            await process.wait()
+            return
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=2)
+            return
+        except TimeoutError:
+            pass
+        with suppress(ProcessLookupError):
+            os.killpg(process.pid, signal.SIGKILL)
+        await process.wait()
 
     @staticmethod
     def _decode_execution(execution: CommandExecution) -> dict[str, JsonValue]:

@@ -35,10 +35,11 @@ class ActivationJournal:
     """在 factory 导入前持久化未完成激活标记。"""
 
     def __init__(self, path: Path) -> None:
-        self.path = path.resolve()
+        self.path = path.absolute()
 
     def pending_module_ids(self) -> frozenset[str]:
         """读取 pending 集合，损坏时失败关闭而不猜测。"""
+        self._validate_path()
         if not self.path.exists():
             return frozenset()
         try:
@@ -76,7 +77,7 @@ class ActivationJournal:
 
     def _write(self, module_ids: set[str]) -> None:
         """通过同目录替换写入固定版本与稳定排序。"""
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._validate_path()
         temporary_path = self.path.with_name(f".{self.path.name}.tmp")
         payload = json.dumps(
             {
@@ -87,6 +88,7 @@ class ActivationJournal:
             separators=(",", ":"),
         )
         try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
             temporary_path.write_text(payload, encoding="utf-8")
             temporary_path.chmod(0o600)
             os.replace(temporary_path, self.path)
@@ -94,6 +96,11 @@ class ActivationJournal:
             with suppress(OSError):
                 temporary_path.unlink()
             raise ActivationJournalError("激活日志无法原子写入") from error
+
+    def _validate_path(self) -> None:
+        """拒绝日志文件或已存在父目录的符号链接跳转。"""
+        if self.path.is_symlink() or self.path.parent.is_symlink():
+            raise ActivationJournalError("激活日志路径不得是符号链接")
 
 
 @dataclass(slots=True)

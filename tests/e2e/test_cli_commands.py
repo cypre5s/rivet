@@ -110,3 +110,16 @@ def test_model_command_without_key_is_classified_without_traceback(
     assert completed.returncode == 3
     assert "DEEPSEEK_API_KEY" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+def test_init_rejects_symlink_target(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    link = tmp_path / "repository-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    completed = _run(tmp_path, link, "init")
+
+    assert completed.returncode == 3
+    assert "符号链接" in completed.stderr
+    assert not (target / ".rivet").exists()

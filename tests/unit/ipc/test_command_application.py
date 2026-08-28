@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
 from pydantic import JsonValue
 
+import rivet.ipc.command_application as command_application
 from rivet.contracts.ipc import IpcRequest
 from rivet.ipc.command_application import (
     CommandExecution,
@@ -176,3 +179,29 @@ async def test_cli_error_is_classified_without_forwarding_stderr(
 
     assert captured.value.code == "provider.api_key_missing"
     assert "must-not-cross" not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_subprocess_output_is_drained_with_bounded_memory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class ProbeApplication(CommandWorkerApplication):
+        """只向测试暴露受保护的默认子进程 runner。"""
+
+        async def run_probe(self, argv: tuple[str, ...]) -> CommandExecution:
+            """运行固定测试 argv。"""
+            return await self._run_subprocess(argv)
+
+    monkeypatch.setattr(command_application, "MAX_COMMAND_OUTPUT_BYTES", 64)
+    application = ProbeApplication(
+        tmp_path,
+        environment={"PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+    )
+
+    with pytest.raises(WorkerMethodError) as captured:
+        await application.run_probe(
+            (sys.executable, "-c", "print('x' * 4096)"),
+        )
+
+    assert captured.value.code == "ipc.command_output_too_large"

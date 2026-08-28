@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 from pathlib import Path
 from typing import cast
@@ -16,7 +17,7 @@ def test_tui_smoke_model_contains_required_panels() -> None:
         capture_output=True,
         timeout=10,
         check=False,
-        env={"PATH": "/home/lbx/.local/bin:/usr/bin:/bin", "NO_COLOR": "1"},
+        env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "NO_COLOR": "1"},
     )
 
     payload = cast(dict[str, object], json.loads(completed.stdout.decode()))

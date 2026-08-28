@@ -142,6 +142,7 @@ class SessionStore:
 
     def load(self, session_id: str) -> SessionCheckpoint:
         """严格验证 ID、普通文件、大小、协议、哈希和契约。"""
+        self._validate_state_directories()
         path = self._checkpoint_path(session_id)
         if not path.exists():
             raise KeyError(session_id)
@@ -211,12 +212,15 @@ class SessionStore:
 
     def _prepare(self) -> None:
         """只在显式保存时创建目录并拒绝任一级符号链接。"""
-        runtime_root = self._repository / ".rivet"
-        for path in (runtime_root, self._sessions):
-            if path.is_symlink():
-                raise ValueError("checkpoint 状态目录不得是符号链接")
+        self._validate_state_directories()
         self._sessions.mkdir(parents=True, exist_ok=True, mode=0o700)
         self._sessions.chmod(0o700)
+
+    def _validate_state_directories(self) -> None:
+        """拒绝运行根或会话目录通过符号链接跳出仓库。"""
+        runtime_root = self._repository / ".rivet"
+        if runtime_root.is_symlink() or self._sessions.is_symlink():
+            raise ValueError("checkpoint 状态目录不得是符号链接")
 
     def _checkpoint_path(self, session_id: str) -> Path:
         """在路径拼接前验证公共 Session ID 格式。"""

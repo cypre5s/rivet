@@ -74,3 +74,23 @@ def test_session_store_rejects_tamper_and_unknown_id(tmp_path: Path) -> None:
     (sessions / "session_tampered.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="checkpoint"):
         store.load("session_tampered")
+
+
+def test_session_store_rejects_symlink_state_directory(tmp_path: Path) -> None:
+    external = tmp_path / "external"
+    external.mkdir()
+    (tmp_path / ".rivet").symlink_to(external, target_is_directory=True)
+    store = SessionStore(tmp_path)
+
+    with pytest.raises(ValueError, match="符号链接"):
+        store.load("session_missing")
+    with pytest.raises(ValueError, match="符号链接"):
+        store.save(
+            SessionCheckpoint(
+                session_id="session_symlink",
+                run_id="run_symlink",
+                command="ask",
+                query="检查链接",
+                status=SessionStatus.RUNNING,
+            )
+        )

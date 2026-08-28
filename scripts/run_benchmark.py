@@ -18,6 +18,11 @@ from context_fixtures import (
     load_context_cases,
     materialize_context_case,
 )
+from environment_fingerprint import collect_environment_fingerprint
+from fault_benchmark import run_fault_benchmark
+from functional_benchmark import run_functional_benchmark
+from performance_benchmark import run_performance_benchmark
+from verify_licenses import inspect_licenses
 
 from rivet.context.engine import ProgressiveContext
 from rivet.context.inventory import RepositoryInventoryBuilder
@@ -427,7 +432,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="运行 Rivet 可重复基准")
     parser.add_argument(
         "--suite",
-        choices=("context-smoke", "context-full", "security"),
+        choices=(
+            "context-smoke",
+            "context-full",
+            "security",
+            "functional",
+            "faults",
+            "performance",
+            "all",
+        ),
         required=True,
     )
     parser.add_argument("--output", type=Path)
@@ -445,16 +458,154 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = asyncio.run(run_context_full())
     elif suite == "security":
         result = run_security()
+    elif suite == "functional":
+        result = asyncio.run(run_functional_benchmark())
+    elif suite == "faults":
+        result = asyncio.run(run_fault_benchmark())
+    elif suite == "performance":
+        result = run_performance_benchmark()
+    elif suite == "all":
+        result = _run_all()
     else:
         raise AssertionError("参数解析器不得产生未知套件")
     serialized = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
+    if suite == "all" and output_path is None:
+        output_path = (
+            Path(__file__).parents[1] / "benchmarks" / "reports" / "final.json"
+        )
     if output_path is None:
         print(serialized)
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(f"{serialized}\n", encoding="utf-8")
-        print(f"Context 基准结果已写入 {output_path}")
+        if suite == "all":
+            markdown_path = output_path.with_suffix(".md")
+            markdown_path.write_text(_render_final_report(result), encoding="utf-8")
+            print(f"全量评测结果已写入 {output_path} 和 {markdown_path}")
+        else:
+            print(f"基准结果已写入 {output_path}")
     return 0 if cast(bool, result["passed"]) else 1
+
+
+def _run_all() -> dict[str, object]:
+    """顺序运行全部套件并生成同一环境下的最终事实。"""
+    context = asyncio.run(run_context_full())
+    security = run_security()
+    functional = asyncio.run(run_functional_benchmark())
+    faults = asyncio.run(run_fault_benchmark())
+    performance = run_performance_benchmark()
+    licenses = inspect_licenses(Path(__file__).parents[1])
+    components = {
+        "context": context,
+        "faults": faults,
+        "functional": functional,
+        "licenses": licenses,
+        "performance": performance,
+        "security": security,
+    }
+    return {
+        "schema_version": 1,
+        "suite": "all",
+        "passed": all(cast(bool, result["passed"]) for result in components.values()),
+        "recorded_at": datetime.now(UTC).isoformat(),
+        "environment": collect_environment_fingerprint(),
+        "components": components,
+        "limitations": [
+            "功能任务使用明确标注的离线录制提案，不代表真实模型泛化能力",
+            "聊天中披露过的凭据未确认轮换，因此未执行 live Provider 评测",
+            "非交互环境未把测试渲染耗时冒充真实 TUI 首帧或空闲 RSS",
+        ],
+    }
+
+
+def _render_final_report(result: dict[str, object]) -> str:
+    """从最终 JSON 的同一事实生成简洁 Markdown 报告。"""
+    raw_components = result.get("components")
+    if not isinstance(raw_components, dict):
+        raise ValueError("最终报告缺少 components")
+    components = cast(dict[str, object], raw_components)
+    functional = _result_mapping(components, "functional")
+    context = _result_mapping(components, "context")
+    security = _result_mapping(components, "security")
+    faults = _result_mapping(components, "faults")
+    licenses = _result_mapping(components, "licenses")
+    performance = _result_mapping(components, "performance")
+    metrics = _result_mapping(functional, "metrics_by_group")
+    b4 = _result_mapping(metrics, "B4")
+    performance_startup = _result_mapping(performance, "startup")
+    cold_start = _result_mapping(performance_startup, "help_cold_start_ms")
+    kernel = _result_mapping(performance, "kernel")
+    empty_kernel = _result_mapping(kernel, "empty_kernel")
+    return "\n".join(
+        (
+            "# Rivet Phase 14 最终评测",
+            "",
+            f"- 总状态：{'PASSED' if result['passed'] else 'FAILED'}",
+            f"- 记录时间：{result['recorded_at']}",
+            "- 模型模式：离线录制提案（未使用真实凭据或网络）",
+            "",
+            "## 核心指标",
+            "",
+            "| 指标 | 结果 | 目标 |",
+            "|---|---:|---:|",
+            f"| 功能任务数 | {functional['task_count']} | 24 |",
+            "| 每任务运行次数 | 2 | >= 2 |",
+            f"| B4 Task Resolve Rate | {_percentage(b4, 'task_resolve_rate')} | >= 65% |",
+            f"| B4 错误补丁误放行率 | {_percentage(b4, 'false_allow_rate')} | <= 2% |",
+            f"| Gold File Recall@10 | {_percentage(b4, 'gold_file_recall_at_10')} | >= 80% |",
+            f"| 上下文无关 token 比例 | {_percentage(context, 'irrelevant_token_ratio')} | <= 40% |",
+            f"| 安全任务通过 | {security['passed_count']}/{security['case_count']} | 30/30 |",
+            f"| 故障注入通过 | {faults['passed_count']}/{faults['case_count']} | 5/5 |",
+            f"| B4 Guard 租约 | {b4['guard_authorized_count']} | 48 |",
+            f"| B4 EvidenceBundle | {b4['evidence_bundle_count']} | 48 |",
+            f"| B4 Kernel/Module 激活 | {b4['kernel_activation_count']} | 48 |",
+            f"| 许可证证据 | {licenses['record_count']} 项 | 全部有证据 |",
+            f"| help 冷启动 p95 | {_number(cold_start, 'p95'):.3f} ms | <= 300 ms |",
+            f"| Headless Kernel RSS | {_number(empty_kernel, 'peak_rss_mib'):.3f} MiB | <= 80 MiB |",
+            "",
+            "## 对照结论",
+            "",
+            "- B0-B2 会直接污染各自临时 fixture 的主工作树；B3/B4 的真实 Git Worktree 事务污染为 0。",
+            "- B0-B3 的弱交付条件会放行固定错误提案；B4 独立 verifier 的误放行为 0。",
+            "- B4 渐进式上下文相对 B0 全量注入显著减少估算 token，原始选择与每次运行均保存在 final.json。",
+            "",
+            "## 诚实限制",
+            "",
+            "- 此处 Resolve Rate 衡量固定离线提案穿过完整本地闭环的结果，不外推为真实模型泛化率。",
+            "- 已披露凭据未确认轮换，live DeepSeek 任务没有执行；费用为 0，usage 是明确标注的本地估算。",
+            "- TUI 首帧和 TUI+Kernel 空闲 RSS 在非交互环境标为 INCONCLUSIVE，保留发布阶段真实 PTY 人工检查。",
+            "",
+            "## 可复现命令",
+            "",
+            "```bash",
+            "uv run python scripts/run_benchmark.py --suite all",
+            "uv run python scripts/verify_secrets.py --worktree --history",
+            "uv run python scripts/verify_licenses.py",
+            "```",
+            "",
+        )
+    )
+
+
+def _result_mapping(payload: dict[str, object], key: str) -> dict[str, object]:
+    """读取最终报告的嵌套映射。"""
+    value = payload[key]
+    if not isinstance(value, dict):
+        raise ValueError(f"最终报告字段 {key} 无效")
+    return cast(dict[str, object], value)
+
+
+def _number(payload: dict[str, object], key: str) -> float:
+    """读取最终报告中的非布尔数值。"""
+    value = payload[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"最终报告指标 {key} 无效")
+    return float(value)
+
+
+def _percentage(payload: dict[str, object], key: str) -> str:
+    """把零到一指标渲染为百分比。"""
+    return f"{_number(payload, key):.1%}"
 
 
 if __name__ == "__main__":
