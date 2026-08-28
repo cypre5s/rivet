@@ -88,9 +88,14 @@ def _safe_environment() -> dict[str, str]:
 
 
 def _run_probe(probe_name: str) -> dict[str, object]:
-    """运行独立探针并解析带固定前缀的单行 JSON。"""
+    """经轻量中转进程运行探针，隔离长生命周期父进程 RSS 峰值。"""
     completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "--probe", probe_name],
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "--launch-probe",
+            probe_name,
+        ],
         check=False,
         capture_output=True,
         text=True,
@@ -163,12 +168,35 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--probe", choices=("empty-kernel", "help"), help=argparse.SUPPRESS
     )
+    parser.add_argument(
+        "--launch-probe",
+        choices=("empty-kernel", "help"),
+        help=argparse.SUPPRESS,
+    )
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """运行探针或输出不含机器凭据的性能 JSON。"""
     arguments = _build_parser().parse_args(argv)
+    launched_probe_name = cast(str | None, arguments.launch_probe)
+    if launched_probe_name is not None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--probe",
+                launched_probe_name,
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=_safe_environment(),
+            timeout=10,
+        )
+        sys.stdout.write(completed.stdout)
+        sys.stderr.write(completed.stderr)
+        return completed.returncode
     probe_name = cast(str | None, arguments.probe)
     if probe_name == "empty-kernel":
         payload = asyncio.run(_probe_empty_kernel())

@@ -35,3 +35,17 @@ def test_kernel_importing_concrete_reader_is_rejected(tmp_path: Path) -> None:
 
     assert len(violations) == 1
     assert violations[0].rule_id == "kernel.concrete_dependency"
+
+
+def test_trace_importing_provider_is_rejected(tmp_path: Path) -> None:
+    trace_directory = tmp_path / "src" / "rivet" / "trace"
+    trace_directory.mkdir(parents=True)
+    (trace_directory / "invalid.py").write_text(
+        "from rivet.providers import deepseek\n",
+        encoding="utf-8",
+    )
+
+    violations = find_architecture_violations(tmp_path)
+
+    assert len(violations) == 1
+    assert violations[0].rule_id == "trace.concrete_dependency"

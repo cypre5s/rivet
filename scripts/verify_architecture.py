@@ -40,6 +40,16 @@ FORBIDDEN_KERNEL_IMPORT_PREFIXES = (
     "pytesseract",
     "whisper",
 )
+FORBIDDEN_TRACE_IMPORT_PREFIXES = (
+    "rivet.context",
+    "rivet.guard",
+    "rivet.ipc",
+    "rivet.providers",
+    "rivet.readers",
+    "rivet.tools",
+    "rivet.transaction",
+    "rivet.verify",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -84,6 +94,12 @@ def find_architecture_violations(
             FORBIDDEN_KERNEL_IMPORT_PREFIXES,
             "kernel.concrete_dependency",
             "Kernel 不得导入具体能力",
+        ),
+        (
+            repository_root / "src" / "rivet" / "trace",
+            FORBIDDEN_TRACE_IMPORT_PREFIXES,
+            "trace.concrete_dependency",
+            "Trace 不得导入具体业务能力",
         ),
     )
     for source_root, forbidden_prefixes, rule_id, summary_prefix in source_rules:
