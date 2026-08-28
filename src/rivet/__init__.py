@@ -10,13 +10,18 @@ __version__ = version("rivet")
 
 
 def main(argv: Sequence[str] | None = None) -> None:
-    """解析基础元信息与当前已接通的 headless 子命令。"""
+    """解析命令；无子命令时启动 TUI，headless 模式保持独立可用。"""
     parser = ArgumentParser(
         prog="rivet",
         description="可靠、可审计的本地编程智能体",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="不启动 TUI，仅使用命令行接口",
     )
     subparsers = parser.add_subparsers(dest="command")
     trace_parser = subparsers.add_parser("trace", help="回放结构化执行轨迹")
@@ -35,9 +40,26 @@ def main(argv: Sequence[str] | None = None) -> None:
     read_parser.add_argument("file", type=Path)
     read_parser.add_argument("--json", action="store_true", dest="json_output")
     read_parser.add_argument("--repository", type=Path, default=Path.cwd())
+    internal_parser = subparsers.add_parser("internal", help="内部版本化进程入口")
+    internal_subparsers = internal_parser.add_subparsers(dest="internal_command")
+    worker_parser = internal_subparsers.add_parser("worker", help="运行 TUI Worker")
+    worker_parser.add_argument("--stdio", action="store_true")
+    worker_parser.add_argument("--repository", type=Path, default=Path.cwd())
     arguments = parser.parse_args(argv)
     command = cast(str | None, arguments.command)
-    if command == "trace":
+    if command is None:
+        if cast(bool, arguments.headless):
+            parser.print_help()
+            return
+        from rivet.tui_launcher import TuiLaunchError, launch_tui
+
+        try:
+            exit_code = launch_tui(Path.cwd())
+        except TuiLaunchError as error:
+            raise SystemExit(str(error)) from error
+        if exit_code:
+            raise SystemExit(exit_code)
+    elif command == "trace":
         from rivet.trace.cli import run_trace_command
 
         exit_code = run_trace_command(
@@ -126,3 +148,14 @@ def main(argv: Sequence[str] | None = None) -> None:
             print(result.content, end="" if result.content.endswith("\n") else "\n")
         if result.status is ReaderStatus.FAILED:
             raise SystemExit(1)
+    elif command == "internal":
+        import asyncio
+
+        if cast(str | None, arguments.internal_command) != "worker" or not cast(
+            bool, arguments.stdio
+        ):
+            raise SystemExit("internal worker 只支持 --stdio")
+        from rivet.ipc.worker import run_stdio_worker
+
+        repository = cast(Path, arguments.repository).resolve(strict=True)
+        raise SystemExit(asyncio.run(run_stdio_worker(repository)))

@@ -56,6 +56,23 @@ class IpcEvent(ContractModel):
     payload: dict[str, JsonValue] = Field(default_factory=dict)
 
 
+class IpcCancel(ContractModel):
+    """表示带独立操作 ID 的在途请求取消消息。"""
+
+    message_type: Literal["cancel"] = "cancel"
+    protocol_version: Literal[1] = IPC_PROTOCOL_VERSION
+    request_id: RequestId
+    target_request_id: RequestId
+
+    @model_validator(mode="after")
+    def _validate_target(self) -> Self:
+        """取消操作自身不得成为取消目标。"""
+        if self.request_id == self.target_request_id:
+            raise ValueError("取消请求不得以自身为目标")
+        return self
+
+
 IpcMessage = Annotated[
-    IpcRequest | IpcResponse | IpcEvent, Field(discriminator="message_type")
+    IpcRequest | IpcResponse | IpcEvent | IpcCancel,
+    Field(discriminator="message_type"),
 ]

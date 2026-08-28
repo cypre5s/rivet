@@ -1,6 +1,6 @@
 export const IPC_PROTOCOL_VERSION = 1 as const;
-export const IPC_SCHEMA_SHA256 = "0fa44dfd84f6513cf72daf535c65afc6982f83f37da9d51cede4c3d21ba1f45b";
-export const IPC_FIELD_MAP = {"IpcEvent":["schema_version","message_type","protocol_version","event_id","event_type","sequence","payload"],"IpcRequest":["schema_version","message_type","protocol_version","request_id","method","params"],"IpcResponse":["schema_version","message_type","protocol_version","request_id","ok","result","error"]} as const;
+export const IPC_SCHEMA_SHA256 = "4e92ee8ba4cea3a034d4ed5b85267452c8765e880b421e40603473656132d902";
+export const IPC_FIELD_MAP = {"IpcCancel":["schema_version","message_type","protocol_version","request_id","target_request_id"],"IpcEvent":["schema_version","message_type","protocol_version","event_id","event_type","sequence","payload"],"IpcRequest":["schema_version","message_type","protocol_version","request_id","method","params"],"IpcResponse":["schema_version","message_type","protocol_version","request_id","ok","result","error"]} as const;
 
 export type JsonValue =
   | null
@@ -52,4 +52,12 @@ export interface IpcEvent {
   payload: { [key: string]: JsonValue };
 }
 
-export type IpcMessage = IpcRequest | IpcResponse | IpcEvent;
+export interface IpcCancel {
+  schema_version: 1;
+  message_type: "cancel";
+  protocol_version: 1;
+  request_id: string;
+  target_request_id: string;
+}
+
+export type IpcMessage = IpcRequest | IpcResponse | IpcEvent | IpcCancel;

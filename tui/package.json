@@ -1,0 +1,27 @@
+{
+  "name": "@rivet/tui",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.0",
+  "engines": {
+    "bun": ">=1.4.0 <1.5.0"
+  },
+  "scripts": {
+    "start": "bun run src/main.tsx",
+    "smoke": "bun run src/smoke.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opentui/core": "0.5.8",
+    "@opentui/keymap": "0.5.8",
+    "@opentui/react": "0.5.8",
+    "react": "19.2.8"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.0",
+    "@types/react": "19.2.18",
+    "typescript": "5.9.3"
+  }
+}

@@ -13,9 +13,20 @@ from typing import cast
 
 from pydantic import BaseModel
 
-from rivet.contracts.ipc import IPC_PROTOCOL_VERSION, IpcEvent, IpcRequest, IpcResponse
+from rivet.contracts.ipc import (
+    IPC_PROTOCOL_VERSION,
+    IpcCancel,
+    IpcEvent,
+    IpcRequest,
+    IpcResponse,
+)
 
-IPC_MODELS: tuple[type[BaseModel], ...] = (IpcRequest, IpcResponse, IpcEvent)
+IPC_MODELS: tuple[type[BaseModel], ...] = (
+    IpcRequest,
+    IpcResponse,
+    IpcEvent,
+    IpcCancel,
+)
 SCHEMA_FIXTURE_PATH = Path("tests/fixtures/contracts/ipc_schema_v1.json")
 TYPESCRIPT_MIRROR_PATH = Path("tui/src/contracts/ipc.ts")
 SCHEMA_HASH_PATTERN = re.compile(r'IPC_SCHEMA_SHA256 = "([0-9a-f]{64})"')
@@ -113,7 +124,15 @@ export interface IpcEvent {{
   payload: {{ [key: string]: JsonValue }};
 }}
 
-export type IpcMessage = IpcRequest | IpcResponse | IpcEvent;
+export interface IpcCancel {{
+  schema_version: 1;
+  message_type: "cancel";
+  protocol_version: 1;
+  request_id: string;
+  target_request_id: string;
+}}
+
+export type IpcMessage = IpcRequest | IpcResponse | IpcEvent | IpcCancel;
 '''
 
 

@@ -10,7 +10,7 @@ from rivet.contracts.guard import (
     CapabilityLease,
     PermissionRequest,
 )
-from rivet.contracts.ipc import IpcEvent, IpcRequest, IpcResponse
+from rivet.contracts.ipc import IpcCancel, IpcEvent, IpcRequest, IpcResponse
 from rivet.contracts.messages import (
     AssistantMessage,
     ProviderOpaqueState,
@@ -48,6 +48,7 @@ CONTRACT_MODELS: tuple[type[BaseModel], ...] = (
     AuthorizationDecision,
     CapabilityLease,
     PermissionRequest,
+    IpcCancel,
     IpcEvent,
     IpcRequest,
     IpcResponse,
