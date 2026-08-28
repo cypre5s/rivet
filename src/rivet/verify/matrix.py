@@ -196,10 +196,9 @@ def compute_verdict(
         status = VerificationStatus.CANCELLED
     elif any(status is VerificationStatus.FAILED for status in required_statuses):
         status = VerificationStatus.FAILED
-    elif any(
-        status in {VerificationStatus.INCONCLUSIVE, VerificationStatus.BLOCKED}
-        for status in required_statuses
-    ):
+    elif any(status is VerificationStatus.BLOCKED for status in required_statuses):
+        status = VerificationStatus.BLOCKED
+    elif any(status is VerificationStatus.INCONCLUSIVE for status in required_statuses):
         status = VerificationStatus.INCONCLUSIVE
     else:
         status = VerificationStatus.PASSED

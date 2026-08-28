@@ -161,6 +161,7 @@ async def test_registry_records_trace_and_keeps_model_view_smaller(
     assert [record.event.event_type for record in replay.events] == [
         "tool.started",
         "tool.completed",
+        "workspace.changed",
     ]
     await trace.close()
     await scope.close()
@@ -265,7 +266,8 @@ async def test_registry_adapts_to_agent_loop_tool_contract(tmp_path: Path) -> No
     transaction = tmp_path / "transaction"
     repository.mkdir()
     transaction.mkdir()
-    (repository / "sample.txt").write_text("content", encoding="utf-8")
+    (repository / "sample.txt").write_text("stale main content", encoding="utf-8")
+    (transaction / "sample.txt").write_text("transaction content", encoding="utf-8")
     scope = ResourceScope("tools.agent.adapter")
     trace = await _start_trace(tmp_path, repository)
     registry = build_workspace_tool_registry(
@@ -290,7 +292,8 @@ async def test_registry_adapts_to_agent_loop_tool_contract(tmp_path: Path) -> No
         )
     )
 
-    assert "content" in observation
+    assert "transaction content" in observation
+    assert "stale main content" not in observation
     await trace.close()
     await scope.close()
 

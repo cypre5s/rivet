@@ -477,6 +477,39 @@ class GitBackend:
         )
         return parse_porcelain_paths(status)
 
+    async def added_paths(
+        self,
+        worktree: Path,
+        base_commit: str,
+    ) -> tuple[str, ...]:
+        """返回相对冻结基线新增的文件，包含 intent-to-add 文件。"""
+        output = await self.run_worktree(
+            worktree,
+            (
+                "diff",
+                "--name-only",
+                "--diff-filter=A",
+                "-z",
+                base_commit,
+                "--",
+            ),
+        )
+        return parse_nul_paths(output)
+
+    async def file_at_revision(
+        self,
+        worktree: Path,
+        revision: str,
+        path: str,
+    ) -> bytes:
+        """读取冻结 revision 的单文件内容；不存在时返回空字节。"""
+        _decode_path(path.encode("utf-8", errors="strict"))
+        return await self.run_worktree(
+            worktree,
+            ("show", f"{revision}:{path}"),
+            check=False,
+        )
+
     async def binary_diff(self, worktree: Path, base_commit: str) -> bytes:
         """将 untracked 标记为 intent-to-add 后生成完整 binary diff。"""
         untracked = parse_nul_paths(

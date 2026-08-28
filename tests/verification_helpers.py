@@ -118,6 +118,7 @@ async def run_verification_case(
     use_production_sandbox: bool = False,
     sandbox_executable: Path | None = None,
     behavior_verification_commands: tuple[tuple[str, ...], ...] | None = None,
+    verification_scope: ResourceScope | None = None,
 ) -> PreparedVerification:
     """创建真实 Worktree、写补丁并执行完整验证矩阵。"""
     repository = initialize_repository(tmp_path)
@@ -162,7 +163,7 @@ async def run_verification_case(
     )
     service = VerificationService(
         manager,
-        scope=scope,
+        scope=verification_scope or scope,
         project_configuration=configuration,
         configuration_confirmed=True,
         cancelled=cancelled,

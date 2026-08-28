@@ -17,7 +17,7 @@ from rivet.storage.sessions import (
 )
 
 
-def test_interrupted_tool_is_unknown_and_requires_explicit_retry(
+def test_interrupted_write_is_unknown_and_requires_explicit_abort(
     tmp_path: Path,
 ) -> None:
     store = SessionStore(tmp_path)
@@ -43,7 +43,7 @@ def test_interrupted_tool_is_unknown_and_requires_explicit_retry(
 
     assert recovered.status is SessionStatus.INTERRUPTED
     assert recovered.pending_tools[0].status is ToolRecoveryStatus.UNKNOWN
-    assert recovered.pending_tools[0].next_action == "RETRY"
+    assert recovered.pending_tools[0].next_action == "ABORT"
     assert recovered.provider_state == {"reasoning_content": "opaque"}
     assert recovered.transaction_id == "tx_resume_one"
 

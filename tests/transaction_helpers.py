@@ -81,6 +81,7 @@ def acceptance_spec(
         user_goal="在隔离 Worktree 中修改 fixture",
         baseline_reproduction=(("git", "status", "--short"),),
         allowed_paths=("tracked.txt", "second.txt", "binary.bin", "新增.txt"),
+        allowed_new_paths=("新增.txt",),
         forbidden_paths=("forbidden.txt",),
         expected_behaviors=(expected_behavior,),
         preserved_behaviors=("主工作区在验证前保持不变",),

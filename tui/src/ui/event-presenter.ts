@@ -36,6 +36,9 @@ const EVENT_TITLES: Record<string, string> = {
   "evidence.published": "验证证据已发布",
   "permission.requested": "需要确认受限操作",
   "permission.resolved": "权限请求已处理",
+  "agent.answered": "回复已生成",
+  "agent.planned": "计划已生成",
+  "agent.patch_ready": "补丁生成完成，等待独立验证",
   "agent.completed": "Rivet 已完成回复",
   "agent.cancelled": "当前任务已取消",
   "plan.updated": "任务阶段已更新",
@@ -107,11 +110,19 @@ function specializedTitle(
     if (status === "BLOCKED") return "验证被阻塞";
     if (status === "INCONCLUSIVE") return "验证结果不确定";
   }
+  if (eventType === "agent.patch_ready") {
+    return "补丁生成完成，等待独立验证";
+  }
   return null;
 }
 
 function eventKind(eventType: string): TimelineKind {
-  if (eventType === "agent.completed") return "assistant";
+  if (
+    eventType === "agent.completed" ||
+    eventType === "agent.answered" ||
+    eventType === "agent.planned"
+  )
+    return "assistant";
   if (eventType.startsWith("tool.")) return eventType.endsWith("failed") ? "error" : "tool";
   if (eventType.includes("failed") || eventType.includes("error")) return "error";
   return "status";
@@ -122,6 +133,7 @@ function eventStatus(
   payload: Record<string, JsonValue>,
 ): TimelineStatus {
   const status = text(payload.status).toUpperCase();
+  if (status === "READY_FOR_VERIFICATION") return "running";
   if (eventType.endsWith("started") || status === "RUNNING") return "running";
   if (eventType.includes("cancel") || status === "CANCELLED") return "cancelled";
   if (status === "BLOCKED" || status === "INCONCLUSIVE") return "blocked";

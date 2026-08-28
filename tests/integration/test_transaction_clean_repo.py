@@ -82,6 +82,7 @@ async def test_clean_repository_patch_apply_isolated_and_idempotent(
 
     assert worktree_digest(repository) == main_before
     assert patch.changed_files == ("binary.bin", "tracked.txt", "新增.txt")
+    assert patch.created_files == ("新增.txt",)
     assert patch.contains_binary_diff is True
     assert manager.patch_path(record.transaction_id, patch.patch_id).is_file()
 

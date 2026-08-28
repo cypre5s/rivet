@@ -135,3 +135,32 @@ def test_verdict_rejects_forged_passed_flag() -> None:
             results=(result,),
             decided_at=datetime(2026, 8, 28, tzinfo=UTC),
         )
+
+
+def test_verdict_preserves_blocked_status() -> None:
+    step = VerificationStep(
+        step_id="verification_blocked",
+        kind=VerificationKind.ENVIRONMENT,
+        name="环境阻塞步骤",
+        required=True,
+        command=("missing-tool",),
+        timeout_seconds=30,
+    )
+    result = VerificationResult(
+        step=step,
+        status=VerificationStatus.BLOCKED,
+        duration_ms=1,
+    )
+
+    verdict = Verdict(
+        transaction_id="tx_blocked",
+        acceptance_sha256="sha256:" + ("d" * 64),
+        evidence_id="evidence_blocked",
+        evidence_manifest_path="evidence/attempt_0001/manifest.json",
+        status=VerificationStatus.BLOCKED,
+        passed=False,
+        results=(result,),
+        decided_at=datetime(2026, 8, 28, tzinfo=UTC),
+    )
+
+    assert verdict.status is VerificationStatus.BLOCKED

@@ -25,10 +25,27 @@ class AgentLoopState(StrEnum):
     EXECUTE_TOOLS = "execute_tools"
     OBSERVE = "observe"
     EVALUATE = "evaluate"
-    VERIFY = "verify"
     COMPLETE = "complete"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class AgentTaskMode(StrEnum):
+    """区分模型阶段完成后应产生的本地任务语义。"""
+
+    ASK = "ASK"
+    PLAN = "PLAN"
+    FIX = "FIX"
+
+
+class AgentCompletionStatus(StrEnum):
+    """描述模型阶段结论，不包含独立验证才能产生的 VERIFIED。"""
+
+    ANSWERED = "ANSWERED"
+    PLANNED = "PLANNED"
+    READY_FOR_VERIFICATION = "READY_FOR_VERIFICATION"
+    FAILED = "FAILED"
+    CANCELLED = "CANCELLED"
 
 
 class AgentTerminationReason(StrEnum):
@@ -92,6 +109,7 @@ class AgentTask:
     session_id: SessionId
     messages: tuple[Message, ...]
     model: str
+    mode: AgentTaskMode = AgentTaskMode.ASK
     initial_round_count: int = 0
     initial_tool_call_count: int = 0
     initial_prompt_tokens: int = 0
@@ -123,6 +141,7 @@ class AgentLoopResult:
     state: AgentLoopState
     state_history: tuple[AgentLoopState, ...]
     termination_reason: AgentTerminationReason
+    completion_status: AgentCompletionStatus
     messages: tuple[Message, ...]
     answer: str | None
     round_count: int

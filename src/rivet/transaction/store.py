@@ -343,7 +343,12 @@ class TransactionStore:
             )
         if record.state in {TransactionState.VERIFIED, TransactionState.APPLIED}:
             expected_passed = True
-        elif record.state is TransactionState.REJECTED:
+        elif record.state in {
+            TransactionState.REJECTED,
+            TransactionState.INCONCLUSIVE,
+            TransactionState.BLOCKED,
+            TransactionState.CANCELLED,
+        }:
             expected_passed = False
         else:
             raise TransactionError(

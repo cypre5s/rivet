@@ -41,6 +41,30 @@ def test_state_machine_accepts_only_adjacent_verified_path() -> None:
         validate_transition(TransactionState.BASELINED, TransactionState.VERIFIED)
 
 
+@pytest.mark.parametrize(
+    "decided_state",
+    (
+        TransactionState.REJECTED,
+        TransactionState.INCONCLUSIVE,
+        TransactionState.BLOCKED,
+        TransactionState.CANCELLED,
+    ),
+)
+def test_non_verified_decisions_can_only_retry_or_abort(
+    decided_state: TransactionState,
+) -> None:
+    assert (
+        validate_transition(decided_state, TransactionState.PATCHING)
+        is TransactionState.PATCHING
+    )
+    assert (
+        validate_transition(decided_state, TransactionState.ABORTED)
+        is TransactionState.ABORTED
+    )
+    with pytest.raises(TransactionError):
+        validate_transition(decided_state, TransactionState.APPLIED)
+
+
 def test_terminal_state_is_idempotent_but_cannot_reopen() -> None:
     assert (
         validate_transition(TransactionState.APPLIED, TransactionState.APPLIED)

@@ -26,9 +26,11 @@ from rivet.contracts.provider import (
 from rivet.contracts.tools import ToolCall
 from rivet.kernel.agent_loop import AgentLoop
 from rivet.kernel.agent_models import (
+    AgentCompletionStatus,
     AgentLoopConfig,
     AgentLoopState,
     AgentTask,
+    AgentTaskMode,
     AgentTerminationReason,
 )
 from rivet.kernel.agent_tools import AgentTool
@@ -47,6 +49,14 @@ class EchoArguments(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     text: str
+
+
+class WriteArguments(BaseModel):
+    """为修改后 Context 刷新测试提供严格写参数。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    content: str
 
 
 class ScriptedProvider:
@@ -99,12 +109,13 @@ def _response(
     )
 
 
-def _task() -> AgentTask:
+def _task(mode: AgentTaskMode = AgentTaskMode.ASK) -> AgentTask:
     return AgentTask(
         run_id="run_agent_test",
         session_id="session_agent_test",
         messages=(UserMessage(content="do it", created_at=NOW),),
         model="deepseek-v4-pro",
+        mode=mode,
     )
 
 
@@ -171,9 +182,32 @@ async def test_final_answer_completes_without_tools() -> None:
         AgentLoopState.MODEL_CALL,
         AgentLoopState.PARSE_TOOL_CALLS,
         AgentLoopState.EVALUATE,
-        AgentLoopState.VERIFY,
         AgentLoopState.COMPLETE,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    (
+        (AgentTaskMode.ASK, AgentCompletionStatus.ANSWERED),
+        (AgentTaskMode.PLAN, AgentCompletionStatus.PLANNED),
+        (AgentTaskMode.FIX, AgentCompletionStatus.READY_FOR_VERIFICATION),
+    ),
+)
+async def test_provider_stop_has_command_specific_non_verified_status(
+    mode: AgentTaskMode,
+    expected: AgentCompletionStatus,
+) -> None:
+    provider = ScriptedProvider(
+        (_response(content="已经修复，全部测试通过，verified done。"),)
+    )
+
+    result = await AgentLoop(provider, tools=(), clock=lambda: NOW).run(_task(mode))
+
+    assert result.completion_status is expected
+    assert all(state.value != "verify" for state in result.state_history)
+    assert result.completion_status.value != "VERIFIED"
 
 
 @pytest.mark.asyncio
@@ -196,6 +230,53 @@ async def test_context_gatherer_runs_inside_kernel_before_first_model_call() -> 
 
     assert result.state is AgentLoopState.COMPLETE
     assert provider.requests[0].messages[-1] == gathered
+
+
+@pytest.mark.asyncio
+async def test_transaction_write_refreshes_context_before_next_model_call() -> None:
+    current = {"content": "old content"}
+
+    async def write(arguments: BaseModel) -> str:
+        values = WriteArguments.model_validate(arguments.model_dump())
+        current["content"] = values.content
+        return "written"
+
+    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
+        return (SystemMessage(content=current["content"], created_at=NOW),)
+
+    provider = ScriptedProvider(
+        (
+            _response(
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_refresh_context",
+                        tool_name="file.write_transaction",
+                        arguments={"content": "new content"},
+                    ),
+                ),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            ),
+            _response(content="done"),
+        )
+    )
+    tool = AgentTool.from_model(
+        name="file.write_transaction",
+        description="事务写入",
+        input_model=WriteArguments,
+        executor=write,
+    )
+
+    result = await AgentLoop(
+        provider,
+        tools=(tool,),
+        context_gatherer=gather_context,
+        clock=lambda: NOW,
+    ).run(_task(AgentTaskMode.FIX))
+
+    assert result.state is AgentLoopState.COMPLETE
+    assert any(
+        message.content == "new content" for message in provider.requests[1].messages
+    )
 
 
 @pytest.mark.asyncio

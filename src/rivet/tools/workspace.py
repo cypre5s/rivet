@@ -46,7 +46,7 @@ class WorkspaceInspector:
 
     async def info(self) -> WorkspaceInfo:
         """读取 Git HEAD 文件，不启动外部进程。"""
-        root = self._boundary.repository_root
+        root = self._boundary.effective_root
         git_path = root / ".git"
         is_bare = (
             not git_path.exists()
@@ -107,7 +107,7 @@ class WorkspaceInspector:
                     return
                 child_path = Path(child.path)
                 relative = child_path.relative_to(
-                    self._boundary.repository_root
+                    self._boundary.effective_root
                 ).as_posix()
                 if child.is_symlink():
                     kind = "symlink"

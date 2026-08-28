@@ -141,6 +141,18 @@ const ui = (action: UiCommandAction): CommandHandler => (argument) => ({
   argument,
 });
 
+const exportCommand: CommandHandler = (argument) => {
+  const tokens = argument.trim().split(/\s+/).filter(Boolean);
+  const exportKind = tokens.shift();
+  if (!exportKind || !["evidence", "trace", "session"].includes(exportKind)) {
+    throw new Error("/export 需要 evidence、trace 或 session");
+  }
+  if (tokens.length > 1) throw new Error("/export 最多接受一个输出路径");
+  const params: Record<string, JsonValue> = { export_kind: exportKind };
+  if (tokens[0]) params.output_path = tokens[0];
+  return { kind: "worker", method: "command.export", params };
+};
+
 const modulesCommand: CommandHandler = (argument) => {
   const tokens = argument.trim().split(/\s+/).filter(Boolean);
   const operations = new Set(["list", "show", "enable", "disable", "wake", "sleep"]);
@@ -359,8 +371,8 @@ export const COMMAND_REGISTRY: readonly CommandDescriptor[] = [
     { aliases: ["主题"] },
   ),
   descriptor(
-    "export", "项目与系统", "导出视图", "打开可复制的 Trace、Evidence 或 Session 视图",
-    "trace|evidence|session", "export", ui("export-view"),
+    "export", "项目与系统", "导出文件", "原子导出 Trace、Evidence 或 Session 并返回 SHA-256",
+    "trace|evidence|session [PATH]", "export", exportCommand,
     { aliases: ["导出"] },
   ),
 ] as const;

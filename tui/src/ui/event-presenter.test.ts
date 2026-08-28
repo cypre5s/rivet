@@ -31,6 +31,17 @@ describe("trace event presentation", () => {
         event("verification.completed", { status: "PASSED" }),
       ),
     ).toMatchObject({ title: "验证通过", status: "success" });
+    expect(
+      presentTraceEvent(
+        event("agent.patch_ready", { status: "READY_FOR_VERIFICATION" }),
+      ),
+    ).toMatchObject({
+      title: "补丁生成完成，等待独立验证",
+      status: "running",
+    });
+    expect(
+      presentTraceEvent(event("agent.answered", { status: "ANSWERED" })),
+    ).toMatchObject({ title: "回复已生成", kind: "assistant" });
   });
 
   test("keeps unknown events generic instead of exposing raw protocol names", () => {

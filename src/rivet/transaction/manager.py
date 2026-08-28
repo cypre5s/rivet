@@ -10,6 +10,7 @@ from contextlib import suppress
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 from rivet.contracts.common import RepositoryPath
 from rivet.contracts.transactions import (
@@ -96,6 +97,8 @@ class TransactionManager:
         user_goal: str,
         baseline_reproduction: tuple[Command, ...],
         allowed_paths: tuple[RepositoryPath, ...],
+        read_scope: tuple[RepositoryPath, ...] = (),
+        allowed_new_paths: tuple[RepositoryPath, ...] = (),
         expected_behaviors: tuple[str, ...],
         preserved_behaviors: tuple[str, ...],
         verification_commands: tuple[Command, ...],
@@ -104,6 +107,8 @@ class TransactionManager:
         max_tokens: int,
         max_tool_calls: int,
         forbidden_paths: tuple[RepositoryPath, ...] = (),
+        scope_reason: str = "完成用户任务所需的最小文件集合",
+        scope_source: Literal["explicit", "task", "plan", "project"] = "project",
         max_cost_usd: Decimal | None = None,
         acceptable_risks: tuple[str, ...] = (),
         non_goals: tuple[str, ...] = (),
@@ -114,8 +119,13 @@ class TransactionManager:
             acceptance_id=acceptance_id or _new_identifier("acceptance"),
             user_goal=user_goal,
             baseline_reproduction=baseline_reproduction,
+            read_scope=read_scope,
             allowed_paths=allowed_paths,
+            write_scope=allowed_paths,
+            allowed_new_paths=allowed_new_paths,
             forbidden_paths=forbidden_paths,
+            scope_reason=scope_reason,
+            scope_source=scope_source,
             expected_behaviors=expected_behaviors,
             preserved_behaviors=preserved_behaviors,
             verification_commands=verification_commands,
@@ -254,6 +264,16 @@ class TransactionManager:
         store.save_record(planned)
         return stored_digest
 
+    async def load_acceptance_spec(self, transaction_id: str) -> AcceptanceSpec:
+        """加载并复验事务绑定的冻结 AcceptanceSpec。"""
+        await self._ensure_backend()
+        record = self._require_store().load_record(transaction_id)
+        acceptance_hash = self._verify_acceptance(record)
+        return self._require_store().load_acceptance(
+            transaction_id,
+            expected_sha256=acceptance_hash,
+        )
+
     def transaction_boundary(self, transaction_id: str) -> WorkspaceBoundary:
         """只向写工具暴露主仓库只读根和独立事务写根。"""
         backend = self._require_backend()
@@ -271,7 +291,12 @@ class TransactionManager:
                 "transaction.worktree_missing",
                 "事务 Worktree 不存在",
             )
-        return WorkspaceBoundary(backend.repository_root, worktree)
+        return WorkspaceBoundary(
+            backend.repository_root,
+            worktree,
+            transaction_id=record.transaction_id,
+            mode="FIX",
+        )
 
     def worktree_path(self, transaction_id: str) -> Path:
         """返回记录绑定的 XDG cache Worktree 路径。"""
@@ -455,6 +480,9 @@ class TransactionManager:
             TransactionState.PLANNED,
             TransactionState.PATCHING,
             TransactionState.REJECTED,
+            TransactionState.INCONCLUSIVE,
+            TransactionState.BLOCKED,
+            TransactionState.CANCELLED,
         }:
             raise TransactionError(
                 "transaction.patch_state_invalid",
@@ -466,6 +494,13 @@ class TransactionManager:
         if not content:
             raise TransactionError("transaction.patch_empty", "事务没有可记录的修改")
         changed_files = await backend.changed_paths(worktree)
+        created_files = await backend.added_paths(worktree, record.base_commit)
+        selected_symbols = changed_symbols or await self._extract_changed_symbols(
+            backend,
+            worktree,
+            record.base_commit,
+            changed_files,
+        )
         selected_patch_id = patch_id or _new_identifier("patch")
         patch = PatchSet(
             patch_id=selected_patch_id,
@@ -474,7 +509,8 @@ class TransactionManager:
             acceptance_sha256=acceptance_hash,
             patch_sha256=sha256_digest(content),
             changed_files=changed_files,
-            changed_symbols=changed_symbols,
+            created_files=created_files,
+            changed_symbols=selected_symbols,
             contains_binary_diff=(
                 b"GIT binary patch" in content or b"Binary files " in content
             ),
@@ -488,6 +524,36 @@ class TransactionManager:
         )
         store.save_record(patching)
         return patch
+
+    @staticmethod
+    async def _extract_changed_symbols(
+        backend: GitBackend,
+        worktree: Path,
+        base_commit: str,
+        changed_files: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """有界读取补丁两侧源码并生成 Evidence 可复核符号差异。"""
+        from rivet.context.syntax import supports_syntax_path
+        from rivet.verify.symbols import extract_changed_symbols
+
+        before: dict[str, str] = {}
+        after: dict[str, str] = {}
+        for path in changed_files:
+            if not supports_syntax_path(path):
+                continue
+            old = await backend.file_at_revision(worktree, base_commit, path)
+            if old:
+                with suppress(UnicodeDecodeError):
+                    before[path] = old.decode("utf-8", errors="strict")
+            candidate = worktree / path
+            try:
+                if candidate.is_file() and not candidate.is_symlink():
+                    content = candidate.read_bytes()
+                    if len(content) <= 2 * 1024 * 1024:
+                        after[path] = content.decode("utf-8", errors="strict")
+            except (OSError, UnicodeDecodeError):
+                continue
+        return extract_changed_symbols(before=before, after=after)
 
     async def begin_verification(self, transaction_id: str) -> TransactionRecord:
         """锁定当前 PatchSet 并进入等待确定性 Verdict 的状态。"""
@@ -526,11 +592,13 @@ class TransactionManager:
             verdict,
             expected_patch_sha256=patch.patch_sha256 if verdict.passed else None,
         )
-        target = (
-            TransactionState.VERIFIED
-            if verdict.status is VerificationStatus.PASSED and verdict.passed
-            else TransactionState.REJECTED
-        )
+        target = {
+            VerificationStatus.PASSED: TransactionState.VERIFIED,
+            VerificationStatus.FAILED: TransactionState.REJECTED,
+            VerificationStatus.INCONCLUSIVE: TransactionState.INCONCLUSIVE,
+            VerificationStatus.BLOCKED: TransactionState.BLOCKED,
+            VerificationStatus.CANCELLED: TransactionState.CANCELLED,
+        }[verdict.status]
         decided = self._transition(
             record,
             target,

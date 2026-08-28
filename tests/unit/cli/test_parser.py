@@ -30,6 +30,7 @@ def test_parser_exposes_every_official_command() -> None:
         "benchmark",
         "config",
         "clean",
+        "export",
     )
     assert all(command in help_text for command in OFFICIAL_COMMANDS)
     assert "internal" not in help_text
@@ -72,6 +73,38 @@ def test_apply_requires_transaction_id() -> None:
         build_parser().parse_args(("apply",))
 
     assert captured.value.code == 2
+
+
+def test_read_parser_exposes_bounded_enhancement_options() -> None:
+    arguments = build_parser().parse_args(
+        (
+            "read",
+            "video.mp4",
+            "--ocr",
+            "--transcribe",
+            "--frames",
+            "8",
+            "--max-ocr-pages",
+            "12",
+            "--max-image-pixels",
+            "2000000",
+            "--max-audio-duration",
+            "600",
+            "--max-output-chars",
+            "5000",
+            "--timeout",
+            "15",
+        )
+    )
+
+    assert arguments.ocr is True
+    assert arguments.transcribe is True
+    assert arguments.frames == 8
+    assert arguments.max_ocr_pages == 12
+    assert arguments.max_image_pixels == 2_000_000
+    assert arguments.max_audio_duration == 600
+    assert arguments.max_output_chars == 5_000
+    assert arguments.timeout == 15
 
 
 def test_modules_parser_exposes_lifecycle_operations_and_safety_options() -> None:

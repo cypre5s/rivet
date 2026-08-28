@@ -50,6 +50,7 @@ OFFICIAL_TUI_COMMANDS = frozenset(
         "resume",
         "trace",
         "verify",
+        "export",
     }
 )
 CommandRunner = Callable[[tuple[str, ...], EmitEvent], Awaitable["CommandExecution"]]
@@ -721,6 +722,28 @@ class CommandWorkerApplication(BaseWorkerApplication):
                     "从 Trace 面板选择有效 Run",
                 )
             return (*prefix, run_id)
+        if command == "export":
+            export_kind = request.params.get("export_kind")
+            output_path = request.params.get("output_path")
+            if export_kind not in {"evidence", "trace", "session"}:
+                raise WorkerMethodError(
+                    "export.kind_invalid",
+                    "导出种类无效",
+                    "使用 evidence、trace 或 session",
+                )
+            if output_path is None:
+                return (*prefix, export_kind)
+            if (
+                not isinstance(output_path, str)
+                or not output_path
+                or len(output_path) > 4_096
+            ):
+                raise WorkerMethodError(
+                    "export.destination_invalid",
+                    "导出路径无效",
+                    "提供仓库内相对路径",
+                )
+            return (*prefix, export_kind, output_path)
         if command not in {"verify", "diff", "apply", "abort"}:
             return prefix
         transaction_id = request.params.get("transaction_id")
@@ -1090,7 +1113,24 @@ class CommandWorkerApplication(BaseWorkerApplication):
         """把同一命令结果投影为 TUI 各面板消费的结构化事件。"""
         answer = payload.get("answer")
         if isinstance(answer, str) and answer:
-            await emit("agent.completed", {"summary": answer})
+            model_status = payload.get("model_status", payload.get("status"))
+            if model_status == "ANSWERED":
+                event_type = "agent.answered"
+            elif model_status == "PLANNED":
+                event_type = "agent.planned"
+            elif model_status == "READY_FOR_VERIFICATION":
+                event_type = "agent.patch_ready"
+            else:
+                event_type = "agent.completed"
+            await emit(
+                event_type,
+                {
+                    "status": model_status
+                    if isinstance(model_status, str)
+                    else "UNKNOWN",
+                    "summary": answer,
+                },
+            )
         session_id = payload.get("session_id")
         if isinstance(session_id, str):
             await emit(

@@ -23,6 +23,7 @@ OFFICIAL_COMMANDS = (
     "benchmark",
     "config",
     "clean",
+    "export",
 )
 
 
@@ -61,6 +62,14 @@ def build_parser() -> ArgumentParser:
 
     read_parser = subparsers.add_parser("read", help="安全读取本地文件")
     read_parser.add_argument("file", type=Path)
+    read_parser.add_argument("--ocr", action="store_true")
+    read_parser.add_argument("--transcribe", action="store_true")
+    read_parser.add_argument("--frames", type=int, default=20)
+    read_parser.add_argument("--max-ocr-pages", type=int, default=100)
+    read_parser.add_argument("--max-image-pixels", type=int, default=40_000_000)
+    read_parser.add_argument("--max-audio-duration", type=int, default=14_400)
+    read_parser.add_argument("--max-output-chars", type=int, default=1_000_000)
+    read_parser.add_argument("--timeout", type=int, default=30)
     _add_runtime_aliases(read_parser)
 
     plan_parser = subparsers.add_parser("plan", help="生成可验证计划")
@@ -70,6 +79,13 @@ def build_parser() -> ArgumentParser:
     fix_parser = subparsers.add_parser("fix", help="在隔离事务中修复代码")
     fix_parser.add_argument("task")
     fix_parser.add_argument("--yes", action="store_true")
+    fix_parser.add_argument(
+        "--allow-write",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="显式授权本任务可修改的仓库相对文件或目录；可重复",
+    )
     fix_parser.add_argument(
         "--dirty-policy",
         choices=("reject", "snapshot"),
@@ -96,6 +112,13 @@ def build_parser() -> ArgumentParser:
     trace_parser = subparsers.add_parser("trace", help="回放结构化执行轨迹")
     trace_parser.add_argument("run_id", nargs="?")
     _add_runtime_aliases(trace_parser)
+
+    export_parser = subparsers.add_parser(
+        "export", help="原子导出 Evidence、Trace 或 Session"
+    )
+    export_parser.add_argument("kind", choices=("evidence", "trace", "session"))
+    export_parser.add_argument("path", nargs="?", type=Path)
+    _add_runtime_aliases(export_parser)
 
     resume_parser = subparsers.add_parser("resume", help="恢复持久化会话")
     resume_parser.add_argument("session_id")

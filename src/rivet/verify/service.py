@@ -123,10 +123,9 @@ def _aggregate_status(statuses: tuple[VerificationStatus, ...]) -> VerificationS
         return VerificationStatus.CANCELLED
     if any(status is VerificationStatus.FAILED for status in statuses):
         return VerificationStatus.FAILED
-    if any(
-        status in {VerificationStatus.INCONCLUSIVE, VerificationStatus.BLOCKED}
-        for status in statuses
-    ):
+    if any(status is VerificationStatus.BLOCKED for status in statuses):
+        return VerificationStatus.BLOCKED
+    if any(status is VerificationStatus.INCONCLUSIVE for status in statuses):
         return VerificationStatus.INCONCLUSIVE
     return VerificationStatus.PASSED
 
@@ -350,9 +349,7 @@ class VerificationService:
             for executable in executables
             if not self._is_executable(executable, environment["PATH"])
         )
-        status = (
-            VerificationStatus.INCONCLUSIVE if missing else VerificationStatus.PASSED
-        )
+        status = VerificationStatus.BLOCKED if missing else VerificationStatus.PASSED
         return _StepDraft(
             step=step,
             status=status,
@@ -433,7 +430,7 @@ class VerificationService:
         except ProcessToolError as error:
             return _StepDraft(
                 step=step,
-                status=VerificationStatus.INCONCLUSIVE,
+                status=VerificationStatus.BLOCKED,
                 exit_code=None,
                 duration_ms=self._duration_ms(started),
                 stderr=f"命令无法启动：{error.code}",
@@ -483,9 +480,17 @@ class VerificationService:
                 for denied in context.acceptance.forbidden_paths
             )
         )
+        unauthorized_created = tuple(
+            path
+            for path in context.patch.created_files
+            if not any(
+                _scope_matches(path, allowed)
+                for allowed in context.acceptance.allowed_new_paths
+            )
+        )
         status = (
             VerificationStatus.PASSED
-            if changed and not outside and not forbidden
+            if changed and not outside and not forbidden and not unauthorized_created
             else VerificationStatus.FAILED
         )
         report: dict[str, object] = {
@@ -493,6 +498,8 @@ class VerificationService:
             "changed_files": list(changed),
             "outside_allowed_paths": list(outside),
             "forbidden_paths_changed": list(forbidden),
+            "created_files": list(context.patch.created_files),
+            "unauthorized_created_files": list(unauthorized_created),
         }
         return (
             _StepDraft(
@@ -671,8 +678,8 @@ class VerificationService:
             and counts.open_client_count == 0
             and counts.open_connection_count == 0
             and counts.temporary_directory_count == 0
-            and counts.temporary_worktree_count == 1
-            and counts.resource_count == 1
+            and counts.temporary_worktree_count in {0, 1}
+            and counts.resource_count == counts.temporary_worktree_count
         )
         if cleanup_errors:
             status = VerificationStatus.INCONCLUSIVE

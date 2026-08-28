@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
+import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -21,9 +23,11 @@ from rivet.contracts.guard import (
     TaintSource,
 )
 from rivet.contracts.tools import (
+    SideEffectClass,
     ToolCall,
     ToolDefinition,
     ToolError,
+    ToolExecutionStatus,
     ToolOutput,
     ToolResult,
 )
@@ -39,9 +43,58 @@ ToolHandler = Callable[[BaseModel], Awaitable["RawToolOutput"]]
 ToolAuthorizer = Callable[[PermissionRequest], AuthorizationDecision]
 
 
+@dataclass(frozen=True, slots=True)
+class ToolCheckpointTransition:
+    """只携带脱敏结果和参数哈希的单次耐久状态变化。"""
+
+    tool_call_id: str
+    tool_name: str
+    arguments_hash: str
+    side_effect_class: SideEffectClass
+    status: ToolExecutionStatus
+    started_at: datetime
+    completed_at: datetime | None = None
+    result_hash: str | None = None
+    result_text: str | None = None
+    error_code: str | None = None
+    retry_policy: str = "NEVER_AUTOMATIC"
+
+
+ToolCheckpointCallback = Callable[[ToolCheckpointTransition], Awaitable[None]]
+
+
 def _utc_now() -> datetime:
     """返回工具结果所需的 UTC 时间。"""
     return datetime.now(UTC)
+
+
+def _side_effect_class(
+    permission: Permission,
+    scope: PermissionScope,
+) -> SideEffectClass:
+    """从权限契约推导默认副作用分类。"""
+    if permission is Permission.READ:
+        return SideEffectClass.READ_ONLY
+    if permission is Permission.WRITE:
+        return (
+            SideEffectClass.TRANSACTIONAL_WRITE
+            if scope in {PermissionScope.TRANSACTION, PermissionScope.SPECIFIC_PATHS}
+            else SideEffectClass.IDEMPOTENT_WRITE
+        )
+    if permission is Permission.EXECUTE:
+        return SideEffectClass.LOCAL_PROCESS
+    return SideEffectClass.EXTERNAL_SIDE_EFFECT
+
+
+def _retry_policy(side_effect_class: SideEffectClass) -> str:
+    """返回恢复器可审计的重放策略。"""
+    return {
+        SideEffectClass.READ_ONLY: "AUTO_REPLAY_READ_ONLY",
+        SideEffectClass.IDEMPOTENT_WRITE: "VERIFY_THEN_RETRY",
+        SideEffectClass.TRANSACTIONAL_WRITE: "VERIFY_TRANSACTION_EFFECT",
+        SideEffectClass.LOCAL_PROCESS: "NEVER_AUTOMATIC",
+        SideEffectClass.EXTERNAL_SIDE_EFFECT: "NEVER_AUTOMATIC",
+    }[side_effect_class]
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,6 +122,7 @@ class RegisteredTool:
     permission: Permission = Permission.READ
     permission_scope: PermissionScope = PermissionScope.WORKSPACE
     path_argument: str | None = None
+    side_effect_class: SideEffectClass = SideEffectClass.READ_ONLY
 
     @classmethod
     def from_model(
@@ -82,6 +136,7 @@ class RegisteredTool:
         permission: Permission = Permission.READ,
         permission_scope: PermissionScope = PermissionScope.WORKSPACE,
         path_argument: str | None = None,
+        side_effect_class: SideEffectClass | None = None,
     ) -> RegisteredTool:
         """从拒绝额外字段的 Pydantic 模型生成工具定义。"""
         if input_model.model_config.get("extra") != "forbid":
@@ -99,6 +154,8 @@ class RegisteredTool:
             permission=permission,
             permission_scope=permission_scope,
             path_argument=path_argument,
+            side_effect_class=side_effect_class
+            or _side_effect_class(permission, permission_scope),
         )
 
 
@@ -111,6 +168,7 @@ class ToolInvocationContext:
     trace: TraceStore
     transaction_id: TransactionId | None = None
     taint_sources: tuple[TaintSource, ...] = (TaintSource.USER_INSTRUCTION,)
+    checkpoint: ToolCheckpointCallback | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -222,6 +280,31 @@ class ToolRegistry:
         started_at = self._clock()
         registered = self._tools.get(call.tool_name)
         capability_id = registered.capability_id if registered is not None else None
+        side_effect_class = (
+            registered.side_effect_class
+            if registered is not None
+            else SideEffectClass.EXTERNAL_SIDE_EFFECT
+        )
+        arguments_hash = self._digest(
+            json.dumps(
+                call.arguments,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+        )
+        await self._checkpoint(
+            context,
+            ToolCheckpointTransition(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                arguments_hash=arguments_hash,
+                side_effect_class=side_effect_class,
+                status=ToolExecutionStatus.PREPARED,
+                started_at=started_at,
+                retry_policy=_retry_policy(side_effect_class),
+            ),
+        )
         started_event = self._event_builder.build(
             event_type="tool.started",
             run_id=context.run_id,
@@ -238,6 +321,7 @@ class ToolRegistry:
 
         success = False
         tool_error: ToolError | None = None
+        arguments: BaseModel | None = None
         try:
             if registered is None:
                 raise WorkspaceToolError("tool.unknown", "工具未注册")
@@ -268,8 +352,48 @@ class ToolRegistry:
                 )
                 await context.trace.emit(authorization_event)
                 raise WorkspaceToolError(decision.code, decision.summary)
+            await self._checkpoint(
+                context,
+                ToolCheckpointTransition(
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.tool_name,
+                    arguments_hash=arguments_hash,
+                    side_effect_class=side_effect_class,
+                    status=ToolExecutionStatus.AUTHORIZED,
+                    started_at=started_at,
+                    retry_policy=_retry_policy(side_effect_class),
+                ),
+            )
+            await self._checkpoint(
+                context,
+                ToolCheckpointTransition(
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.tool_name,
+                    arguments_hash=arguments_hash,
+                    side_effect_class=side_effect_class,
+                    status=ToolExecutionStatus.EXECUTING,
+                    started_at=started_at,
+                    retry_policy=_retry_policy(side_effect_class),
+                ),
+            )
             raw_output = await registered.handler(arguments)
             success = True
+        except asyncio.CancelledError:
+            await self._checkpoint(
+                context,
+                ToolCheckpointTransition(
+                    tool_call_id=call.tool_call_id,
+                    tool_name=call.tool_name,
+                    arguments_hash=arguments_hash,
+                    side_effect_class=side_effect_class,
+                    status=ToolExecutionStatus.CANCELLED,
+                    started_at=started_at,
+                    completed_at=self._clock(),
+                    error_code="tool.cancelled",
+                    retry_policy=_retry_policy(side_effect_class),
+                ),
+            )
+            raise
         except WorkspaceToolError as error:
             if error.code.startswith("sandbox.") or error.code in {
                 "guard.command_denied",
@@ -376,7 +500,62 @@ class ToolRegistry:
             completed_at=completed_at,
         )
         await context.trace.emit(completed_event)
+        await self._checkpoint(
+            context,
+            ToolCheckpointTransition(
+                tool_call_id=call.tool_call_id,
+                tool_name=call.tool_name,
+                arguments_hash=arguments_hash,
+                side_effect_class=side_effect_class,
+                status=(
+                    ToolExecutionStatus.COMPLETED
+                    if success
+                    else ToolExecutionStatus.FAILED
+                ),
+                started_at=started_at,
+                completed_at=completed_at,
+                result_hash=self._digest(model_text.encode("utf-8")),
+                result_text=model_text,
+                error_code=tool_error.code if tool_error is not None else None,
+                retry_policy=_retry_policy(side_effect_class),
+            ),
+        )
+        if success and side_effect_class in {
+            SideEffectClass.IDEMPOTENT_WRITE,
+            SideEffectClass.TRANSACTIONAL_WRITE,
+            SideEffectClass.LOCAL_PROCESS,
+        }:
+            changed_path = (
+                getattr(arguments, registered.path_argument, None)
+                if arguments is not None
+                and registered is not None
+                and registered.path_argument is not None
+                else None
+            )
+            await context.trace.emit(
+                self._event_builder.build(
+                    event_type="workspace.changed",
+                    run_id=context.run_id,
+                    session_id=context.session_id,
+                    transaction_id=context.transaction_id,
+                    parent_event_id=completed_event.event_id,
+                    result_summary="工具可能改变了有效工作区，后续 Context 必须刷新",
+                    payload={
+                        "path": changed_path,
+                        "tool_name": call.tool_name,
+                    },
+                )
+            )
         return ToolInvocationView(result, model_text, tui_text, output_capture)
+
+    @staticmethod
+    async def _checkpoint(
+        context: ToolInvocationContext,
+        transition: ToolCheckpointTransition,
+    ) -> None:
+        """在真实副作用边界同步等待耐久 checkpoint。"""
+        if context.checkpoint is not None:
+            await context.checkpoint(transition)
 
     def _authorize(
         self,

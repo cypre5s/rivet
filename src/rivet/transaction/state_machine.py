@@ -32,6 +32,9 @@ ALLOWED_TRANSITIONS = {
     TransactionState.VERIFYING: {
         TransactionState.VERIFIED,
         TransactionState.REJECTED,
+        TransactionState.INCONCLUSIVE,
+        TransactionState.BLOCKED,
+        TransactionState.CANCELLED,
         TransactionState.ABORTED,
     },
     TransactionState.VERIFIED: {
@@ -39,6 +42,18 @@ ALLOWED_TRANSITIONS = {
         TransactionState.ABORTED,
     },
     TransactionState.REJECTED: {
+        TransactionState.PATCHING,
+        TransactionState.ABORTED,
+    },
+    TransactionState.INCONCLUSIVE: {
+        TransactionState.PATCHING,
+        TransactionState.ABORTED,
+    },
+    TransactionState.BLOCKED: {
+        TransactionState.PATCHING,
+        TransactionState.ABORTED,
+    },
+    TransactionState.CANCELLED: {
         TransactionState.PATCHING,
         TransactionState.ABORTED,
     },

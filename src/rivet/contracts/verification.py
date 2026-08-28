@@ -98,9 +98,10 @@ class Verdict(ContractModel):
             computed = VerificationStatus.CANCELLED
         elif any(status is VerificationStatus.FAILED for status in required_statuses):
             computed = VerificationStatus.FAILED
+        elif any(status is VerificationStatus.BLOCKED for status in required_statuses):
+            computed = VerificationStatus.BLOCKED
         elif any(
-            status in {VerificationStatus.INCONCLUSIVE, VerificationStatus.BLOCKED}
-            for status in required_statuses
+            status is VerificationStatus.INCONCLUSIVE for status in required_statuses
         ):
             computed = VerificationStatus.INCONCLUSIVE
         else:

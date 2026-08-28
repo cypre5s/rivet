@@ -103,3 +103,75 @@ async def test_same_query_and_snapshot_have_stable_order(tmp_path: Path) -> None
     assert first.selection == second.selection
     await first_scope.close()
     await second_scope.close()
+
+
+@pytest.mark.asyncio
+async def test_context_auto_escalates_syntax_only_when_lexical_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    focused = tmp_path / "focused"
+    focused.mkdir()
+    (focused / "target.py").write_text(
+        "def unique_handler():\n    return 'unique_token'\n",
+        encoding="utf-8",
+    )
+    focused_scope = ResourceScope("context.auto.focused")
+    focused_result = await ProgressiveContext(
+        focused, scope=focused_scope, clock=lambda: NOW
+    ).retrieve("unique_handler target.py", budget=BUDGET_8K, include_syntax=None)
+
+    ambiguous = tmp_path / "ambiguous"
+    ambiguous.mkdir()
+    for index in range(6):
+        (ambiguous / f"handler_{index}.py").write_text(
+            f"def shared_handler_{index}():\n    return 'shared_token'\n",
+            encoding="utf-8",
+        )
+    ambiguous_scope = ResourceScope("context.auto.ambiguous")
+    ambiguous_result = await ProgressiveContext(
+        ambiguous, scope=ambiguous_scope, clock=lambda: NOW
+    ).retrieve("shared_handler", budget=BUDGET_8K, include_syntax=None)
+
+    assert focused_result.syntax_activated is False
+    assert all(
+        item.retrieval_level < ContextLevel.SYNTAX
+        for item in focused_result.selection.items
+    )
+    assert ambiguous_result.syntax_activated is True
+    assert any(
+        item.retrieval_level is ContextLevel.SYNTAX
+        for item in ambiguous_result.selection.items
+    )
+    await focused_scope.close()
+    await ambiguous_scope.close()
+
+
+@pytest.mark.asyncio
+async def test_context_content_hash_refreshes_after_change_and_delete(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "refresh"
+    repository.mkdir()
+    source = repository / "target.py"
+    source.write_text("REFRESH_TOKEN = 'old'\n", encoding="utf-8")
+    scope = ResourceScope("context.refresh")
+    engine = ProgressiveContext(repository, scope=scope, clock=lambda: NOW)
+    first = await engine.retrieve("REFRESH_TOKEN", budget=BUDGET_8K)
+    first_item = next(
+        item for item in first.selection.items if item.repository_path == "target.py"
+    )
+
+    source.write_text("REFRESH_TOKEN = 'new'\n", encoding="utf-8")
+    second = await engine.retrieve("REFRESH_TOKEN", budget=BUDGET_8K)
+    second_item = next(
+        item for item in second.selection.items if item.repository_path == "target.py"
+    )
+    source.unlink()
+    third = await engine.retrieve("REFRESH_TOKEN", budget=BUDGET_8K)
+
+    assert first_item.content_sha256 != second_item.content_sha256
+    assert first_item.freshness == first_item.content_sha256
+    assert second_item.freshness == second_item.content_sha256
+    assert "new" in second_item.content
+    assert all(item.repository_path != "target.py" for item in third.selection.items)
+    await scope.close()

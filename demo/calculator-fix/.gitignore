@@ -1,0 +1,3 @@
+.rivet/*
+!.rivet/project.toml
+__pycache__/

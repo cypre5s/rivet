@@ -1,0 +1,13 @@
+schema_version = 1
+
+[rivet]
+model = "deepseek-v4-pro"
+max_rounds = 16
+max_total_tokens = 16000
+
+[verification]
+acceptance = [["/usr/bin/python3", "-c", "from decimal import Decimal; from calculator import total_with_tax; cases=((Decimal('1.00'),Decimal('0.10'),Decimal('1.10')),(Decimal('12.34'),Decimal('0.075'),Decimal('13.27')),(Decimal('250.00'),Decimal('0.16'),Decimal('290.00'))); raise SystemExit(0 if all(total_with_tax(a,b)==c for a,b,c in cases) else 1)"]]
+targeted = [["/usr/bin/python3", "test_calculator.py"]]
+related = [["/usr/bin/python3", "test_calculator.py"]]
+regression = [["/usr/bin/python3", "test_calculator.py"]]
+static = [["/usr/bin/python3", "-m", "py_compile", "calculator.py", "test_calculator.py"]]

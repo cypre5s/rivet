@@ -36,6 +36,13 @@ def test_reader_request_rejects_archive_depth_above_frozen_limit() -> None:
         ReaderRequest(source_path="sample.zip", max_depth=4)
 
 
+def test_reader_request_rejects_enhancement_resource_limits() -> None:
+    with pytest.raises(ValidationError):
+        ReaderRequest(source_path="image.png", max_image_pixels=100_000_001)
+    with pytest.raises(ValidationError):
+        ReaderRequest(source_path="audio.mp3", max_audio_duration=86_401)
+
+
 @pytest.mark.asyncio
 async def test_file_size_limit_fails_without_reading_content(tmp_path: Path) -> None:
     status, content, warnings = await _read(

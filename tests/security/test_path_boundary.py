@@ -41,6 +41,25 @@ def test_symlink_to_outside_is_rejected_for_read_and_write(tmp_path: Path) -> No
     assert (outside / "secret.txt").read_text(encoding="utf-8") == "outside"
 
 
+def test_hardlink_write_fails_closed_without_changing_external_inode(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    transaction = tmp_path / "transaction"
+    outside = tmp_path / "outside.txt"
+    repository.mkdir()
+    transaction.mkdir()
+    outside.write_text("outside", encoding="utf-8")
+    (transaction / "hard-link.txt").hardlink_to(outside)
+    writer = TransactionFileWriter(WorkspaceBoundary(repository, transaction))
+
+    with pytest.raises(PathBoundaryError) as captured:
+        writer.write("hard-link.txt", "overwritten")
+
+    assert captured.value.code == "workspace.hardlink_write_forbidden"
+    assert outside.read_text(encoding="utf-8") == "outside"
+
+
 @pytest.mark.parametrize(
     "protected_path",
     (

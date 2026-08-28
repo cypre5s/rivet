@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 from enum import StrEnum
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 
 from pydantic import Field, StringConstraints, model_validator
 
@@ -36,6 +36,9 @@ class TransactionState(StrEnum):
     VERIFYING = "VERIFYING"
     VERIFIED = "VERIFIED"
     REJECTED = "REJECTED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    BLOCKED = "BLOCKED"
+    CANCELLED = "CANCELLED"
     APPLIED = "APPLIED"
     ABORTED = "ABORTED"
 
@@ -46,8 +49,13 @@ class AcceptanceSpec(ContractModel):
     acceptance_id: AcceptanceId
     user_goal: NonEmptyText
     baseline_reproduction: tuple[Command, ...] = Field(min_length=1)
+    read_scope: tuple[RepositoryPath, ...] = ()
     allowed_paths: tuple[RepositoryPath, ...] = Field(min_length=1)
+    write_scope: tuple[RepositoryPath, ...] = ()
+    allowed_new_paths: tuple[RepositoryPath, ...] = ()
     forbidden_paths: tuple[RepositoryPath, ...] = ()
+    scope_reason: NonEmptyText = "完成用户任务所需的最小文件集合"
+    scope_source: Literal["explicit", "task", "plan", "project"] = "project"
     expected_behaviors: tuple[NonEmptyText, ...] = Field(min_length=1)
     preserved_behaviors: tuple[NonEmptyText, ...] = Field(min_length=1)
     verification_commands: tuple[Command, ...] = Field(min_length=1)
@@ -64,6 +72,21 @@ class AcceptanceSpec(ContractModel):
         """拒绝范围冲突、重复范围或空命令。"""
         if len(set(self.allowed_paths)) != len(self.allowed_paths):
             raise ValueError("允许路径不得重复")
+        if len(set(self.write_scope)) != len(self.write_scope):
+            raise ValueError("写范围不得重复")
+        if self.write_scope and self.write_scope != self.allowed_paths:
+            raise ValueError("write_scope 必须与兼容字段 allowed_paths 完全一致")
+        if len(set(self.allowed_new_paths)) != len(self.allowed_new_paths):
+            raise ValueError("允许创建路径不得重复")
+        effective_write_scope = self.write_scope or self.allowed_paths
+        if any(
+            not any(
+                new_path == allowed or new_path.startswith(f"{allowed}/")
+                for allowed in effective_write_scope
+            )
+            for new_path in self.allowed_new_paths
+        ):
+            raise ValueError("允许创建路径必须位于冻结写范围内")
         if len(set(self.forbidden_paths)) != len(self.forbidden_paths):
             raise ValueError("禁止路径不得重复")
         overlap = set(self.allowed_paths) & set(self.forbidden_paths)
@@ -88,6 +111,7 @@ class PatchSet(ContractModel):
     acceptance_sha256: Sha256Digest
     patch_sha256: Sha256Digest
     changed_files: tuple[RepositoryPath, ...]
+    created_files: tuple[RepositoryPath, ...] = ()
     changed_symbols: tuple[str, ...] = ()
     contains_binary_diff: bool = False
     created_at: Timestamp
@@ -132,6 +156,9 @@ class TransactionRecord(ContractModel):
         if self.state in {
             TransactionState.VERIFIED,
             TransactionState.REJECTED,
+            TransactionState.INCONCLUSIVE,
+            TransactionState.BLOCKED,
+            TransactionState.CANCELLED,
             TransactionState.APPLIED,
         } and not all(value is not None for value in evidence_fields):
             raise ValueError("已判定事务必须绑定 Evidence manifest")

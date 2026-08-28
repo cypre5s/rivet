@@ -85,6 +85,7 @@ def _context_item(
         reason="；".join(ranked.reasons),
         retrieval_level=evidence.retrieval_level,
         content_sha256=f"sha256:{content_digest}",
+        freshness=f"sha256:{content_digest}",
         token_estimate=estimate_tokens(evidence.content),
         selected_at=selected_at,
         use_state=use_state,

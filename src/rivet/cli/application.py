@@ -18,6 +18,7 @@ from rivet.cli.errors import CliConfigurationError, CliError, CliSecurityError
 from rivet.cli.exit_codes import ExitCode
 from rivet.cli.modules import run_module_command
 from rivet.cli.parser import build_internal_parser, build_parser
+from rivet.contracts.tools import SideEffectClass
 from rivet.storage.git_exclude import configure_runtime_excludes
 from rivet.storage.ownership import SafeCleaner
 from rivet.storage.sessions import (
@@ -150,6 +151,30 @@ def _dispatch(
             run_id=cast(str | None, arguments.run_id),
             json_output=json_output,
         )
+    if command == "export":
+        from rivet.export.service import ExportError, ExportService
+
+        try:
+            result = ExportService(repository, environment=environment).export(
+                cast(str, arguments.kind),
+                cast(Path | None, arguments.path),
+            )
+        except ExportError as error:
+            raise CliConfigurationError(
+                error.code,
+                error.summary,
+                "选择有效来源和仓库内尚不存在的目标路径",
+            ) from error
+        _print_payload(
+            {
+                "kind": result.kind,
+                "path": str(result.path),
+                "sha256": result.sha256,
+                "source_id": result.source_id,
+            },
+            json_output=json_output,
+        )
+        return int(ExitCode.SUCCESS)
     if command == "resume":
         return asyncio.run(
             _resume(
@@ -285,7 +310,19 @@ async def _read_file(
         result = await ReaderService(
             repository,
             scope=module_scope(lease.instance),
-        ).read(ReaderRequest(source_path=source_path))
+        ).read(
+            ReaderRequest(
+                source_path=source_path,
+                timeout_seconds=cast(int, arguments.timeout),
+                max_output_chars=cast(int, arguments.max_output_chars),
+                max_ocr_pages=cast(int, arguments.max_ocr_pages),
+                max_image_pixels=cast(int, arguments.max_image_pixels),
+                max_video_frames=cast(int, arguments.frames),
+                max_audio_duration=cast(int, arguments.max_audio_duration),
+                enable_ocr=cast(bool, arguments.ocr),
+                enable_transcription=cast(bool, arguments.transcribe),
+            )
+        )
     except SafeModeViolationError as error:
         raise CliSecurityError(
             "module.safe_mode_denied",
@@ -350,7 +387,14 @@ async def _resume(
         unsafe_pending = tuple(
             tool
             for tool in checkpoint.pending_tools
-            if tool.status in {ToolRecoveryStatus.RUNNING, ToolRecoveryStatus.UNKNOWN}
+            if tool.status is ToolRecoveryStatus.RUNNING
+            or (
+                tool.status is ToolRecoveryStatus.UNKNOWN
+                and not (
+                    tool.side_effect_class is SideEffectClass.READ_ONLY
+                    and tool.next_action == "RETRY"
+                )
+            )
         )
         if unsafe_pending or unresolved_calls:
             raise CliConfigurationError(
@@ -371,7 +415,9 @@ async def _resume(
         )
     if (
         checkpoint.stage is SessionStage.PATCH_FINALIZATION
-        and checkpoint.status in resumable_statuses | {SessionStatus.RUNNING}
+        and checkpoint.status
+        in resumable_statuses
+        | {SessionStatus.RUNNING, SessionStatus.READY_FOR_VERIFICATION}
         and checkpoint.transaction_id is not None
     ):
         from rivet.cli.model_commands import run_model_command
@@ -404,10 +450,9 @@ async def _resume(
             checkpoint.model_copy(
                 update={
                     "stage": SessionStage.TERMINAL,
-                    "status": (
-                        SessionStatus.COMPLETED
-                        if exit_code == int(ExitCode.SUCCESS)
-                        else SessionStatus.FAILED
+                    "status": _verification_session_status(
+                        repository,
+                        checkpoint.transaction_id,
                     ),
                 }
             )
@@ -485,6 +530,19 @@ async def _resume(
     return int(ExitCode.SUCCESS)
 
 
+def _verification_session_status(
+    repository: Path,
+    transaction_id: str,
+) -> SessionStatus:
+    """把独立验证后的事务事实原样投影到 Session。"""
+    from rivet.transaction.store import TransactionStore
+
+    record = TransactionStore(repository / ".rivet" / "transactions").load_record(
+        transaction_id
+    )
+    return SessionStatus(record.state.value)
+
+
 def _unresolved_tool_calls(checkpoint: SessionCheckpoint) -> tuple[str, ...]:
     """从消息历史推导没有 ToolMessage 回执的调用，防止副作用重放。"""
     from rivet.contracts.messages import AssistantMessage, ToolMessage
@@ -494,12 +552,32 @@ def _unresolved_tool_calls(checkpoint: SessionCheckpoint) -> tuple[str, ...]:
         for message in checkpoint.messages
         if isinstance(message, ToolMessage)
     }
+    recoverable = {
+        tool.tool_call_id
+        for tool in checkpoint.pending_tools
+        if (
+            tool.status
+            in {
+                ToolRecoveryStatus.PREPARED,
+                ToolRecoveryStatus.AUTHORIZED,
+            }
+            or (
+                tool.status in {ToolRecoveryStatus.COMPLETED, ToolRecoveryStatus.FAILED}
+                and tool.result_text is not None
+            )
+            or (
+                tool.status is ToolRecoveryStatus.UNKNOWN
+                and tool.side_effect_class is SideEffectClass.READ_ONLY
+                and tool.next_action == "RETRY"
+            )
+        )
+    }
     return tuple(
         call.tool_call_id
         for message in checkpoint.messages
         if isinstance(message, AssistantMessage)
         for call in message.tool_calls
-        if call.tool_call_id not in completed
+        if call.tool_call_id not in completed and call.tool_call_id not in recoverable
     )
 
 

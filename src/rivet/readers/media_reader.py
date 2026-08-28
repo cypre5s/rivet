@@ -49,6 +49,13 @@ class MediaReader:
             content = output.content
             warnings = list(output.warnings)
         status = ReaderStatus.SUCCESS
+        duration = metadata.get("duration_seconds")
+        if (
+            isinstance(duration, (int, float))
+            and duration > context.request.max_audio_duration
+        ):
+            warnings.append("reader.media.duration_limit_exceeded")
+            status = ReaderStatus.FAILED
         if context.request.enable_transcription:
             if importlib.util.find_spec("faster_whisper") is None:
                 warnings.append("reader.media.transcription_unavailable")

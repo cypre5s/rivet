@@ -291,8 +291,8 @@ def test_cli_resume_verification_stage_runs_real_matrix_and_fails_closed(
 
     assert exit_code == int(ExitCode.VERIFICATION_FAILED), captured.err
     assert resumed.stage is SessionStage.TERMINAL, captured.err
-    assert resumed.status is SessionStatus.FAILED
-    assert transaction.state is TransactionState.REJECTED
+    assert resumed.status is SessionStatus.BLOCKED
+    assert transaction.state is TransactionState.BLOCKED
 
     abort_code = run_cli(
         (

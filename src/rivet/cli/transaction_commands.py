@@ -75,7 +75,12 @@ async def run_transaction_command(
                 _verify_record_evidence(store, record)
                 _print_record(record, json_output=json_output)
                 return int(ExitCode.SUCCESS)
-            if record.state is TransactionState.REJECTED:
+            if record.state in {
+                TransactionState.REJECTED,
+                TransactionState.INCONCLUSIVE,
+                TransactionState.BLOCKED,
+                TransactionState.CANCELLED,
+            }:
                 _verify_record_evidence(store, record)
                 _print_record(record, json_output=json_output)
                 return int(ExitCode.VERIFICATION_FAILED)

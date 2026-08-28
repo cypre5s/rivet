@@ -70,11 +70,12 @@ def create_context_gatherer(
 
     async def gather(task: AgentTask) -> tuple[Message, ...]:
         """选择 Level 0-2 证据，并将内容明确标记为不可信数据。"""
-        capability = "context.search.lexical" if safe_mode else "context.search.syntax"
+        capability = "context.search.lexical"
         module_id = kernel.runtime.provider_module_id(capability)
         prior_state = kernel.runtime.state(module_id)
         lease = await kernel.acquire_lease(capability)
         try:
+            from rivet.context.budget import consume_selection
             from rivet.context.engine import ProgressiveContext
 
             scope = module_scope(lease.instance)
@@ -82,7 +83,7 @@ def create_context_gatherer(
             result = await ProgressiveContext(repository_root, scope=scope).retrieve(
                 _task_query(task),
                 budget=budget,
-                include_syntax=not safe_mode,
+                include_syntax=False,
             )
             await _emit_module_activation(
                 trace,
@@ -93,16 +94,41 @@ def create_context_gatherer(
                 module_id=module_id,
                 prior_state=prior_state.value,
             )
+            if not safe_mode and _selection_requires_syntax(result.selection):
+                await lease.release()
+                capability = "context.search.syntax"
+                module_id = kernel.runtime.provider_module_id(capability)
+                prior_state = kernel.runtime.state(module_id)
+                lease = await kernel.acquire_lease(capability)
+                scope = module_scope(lease.instance)
+                result = await ProgressiveContext(
+                    repository_root,
+                    scope=scope,
+                ).retrieve(
+                    _task_query(task),
+                    budget=budget,
+                    include_syntax=True,
+                )
+                await _emit_module_activation(
+                    trace,
+                    builder,
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    module_id=module_id,
+                    prior_state=prior_state.value,
+                )
+            selection = consume_selection(result.selection)
             await _emit_context_selection(
                 trace,
                 builder,
-                result.selection,
+                selection,
                 run_id=run_id,
                 session_id=session_id,
                 transaction_id=transaction_id,
-                status="syntax" if not safe_mode else "lexical",
+                status="syntax" if result.syntax_activated else "lexical",
             )
-            if not result.selection.items:
+            if not selection.items:
                 return ()
             payload = {
                 "items": [
@@ -114,7 +140,7 @@ def create_context_gatherer(
                         "reason": item.reason,
                         "start_line": item.span.start_line if item.span else None,
                     }
-                    for item in result.selection.items
+                    for item in selection.items
                 ],
                 "untrusted": True,
             }
@@ -340,6 +366,18 @@ def _task_query(task: AgentTask) -> str:
     raise ValueError("AgentTask 缺少用户任务消息")
 
 
+def _selection_requires_syntax(selection: ContextSelection) -> bool:
+    """L1 无命中或命中路径过多时才请求 L2 能力。"""
+    from rivet.contracts.context import ContextLevel
+
+    lexical_paths = {
+        item.repository_path
+        for item in selection.items
+        if item.retrieval_level is ContextLevel.LEXICAL
+    }
+    return not lexical_paths or len(lexical_paths) > 4
+
+
 async def _emit_module_activation(
     trace: TraceStore,
     builder: TraceEventBuilder,
@@ -386,12 +424,29 @@ async def _emit_context_selection(
                 result_summary="仓库上下文已按预算选择",
                 payload={
                     "context_item_id": item.context_item_id,
+                    "content_sha256": item.content_sha256,
+                    "consumed_count": item.consumed_count,
                     "freshness": item.freshness,
                     "level": int(item.retrieval_level),
                     "path": item.repository_path,
                     "reason": item.reason,
                     "status": status,
                     "token_estimate": item.token_estimate,
+                    "use_state": item.use_state.value,
+                },
+            )
+        )
+    for context_item_id in selection.evicted_item_ids:
+        await trace.emit(
+            builder.build(
+                event_type="context.evicted",
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+                result_summary="上下文条目因预算或去重被淘汰",
+                payload={
+                    "context_item_id": context_item_id,
+                    "status": status,
                 },
             )
         )

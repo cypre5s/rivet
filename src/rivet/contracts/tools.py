@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from enum import StrEnum
 from typing import Self
 
 from pydantic import Field, JsonValue, model_validator
@@ -19,6 +20,29 @@ from rivet.contracts.common import (
 )
 
 MAX_TOOL_ARGUMENT_BYTES = 65_536
+
+
+class ToolExecutionStatus(StrEnum):
+    """记录一次工具调用在副作用边界上的耐久状态。"""
+
+    PREPARED = "PREPARED"
+    AUTHORIZED = "AUTHORIZED"
+    EXECUTING = "EXECUTING"
+    RUNNING = "EXECUTING"
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    UNKNOWN = "UNKNOWN"
+    CANCELLED = "CANCELLED"
+
+
+class SideEffectClass(StrEnum):
+    """决定中断工具是否允许重放以及需要何种恢复检查。"""
+
+    READ_ONLY = "READ_ONLY"
+    IDEMPOTENT_WRITE = "IDEMPOTENT_WRITE"
+    TRANSACTIONAL_WRITE = "TRANSACTIONAL_WRITE"
+    LOCAL_PROCESS = "LOCAL_PROCESS"
+    EXTERNAL_SIDE_EFFECT = "EXTERNAL_SIDE_EFFECT"
 
 
 class ToolDefinition(ContractModel):

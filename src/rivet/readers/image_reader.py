@@ -30,6 +30,22 @@ class ImageReader:
         content = output.content
         warnings = list(output.warnings)
         status = ReaderStatus.TRUNCATED if output.truncated else ReaderStatus.SUCCESS
+        width = output.metadata.get("width")
+        height = output.metadata.get("height")
+        if (
+            isinstance(width, int)
+            and isinstance(height, int)
+            and width * height > context.request.max_image_pixels
+        ):
+            warnings.append("reader.image.pixel_limit_exceeded")
+            return ReaderPayload(
+                status=ReaderStatus.FAILED,
+                support_level=SupportLevel.FALLBACK,
+                content=content,
+                metadata=output.metadata,
+                warnings=tuple(warnings),
+                truncated=True,
+            )
         if context.request.enable_ocr:
             executable = shutil.which("tesseract")
             if executable is None:

@@ -26,10 +26,12 @@ from rivet.contracts.common import (
     NonEmptyText,
     RunId,
     SessionId,
+    Timestamp,
     ToolCallId,
     TransactionId,
 )
 from rivet.contracts.messages import Message
+from rivet.contracts.tools import SideEffectClass, ToolExecutionStatus
 
 MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
 MAX_SESSION_LIST_ENTRIES = 10_000
@@ -53,6 +55,13 @@ class SessionStatus(StrEnum):
 
     RUNNING = "RUNNING"
     COMPLETED = "COMPLETED"
+    ANSWERED = "ANSWERED"
+    PLANNED = "PLANNED"
+    READY_FOR_VERIFICATION = "READY_FOR_VERIFICATION"
+    VERIFIED = "VERIFIED"
+    REJECTED = "REJECTED"
+    INCONCLUSIVE = "INCONCLUSIVE"
+    BLOCKED = "BLOCKED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     INTERRUPTED = "INTERRUPTED"
@@ -67,31 +76,53 @@ class SessionStage(StrEnum):
     TERMINAL = "TERMINAL"
 
 
-class ToolRecoveryStatus(StrEnum):
-    """记录工具事实，UNKNOWN 不得被推断为已成功。"""
-
-    RUNNING = "RUNNING"
-    UNKNOWN = "UNKNOWN"
-    COMPLETED = "COMPLETED"
-    FAILED = "FAILED"
+ToolRecoveryStatus = ToolExecutionStatus
 
 
 class PendingToolCall(ContractModel):
     """保存可能在进程退出时失去最终回执的工具调用。"""
 
     tool_call_id: ToolCallId
+    run_id: RunId | None = None
+    session_id: SessionId | None = None
+    transaction_id: TransactionId | None = None
     tool_name: ToolName
-    status: ToolRecoveryStatus
+    arguments_hash: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        max_length=71,
+    )
+    side_effect_class: SideEffectClass = SideEffectClass.EXTERNAL_SIDE_EFFECT
+    status: ToolExecutionStatus
+    started_at: Timestamp | None = None
+    completed_at: Timestamp | None = None
+    result_hash: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[0-9a-f]{64}$",
+        max_length=71,
+    )
+    result_text: str | None = Field(default=None, max_length=65_536)
+    error_code: str | None = Field(default=None, max_length=160)
+    retry_policy: Literal[
+        "AUTO_REPLAY_READ_ONLY",
+        "VERIFY_THEN_RETRY",
+        "VERIFY_TRANSACTION_EFFECT",
+        "NEVER_AUTOMATIC",
+    ] = "NEVER_AUTOMATIC"
     next_action: Literal["RETRY", "SKIP", "ABORT"] | None = None
 
     @model_validator(mode="after")
     def _validate_recovery_action(self) -> Self:
         """要求 UNKNOWN 明确动作，其他状态不得伪装恢复决策。"""
-        if self.status is ToolRecoveryStatus.UNKNOWN:
+        if self.status is ToolExecutionStatus.UNKNOWN:
             if self.next_action is None:
                 raise ValueError("UNKNOWN 工具调用必须记录下一步")
         elif self.next_action is not None:
             raise ValueError("只有 UNKNOWN 工具调用允许恢复动作")
+        if self.status is ToolExecutionStatus.COMPLETED and (
+            self.completed_at is None or self.result_hash is None
+        ):
+            raise ValueError("COMPLETED 工具调用必须记录完成时间和结果哈希")
         return self
 
 
@@ -210,13 +241,21 @@ class SessionStore:
         if checkpoint.status is not SessionStatus.RUNNING:
             return checkpoint
         pending_tools = tuple(
-            PendingToolCall(
-                tool_call_id=tool.tool_call_id,
-                tool_name=tool.tool_name,
-                status=ToolRecoveryStatus.UNKNOWN,
-                next_action="RETRY",
+            tool.model_copy(
+                update={
+                    "status": ToolExecutionStatus.UNKNOWN,
+                    "next_action": (
+                        "RETRY"
+                        if tool.side_effect_class is SideEffectClass.READ_ONLY
+                        else "ABORT"
+                    ),
+                    "completed_at": None,
+                    "result_hash": None,
+                    "result_text": None,
+                    "error_code": None,
+                }
             )
-            if tool.status is ToolRecoveryStatus.RUNNING
+            if tool.status is ToolExecutionStatus.EXECUTING
             else tool
             for tool in checkpoint.pending_tools
         )

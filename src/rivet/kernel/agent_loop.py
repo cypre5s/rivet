@@ -7,7 +7,9 @@ import hashlib
 import json
 import time
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal
 
 from rivet.contracts.messages import Message, ToolMessage
 from rivet.contracts.provider import (
@@ -19,6 +21,7 @@ from rivet.contracts.provider import (
 )
 from rivet.contracts.tools import ToolCall
 from rivet.kernel.agent_models import (
+    AgentCompletionStatus,
     AgentLoopConfig,
     AgentLoopResult,
     AgentLoopState,
@@ -33,8 +36,32 @@ MonotonicClock = Callable[[], float]
 ContextGatherer = Callable[[AgentTask], Awaitable[tuple[Message, ...]]]
 
 
+@dataclass(frozen=True, slots=True)
+class AgentProgress:
+    """提供模型响应与工具观察后的可持久化运行事实。"""
+
+    messages: tuple[Message, ...]
+    round_count: int
+    tool_call_count: int
+    usage: TokenUsage
+
+
+ProgressCallback = Callable[[AgentProgress], Awaitable[None]]
+
+
 class _RunCancelled(Exception):
     """在内部竞速中传播用户取消，不跨越 Kernel 公共边界。"""
+
+
+def _may_change_workspace(tool_name: str) -> bool:
+    """识别会使此前 Context 失效的事务写入或本地进程。"""
+    return tool_name in {
+        "file.write_transaction",
+        "file.replace_transaction",
+        "file.create_transaction",
+        "file.delete_transaction",
+        "process.run",
+    }
 
 
 class AgentLoop:
@@ -47,12 +74,14 @@ class AgentLoop:
         tools: tuple[AgentTool, ...],
         config: AgentLoopConfig | None = None,
         context_gatherer: ContextGatherer | None = None,
+        progress_callback: ProgressCallback | None = None,
         clock: Clock | None = None,
         monotonic: MonotonicClock = time.monotonic,
     ) -> None:
         self._provider = provider
         self._config = config or AgentLoopConfig()
         self._context_gatherer = context_gatherer
+        self._progress_callback = progress_callback
         self._clock = clock or (lambda: datetime.now(UTC))
         self._monotonic = monotonic
         self._tools = {tool.definition.name: tool for tool in tools}
@@ -103,6 +132,19 @@ class AgentLoop:
                 state=state,
                 state_history=tuple(state_history),
                 termination_reason=reason,
+                completion_status=(
+                    {
+                        "ASK": AgentCompletionStatus.ANSWERED,
+                        "PLAN": AgentCompletionStatus.PLANNED,
+                        "FIX": AgentCompletionStatus.READY_FOR_VERIFICATION,
+                    }[task.mode.value]
+                    if state is AgentLoopState.COMPLETE
+                    else (
+                        AgentCompletionStatus.CANCELLED
+                        if state is AgentLoopState.CANCELLED
+                        else AgentCompletionStatus.FAILED
+                    )
+                ),
                 messages=tuple(messages),
                 answer=answer,
                 round_count=round_count,
@@ -246,9 +288,17 @@ class AgentLoop:
                 )
 
             messages.append(response.message)
+            await self._save_progress(
+                messages,
+                round_count=round_count,
+                tool_call_count=tool_call_count,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                reasoning_tokens=reasoning_tokens,
+                total_cost=total_cost,
+            )
             if response.finish_reason is ModelFinishReason.STOP:
                 transition(AgentLoopState.EVALUATE)
-                transition(AgentLoopState.VERIFY)
                 return result(
                     AgentLoopState.COMPLETE,
                     AgentTerminationReason.FINAL_ANSWER,
@@ -333,6 +383,44 @@ class AgentLoop:
                         created_at=self._clock(),
                     )
                 )
+                if self._context_gatherer is not None and _may_change_workspace(
+                    call.tool_name
+                ):
+                    try:
+                        refreshed = await self._gather_context_with_limits(
+                            task,
+                            cancel_event=cancel_event,
+                            timeout_seconds=max(
+                                0.001,
+                                self._config.max_wall_seconds
+                                - (self._monotonic() - started_at),
+                            ),
+                        )
+                    except _RunCancelled:
+                        return result(
+                            AgentLoopState.CANCELLED,
+                            AgentTerminationReason.USER_CANCELLED,
+                        )
+                    except TimeoutError:
+                        return result(
+                            AgentLoopState.FAILED,
+                            AgentTerminationReason.WALL_TIME_EXCEEDED,
+                        )
+                    except Exception:
+                        return result(
+                            AgentLoopState.FAILED,
+                            AgentTerminationReason.CONTEXT_FAILED,
+                        )
+                    messages.extend(refreshed)
+                await self._save_progress(
+                    messages,
+                    round_count=round_count,
+                    tool_call_count=tool_call_count,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    total_cost=total_cost,
+                )
                 transition(AgentLoopState.OBSERVE)
             transition(AgentLoopState.EVALUATE)
             if round_made_progress:
@@ -344,6 +432,35 @@ class AgentLoop:
                         AgentLoopState.FAILED,
                         AgentTerminationReason.NO_PROGRESS,
                     )
+
+    async def _save_progress(
+        self,
+        messages: list[Message],
+        *,
+        round_count: int,
+        tool_call_count: int,
+        prompt_tokens: int,
+        completion_tokens: int,
+        reasoning_tokens: int,
+        total_cost: Decimal,
+    ) -> None:
+        """在模型响应和观察边界等待上层完成原子 checkpoint。"""
+        if self._progress_callback is None:
+            return
+        await self._progress_callback(
+            AgentProgress(
+                messages=tuple(messages),
+                round_count=round_count,
+                tool_call_count=tool_call_count,
+                usage=TokenUsage(
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=prompt_tokens + completion_tokens,
+                    reasoning_tokens=reasoning_tokens,
+                    cost_usd=total_cost if total_cost else None,
+                ),
+            )
+        )
 
     async def _complete_with_limits(
         self,

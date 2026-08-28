@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import stat
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 from rivet.tools.errors import PathBoundaryError
 
@@ -21,6 +24,33 @@ SENSITIVE_FILENAMES = frozenset(
         "service-account.json",
     }
 )
+
+WorkspaceMode = Literal["ASK", "PLAN", "FIX"]
+
+
+@dataclass(frozen=True, slots=True)
+class WorkspaceView:
+    """描述仓库身份与当前命令实际观察到的唯一文件系统根。"""
+
+    repository_root: Path
+    effective_root: Path
+    transaction_root: Path | None
+    transaction_id: str | None
+    mode: WorkspaceMode
+
+    def as_dict(self) -> dict[str, str | None]:
+        """返回可写入 Trace、Session 与 IPC 的稳定 JSON 元数据。"""
+        return {
+            "effective_root": str(self.effective_root),
+            "mode": self.mode,
+            "repository_root": str(self.repository_root),
+            "transaction_id": self.transaction_id,
+            "transaction_root": (
+                str(self.transaction_root)
+                if self.transaction_root is not None
+                else None
+            ),
+        }
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:
@@ -56,6 +86,9 @@ class WorkspaceBoundary:
         self,
         repository_root: Path,
         transaction_root: Path | None = None,
+        *,
+        transaction_id: str | None = None,
+        mode: WorkspaceMode | None = None,
     ) -> None:
         repository = repository_root.resolve(strict=True)
         if not repository.is_dir():
@@ -81,6 +114,34 @@ class WorkspaceBoundary:
                 )
         self.repository_root = repository
         self.transaction_root = transaction
+        effective = transaction if transaction is not None else repository
+        resolved_mode: WorkspaceMode = mode or (
+            "FIX" if transaction is not None else "ASK"
+        )
+        if resolved_mode == "FIX" and transaction is None:
+            raise PathBoundaryError(
+                "workspace.transaction_missing", "FIX 视图必须绑定事务根"
+            )
+        if resolved_mode != "FIX" and transaction is not None:
+            raise PathBoundaryError(
+                "workspace.mode_root_mismatch", "只读视图不得绑定事务根"
+            )
+        if transaction_id is not None and transaction is None:
+            raise PathBoundaryError(
+                "workspace.transaction_missing", "事务标识必须绑定事务根"
+            )
+        self.workspace_view = WorkspaceView(
+            repository_root=repository,
+            effective_root=effective,
+            transaction_root=transaction,
+            transaction_id=transaction_id,
+            mode=resolved_mode,
+        )
+
+    @property
+    def effective_root(self) -> Path:
+        """返回所有读、搜、Git、Context、Reader 与进程共同观察的根。"""
+        return self.workspace_view.effective_root
 
     def resolve_repository(
         self,
@@ -90,9 +151,9 @@ class WorkspaceBoundary:
         require_file: bool = False,
         require_directory: bool = False,
     ) -> Path:
-        """解析主仓库路径并拒绝逃逸、内部目录与凭据文件。"""
+        """在当前有效视图解析只读路径并拒绝逃逸与凭据文件。"""
         return self._resolve(
-            self.repository_root,
+            self.effective_root,
             relative_path,
             require_exists=require_exists,
             require_file=require_file,
@@ -123,11 +184,11 @@ class WorkspaceBoundary:
         )
 
     def repository_relative(self, path: Path) -> str:
-        """把已授权路径转换为稳定 POSIX 相对路径。"""
+        """把有效视图中的授权路径转换为稳定 POSIX 相对路径。"""
         resolved = path.resolve(strict=False)
-        if not _is_relative_to(resolved, self.repository_root):
+        if not _is_relative_to(resolved, self.effective_root):
             raise PathBoundaryError("workspace.path_escape", "路径不属于仓库授权根")
-        relative = resolved.relative_to(self.repository_root)
+        relative = resolved.relative_to(self.effective_root)
         return "." if not relative.parts else relative.as_posix()
 
     def transaction_relative(self, path: Path) -> str:
@@ -178,6 +239,23 @@ class WorkspaceBoundary:
                         "workspace.symlink_write_forbidden",
                         "事务写路径不得包含 symlink",
                     )
+            try:
+                metadata = candidate.lstat()
+            except FileNotFoundError:
+                metadata = None
+            except OSError as error:
+                raise PathBoundaryError(
+                    "workspace.path_unreadable", "无法检查事务写路径"
+                ) from error
+            if (
+                metadata is not None
+                and stat.S_ISREG(metadata.st_mode)
+                and metadata.st_nlink > 1
+            ):
+                raise PathBoundaryError(
+                    "workspace.hardlink_write_forbidden",
+                    "事务写路径不得是硬链接文件",
+                )
         resolved = candidate.resolve(strict=False)
         if not _is_relative_to(resolved, root):
             raise PathBoundaryError("workspace.path_escape", "路径解析后越过授权根")

@@ -52,6 +52,7 @@ async def test_ask_routes_to_json_cli_and_emits_result(tmp_path: Path) -> None:
                     "answer": "回答",
                     "run_id": "run_one",
                     "session_id": "session_one",
+                    "status": "ANSWERED",
                     "usage": {"cost_usd": None, "total_tokens": 12},
                 }
             ).encode(),
@@ -76,7 +77,10 @@ async def test_ask_routes_to_json_cli_and_emits_result(tmp_path: Path) -> None:
     assert result["answer"] == "回答"
     assert "--json" in arguments[0]
     assert arguments[0][-2:] == ("ask", "解释")
-    assert any(event_type == "agent.completed" for event_type, _ in events)
+    answered = next(
+        payload for event_type, payload in events if event_type == "agent.answered"
+    )
+    assert answered["status"] == "ANSWERED"
     assert any(event_type == "budget.updated" for event_type, _ in events)
 
 
@@ -557,7 +561,9 @@ async def test_fix_waits_for_explicit_permission_then_adds_yes(
             4,
             json.dumps(
                 {
+                    "answer": "已经修复，全部测试通过",
                     "evidence_id": "evidence_one",
+                    "model_status": "READY_FOR_VERIFICATION",
                     "status": "FAILED",
                     "transaction_id": "tx_one",
                 }
@@ -606,6 +612,11 @@ async def test_fix_waits_for_explicit_permission_then_adds_yes(
     assert arguments[0][-1] == "--yes"
     assert any(event_type == "permission.resolved" for event_type, _ in events)
     assert any(event_type == "verification.completed" for event_type, _ in events)
+    event_types = [event_type for event_type, _ in events]
+    assert "agent.completed" not in event_types
+    assert event_types.index("agent.patch_ready") < event_types.index(
+        "verification.completed"
+    )
 
 
 @pytest.mark.asyncio

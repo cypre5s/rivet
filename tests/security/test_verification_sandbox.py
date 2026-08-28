@@ -12,7 +12,7 @@ from tests.verification_helpers import run_verification_case
 
 
 @pytest.mark.asyncio
-async def test_verification_without_sandbox_is_inconclusive_not_passed(
+async def test_verification_without_sandbox_is_blocked_not_passed(
     tmp_path: Path,
 ) -> None:
     correct = next(case for case in VERIFICATION_CASES if case.case_id == "correct_fix")
@@ -24,7 +24,7 @@ async def test_verification_without_sandbox_is_inconclusive_not_passed(
         sandbox_executable=tmp_path / "missing-bwrap",
     )
 
-    assert prepared.outcome.verdict.status is VerificationStatus.INCONCLUSIVE
+    assert prepared.outcome.verdict.status is VerificationStatus.BLOCKED
     assert not prepared.outcome.verdict.passed
     assert any(
         "sandbox.unavailable" in result.stderr_summary

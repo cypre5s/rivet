@@ -219,7 +219,9 @@ async def test_read_only_model_commands_persist_trace_and_checkpoint(
 
     assert exit_code == 0
     assert payload["answer"] == "离线回答"
-    assert checkpoint.status is SessionStatus.COMPLETED
+    assert checkpoint.status is (
+        SessionStatus.ANSWERED if command == "ask" else SessionStatus.PLANNED
+    )
     assert checkpoint.provider_state == {"reasoning_content": "opaque"}
     assert (repository / ".rivet" / "trace" / "events.ndjson").is_file()
 
@@ -271,8 +273,8 @@ async def test_fix_records_patch_and_fails_closed_when_verification_cannot_pass(
     assert exit_code == 4
     assert payload["status"] != "PASSED"
     assert record.current_patch_id is not None
-    assert record.state.value == "REJECTED"
-    assert checkpoint.status is SessionStatus.FAILED
+    assert record.state.value == "INCONCLUSIVE"
+    assert checkpoint.status is SessionStatus.INCONCLUSIVE
     assert (repository / "tracked.txt").read_text(encoding="utf-8") == "base\n"
 
 
@@ -361,7 +363,7 @@ async def test_resume_continues_saved_history_and_preserves_budget_counts(
     assert payload["resumed"] is True
     assert payload["run_id"] == checkpoint.run_id
     assert requests[0].messages[0] == checkpoint.messages[0]
-    assert resumed.status is SessionStatus.COMPLETED
+    assert resumed.status is SessionStatus.ANSWERED
     assert resumed.stage is SessionStage.TERMINAL
     assert resumed.round_count == 3
     assert resumed.prompt_tokens == 11
@@ -485,8 +487,8 @@ async def test_patch_finalization_resume_skips_provider_and_finishes_verificatio
 
     assert exit_code == int(ExitCode.VERIFICATION_FAILED)
     assert resumed.stage is SessionStage.TERMINAL
-    assert resumed.status is SessionStatus.FAILED
-    assert transaction.state.value == "REJECTED"
+    assert resumed.status is SessionStatus.BLOCKED
+    assert transaction.state.value == "BLOCKED"
     assert transaction.current_patch_id is not None
     assert '"module_id":"provider.deepseek"' not in trace
 

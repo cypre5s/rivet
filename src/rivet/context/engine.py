@@ -47,6 +47,8 @@ class ProgressiveContextResult:
     signals: TaskSignals
     selection: ContextSelection
     explored_items: tuple[ContextItem, ...]
+    syntax_activated: bool = False
+    escalation_reason: str | None = None
 
 
 class ProgressiveContext:
@@ -79,7 +81,7 @@ class ProgressiveContext:
         task: str,
         *,
         budget: ContextBudget,
-        include_syntax: bool = False,
+        include_syntax: bool | None = False,
     ) -> ProgressiveContextResult:
         """建立清单后逐级检索，并用冻结预算确定最终条目。"""
         snapshot = await self._inventory.build()
@@ -87,7 +89,10 @@ class ProgressiveContext:
         candidates = self._inventory_candidates(snapshot, signals)
         lexical = await self._lexical_candidates(snapshot, signals)
         candidates.extend(lexical)
-        if include_syntax:
+        syntax_activated = include_syntax is True or (
+            include_syntax is None and self._lexical_requires_syntax(lexical)
+        )
+        if syntax_activated:
             candidates.extend(self._syntax_candidates(snapshot, signals, lexical))
         candidates = self._attach_corpus_and_pairs(candidates, snapshot)
         recent_paths = await self._recent_git_paths()
@@ -100,7 +105,15 @@ class ProgressiveContext:
             signals=signals,
             selection=selected.selection,
             explored_items=selected.explored_items,
+            syntax_activated=syntax_activated,
+            escalation_reason=("词法候选缺失或歧义过高" if syntax_activated else None),
         )
+
+    @staticmethod
+    def _lexical_requires_syntax(lexical: list[CandidateEvidence]) -> bool:
+        """只在 L1 无证据或命中路径过多时升级 Tree-sitter。"""
+        paths = {candidate.path for candidate in lexical}
+        return not paths or len(paths) > 4
 
     def _inventory_candidates(
         self, snapshot: RepositorySnapshot, signals: TaskSignals

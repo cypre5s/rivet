@@ -45,6 +45,14 @@ describe("TUI command input", () => {
       method: "command.diff",
       params: { transaction_id: "tx_one" },
     });
+    expect(parseCommandInput("/export evidence .rivet/exports/evidence.json")).toEqual({
+      kind: "worker",
+      method: "command.export",
+      params: {
+        export_kind: "evidence",
+        output_path: ".rivet/exports/evidence.json",
+      },
+    });
     expect(parseCommandInput("/apply tx_one", {
       modelConfigured: true,
       currentModel: "deepseek-v4-pro",
