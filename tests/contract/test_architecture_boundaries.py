@@ -1,4 +1,4 @@
-"""验证 contracts 不依赖 Kernel 或具体能力层。"""
+"""验证 contracts 与薄 Kernel 的单向依赖边界。"""
 
 from pathlib import Path
 
@@ -21,3 +21,17 @@ def test_contract_importing_kernel_is_rejected(tmp_path: Path) -> None:
 
     assert len(violations) == 1
     assert violations[0].rule_id == "contracts.reverse_dependency"
+
+
+def test_kernel_importing_concrete_reader_is_rejected(tmp_path: Path) -> None:
+    kernel_directory = tmp_path / "src" / "rivet" / "kernel"
+    kernel_directory.mkdir(parents=True)
+    (kernel_directory / "invalid.py").write_text(
+        "from rivet.readers import pdf\n",
+        encoding="utf-8",
+    )
+
+    violations = find_architecture_violations(tmp_path)
+
+    assert len(violations) == 1
+    assert violations[0].rule_id == "kernel.concrete_dependency"

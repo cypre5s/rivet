@@ -22,6 +22,24 @@ FORBIDDEN_CONTRACT_IMPORT_PREFIXES = (
     "rivet.transaction",
     "rivet.verify",
 )
+FORBIDDEN_KERNEL_IMPORT_PREFIXES = (
+    "rivet.context",
+    "rivet.guard",
+    "rivet.ipc",
+    "rivet.providers",
+    "rivet.readers",
+    "rivet.storage",
+    "rivet.tools",
+    "rivet.trace",
+    "rivet.transaction",
+    "rivet.verify",
+    "markitdown",
+    "tree_sitter",
+    "httpx",
+    "PIL",
+    "pytesseract",
+    "whisper",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,13 +70,56 @@ def _matches_prefix(module_name: str, prefix: str) -> bool:
 def find_architecture_violations(
     repository_root: Path,
 ) -> tuple[ArchitectureViolation, ...]:
-    """检查 contracts 是否反向依赖 Kernel 或具体能力层。"""
-    contract_root = repository_root / "src" / "rivet" / "contracts"
-    if not contract_root.is_dir():
-        return ()
-
+    """检查 contracts 反向依赖与 Kernel 具体能力依赖。"""
     violations: list[ArchitectureViolation] = []
-    for source_path in sorted(contract_root.rglob("*.py")):
+    source_rules = (
+        (
+            repository_root / "src" / "rivet" / "contracts",
+            FORBIDDEN_CONTRACT_IMPORT_PREFIXES,
+            "contracts.reverse_dependency",
+            "contracts 不得导入",
+        ),
+        (
+            repository_root / "src" / "rivet" / "kernel",
+            FORBIDDEN_KERNEL_IMPORT_PREFIXES,
+            "kernel.concrete_dependency",
+            "Kernel 不得导入具体能力",
+        ),
+    )
+    for source_root, forbidden_prefixes, rule_id, summary_prefix in source_rules:
+        if not source_root.is_dir():
+            continue
+        violations.extend(
+            _find_source_violations(
+                repository_root,
+                source_root,
+                forbidden_prefixes,
+                rule_id,
+                summary_prefix,
+            )
+        )
+    return tuple(
+        sorted(
+            violations,
+            key=lambda violation: (
+                violation.path,
+                violation.line,
+                violation.rule_id,
+            ),
+        )
+    )
+
+
+def _find_source_violations(
+    repository_root: Path,
+    source_root: Path,
+    forbidden_prefixes: tuple[str, ...],
+    rule_id: str,
+    summary_prefix: str,
+) -> list[ArchitectureViolation]:
+    """扫描一个源码边界并返回全部可定位违规。"""
+    violations: list[ArchitectureViolation] = []
+    for source_path in sorted(source_root.rglob("*.py")):
         relative_path = source_path.relative_to(repository_root).as_posix()
         try:
             tree = ast.parse(
@@ -76,27 +137,17 @@ def find_architecture_violations(
             continue
         for module_name, line in _imported_modules(tree):
             if any(
-                _matches_prefix(module_name, prefix)
-                for prefix in FORBIDDEN_CONTRACT_IMPORT_PREFIXES
+                _matches_prefix(module_name, prefix) for prefix in forbidden_prefixes
             ):
                 violations.append(
                     ArchitectureViolation(
-                        rule_id="contracts.reverse_dependency",
+                        rule_id=rule_id,
                         path=relative_path,
                         line=line,
-                        summary=f"contracts 不得导入 {module_name}",
+                        summary=f"{summary_prefix} {module_name}",
                     )
                 )
-    return tuple(
-        sorted(
-            violations,
-            key=lambda violation: (
-                violation.path,
-                violation.line,
-                violation.rule_id,
-            ),
-        )
-    )
+    return violations
 
 
 def _build_parser() -> ArgumentParser:
