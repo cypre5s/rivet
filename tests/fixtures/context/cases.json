@@ -131,5 +131,153 @@
       "src/billing/legacy.py": "from decimal import Decimal\n\ndef calculate_total(values: list[Decimal]) -> Decimal:\n    return sum(values, Decimal())\n",
       "tests/test_billing.py": "def test_billing_placeholder():\n    assert True\n"
     }
+  },
+  {
+    "case_id": "python-definition-account",
+    "task": "查找 Account 的跨文件 definition",
+    "include_syntax": true,
+    "gold_files": ["model.py"],
+    "relevant_files": ["model.py", "use.py"],
+    "semantic": {
+      "operation": "definition",
+      "document_path": "use.py",
+      "line": 0,
+      "character": 18
+    },
+    "files": {
+      "model.py": "class Account:\n    pass\n",
+      "use.py": "from model import Account\nvalue = Account()\n",
+      "unrelated.py": "def render_page():\n    return 'ok'\n"
+    }
+  },
+  {
+    "case_id": "python-references-config",
+    "task": "列出 load_config 的 references 引用",
+    "include_syntax": true,
+    "gold_files": ["config.py", "app.py"],
+    "relevant_files": ["config.py", "app.py"],
+    "semantic": {
+      "operation": "references",
+      "document_path": "app.py",
+      "line": 0,
+      "character": 19
+    },
+    "files": {
+      "config.py": "def load_config() -> dict[str, str]:\n    return {}\n",
+      "app.py": "from config import load_config\nCONFIG = load_config()\n",
+      "metrics.py": "def record_metric():\n    return None\n"
+    }
+  },
+  {
+    "case_id": "typescript-definition-user",
+    "task": "查找 User 的跨文件 definition",
+    "include_syntax": true,
+    "gold_files": ["entity.ts"],
+    "relevant_files": ["entity.ts", "use.ts"],
+    "semantic": {
+      "operation": "definition",
+      "document_path": "use.ts",
+      "line": 0,
+      "character": 9
+    },
+    "files": {
+      "tsconfig.json": "{\"compilerOptions\":{\"strict\":true},\"include\":[\"*.ts\"]}\n",
+      "entity.ts": "export class User { readonly id = 1 }\n",
+      "use.ts": "import { User } from './entity'\nexport const current = new User()\n",
+      "logger.ts": "export const log = (message: string) => message\n"
+    }
+  },
+  {
+    "case_id": "typescript-references-emit",
+    "task": "列出 emit 的 references 引用",
+    "include_syntax": true,
+    "gold_files": ["events.ts", "consumer.ts"],
+    "relevant_files": ["events.ts", "consumer.ts"],
+    "semantic": {
+      "operation": "references",
+      "document_path": "consumer.ts",
+      "line": 0,
+      "character": 9
+    },
+    "files": {
+      "tsconfig.json": "{\"compilerOptions\":{\"strict\":true},\"include\":[\"*.ts\"]}\n",
+      "events.ts": "export function emit(name: string): string { return name }\n",
+      "consumer.ts": "import { emit } from './events'\nexport const sent = emit('ready')\n",
+      "format.ts": "export const format = (value: string) => value.trim()\n"
+    }
+  },
+  {
+    "case_id": "python-definition-order-id",
+    "task": "定位 OrderId 定义 definition",
+    "include_syntax": true,
+    "gold_files": ["entities.py"],
+    "relevant_files": ["entities.py", "service.py"],
+    "semantic": {
+      "operation": "definition",
+      "document_path": "service.py",
+      "line": 0,
+      "character": 21
+    },
+    "files": {
+      "entities.py": "class OrderId(str):\n    pass\n",
+      "service.py": "from entities import OrderId\ndef save(order_id: OrderId) -> None:\n    return None\n",
+      "cache.py": "class CacheKey(str):\n    pass\n"
+    }
+  },
+  {
+    "case_id": "typescript-definition-payment",
+    "task": "定位 Payment 接口 definition",
+    "include_syntax": true,
+    "gold_files": ["contract.ts"],
+    "relevant_files": ["contract.ts", "handler.ts"],
+    "semantic": {
+      "operation": "definition",
+      "document_path": "handler.ts",
+      "line": 0,
+      "character": 9
+    },
+    "files": {
+      "tsconfig.json": "{\"compilerOptions\":{\"strict\":true},\"include\":[\"*.ts\"]}\n",
+      "contract.ts": "export interface Payment { amount: number }\n",
+      "handler.ts": "import { Payment } from './contract'\nexport function handle(value: Payment): number { return value.amount }\n",
+      "status.ts": "export type Status = 'ready' | 'done'\n"
+    }
+  },
+  {
+    "case_id": "javascript-definition-sum",
+    "task": "查找 sum 的跨文件 definition",
+    "include_syntax": true,
+    "gold_files": ["math.js"],
+    "relevant_files": ["math.js", "app.js"],
+    "semantic": {
+      "operation": "definition",
+      "document_path": "app.js",
+      "line": 0,
+      "character": 9
+    },
+    "files": {
+      "tsconfig.json": "{\"compilerOptions\":{\"checkJs\":true},\"include\":[\"*.js\"]}\n",
+      "math.js": "export function sum(left, right) { return left + right }\n",
+      "app.js": "import { sum } from './math.js'\nexport const total = sum(1, 2)\n",
+      "theme.js": "export const color = 'blue'\n"
+    }
+  },
+  {
+    "case_id": "python-references-repository",
+    "task": "查询 Repository 的 references 调用者",
+    "include_syntax": true,
+    "gold_files": ["base.py", "implementation.py"],
+    "relevant_files": ["base.py", "implementation.py"],
+    "semantic": {
+      "operation": "references",
+      "document_path": "implementation.py",
+      "line": 0,
+      "character": 17
+    },
+    "files": {
+      "base.py": "class Repository:\n    pass\n",
+      "implementation.py": "from base import Repository\nclass MemoryRepository(Repository):\n    pass\n",
+      "transport.py": "class Transport:\n    pass\n"
+    }
   }
 ]

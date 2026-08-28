@@ -28,7 +28,7 @@ NOW = datetime(2026, 8, 28, tzinfo=UTC)
 async def test_twelve_fixtures_reach_gold_coverage(tmp_path: Path) -> None:
     covered = 0
     gold_count = 0
-    for case in load_context_cases():
+    for case in load_context_cases()[:12]:
         repository = materialize_context_case(case, tmp_path)
         scope = ResourceScope(f"context.{case.case_id.replace('-', '_')}")
         engine = ProgressiveContext(repository, scope=scope, clock=lambda: NOW)

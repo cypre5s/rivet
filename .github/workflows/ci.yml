@@ -16,7 +16,13 @@ jobs:
         with:
           python-version-file: .python-version
           enable-cache: true
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: tools/lsp/package-lock.json
       - run: uv sync --dev --locked
+      - run: npm ci --prefix tools/lsp --ignore-scripts --no-audit --no-fund
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run basedpyright

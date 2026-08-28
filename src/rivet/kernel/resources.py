@@ -82,6 +82,7 @@ class _OwnedResource:
     cleanup: Cleanup
     is_active: Callable[[], bool]
     description: str
+    handle: object | None = None
 
 
 class ResourceScope:
@@ -122,6 +123,7 @@ class ResourceScope:
             cleanup,
             is_active=lambda: not task.done(),
             description=description,
+            handle=task,
         )
 
         def discard_finished(_task: asyncio.Task[T]) -> None:
@@ -129,6 +131,15 @@ class ResourceScope:
 
         task.add_done_callback(discard_finished)
         return task
+
+    def release_task(self, task: asyncio.Task[object]) -> None:
+        """在已结束任务被等待后同步移除其资源登记。"""
+        if not task.done():
+            raise ResourceCleanupError("活动任务不得提前移除资源登记")
+        for resource_id, resource in tuple(self._resources.items()):
+            if resource.handle is task:
+                self._resources.pop(resource_id, None)
+                return
 
     async def create_process(
         self,
@@ -180,8 +191,18 @@ class ResourceScope:
             cleanup,
             is_active=lambda: process.returncode is None,
             description=description,
+            handle=process,
         )
         return process
+
+    def release_process(self, process: asyncio.subprocess.Process) -> None:
+        """在已 wait 的进程退出后移除其资源登记。"""
+        if process.returncode is None:
+            raise ResourceCleanupError("活动进程不得提前移除资源登记")
+        for resource_id, resource in tuple(self._resources.items()):
+            if resource.handle is process:
+                self._resources.pop(resource_id, None)
+                return
 
     def register_client(
         self, client: AsyncCloseable, *, description: str
@@ -326,6 +347,7 @@ class ResourceScope:
         *,
         is_active: Callable[[], bool],
         description: str,
+        handle: object | None = None,
     ) -> str:
         """生成局部稳定 ID 并保存真实清理动作。"""
         self._ensure_open()
@@ -337,6 +359,7 @@ class ResourceScope:
             cleanup=cleanup,
             is_active=is_active,
             description=description,
+            handle=handle,
         )
         return resource_id
 

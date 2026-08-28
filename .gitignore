@@ -21,4 +21,5 @@ artifacts/local/
 reports/local/
 worktrees/
 tui/node_modules/
+tools/lsp/node_modules/
 .DS_Store

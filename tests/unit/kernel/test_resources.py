@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from contextlib import suppress
 from pathlib import Path
 
 import pytest
 
+from rivet.kernel.errors import ResourceCleanupError
 from rivet.kernel.resources import ResourceScope
 
 
@@ -79,3 +82,31 @@ async def test_scope_runs_worktree_cleanup_once(tmp_path: Path) -> None:
     assert cleanup_calls == 1
     assert not worktree.exists()
     assert scope.counts().temporary_worktree_count == 0
+
+
+@pytest.mark.asyncio
+async def test_scope_releases_only_finished_tasks_and_waited_processes() -> None:
+    scope = ResourceScope("context.lsp.release")
+    task = scope.create_task(asyncio.sleep(3_600), description="测试读取任务")
+    with pytest.raises(ResourceCleanupError, match="活动任务"):
+        scope.release_task(task)
+    task.cancel()
+    with suppress(asyncio.CancelledError):
+        await task
+    scope.release_task(task)
+
+    process = await scope.create_process(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(3600)",
+        description="测试 sidecar",
+    )
+
+    with pytest.raises(ResourceCleanupError, match="活动进程"):
+        scope.release_process(process)
+    process.terminate()
+    await process.wait()
+    scope.release_process(process)
+
+    scope.assert_empty()
+    await scope.close()

@@ -23,6 +23,9 @@ def main(argv: Sequence[str] | None = None) -> None:
     trace_parser.add_argument("run_id", nargs="?")
     trace_parser.add_argument("--json", action="store_true", dest="json_output")
     trace_parser.add_argument("--repository", type=Path, default=Path.cwd())
+    doctor_parser = subparsers.add_parser("doctor", help="检测本地运行依赖")
+    doctor_parser.add_argument("--json", action="store_true", dest="json_output")
+    doctor_parser.add_argument("--repository", type=Path, default=Path.cwd())
     arguments = parser.parse_args(argv)
     command = cast(str | None, arguments.command)
     if command == "trace":
@@ -35,3 +38,20 @@ def main(argv: Sequence[str] | None = None) -> None:
         )
         if exit_code:
             raise SystemExit(exit_code)
+    elif command == "doctor":
+        from rivet.context.lsp_doctor import LspDoctor
+        from rivet.context.lsp_manifest import LspManifestRegistry
+
+        report = LspDoctor(
+            LspManifestRegistry.load_builtin(
+                repository_root=cast(Path, arguments.repository)
+            )
+        ).inspect()
+        if cast(bool, arguments.json_output):
+            print(report.to_json())
+        else:
+            for server in report.servers:
+                state = "可用" if server.available else "缺失"
+                print(f"{server.server_id}: {state}")
+        if not report.ready:
+            raise SystemExit(1)

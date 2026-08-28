@@ -1,0 +1,14 @@
+server_id = "typescript"
+language_ids = ["typescript", "typescriptreact", "javascript", "javascriptreact"]
+suffixes = [".ts", ".tsx", ".js", ".jsx"]
+executable_candidates = ["tools/lsp/node_modules/.bin/typescript-language-server", "typescript-language-server"]
+arguments = ["--stdio", "--log-level", "1"]
+idle_timeout_seconds = 300
+request_timeout_seconds = 10
+max_restarts = 1
+
+[initialization_options]
+disableAutomaticTypingAcquisition = true
+
+[initialization_options.tsserver]
+useSyntaxServer = "never"

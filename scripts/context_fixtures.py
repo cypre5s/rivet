@@ -10,6 +10,16 @@ from typing import cast
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticFixture:
+    """描述跨文件语义操作与零基查询位置。"""
+
+    operation: str
+    document_path: str
+    line: int
+    character: int
+
+
+@dataclass(frozen=True, slots=True)
 class ContextFixtureCase:
     """描述单个任务、Gold 文件和小型仓库内容。"""
 
@@ -19,25 +29,44 @@ class ContextFixtureCase:
     gold_files: tuple[str, ...]
     files: dict[str, str]
     recent_paths: tuple[str, ...] = ()
+    relevant_files: tuple[str, ...] = ()
+    semantic: SemanticFixture | None = None
 
 
 def load_context_cases() -> tuple[ContextFixtureCase, ...]:
-    """从固定 JSON 加载十二个可重复检索样本。"""
+    """从固定 JSON 加载二十个可重复检索样本。"""
     fixture_path = (
         Path(__file__).parents[1] / "tests" / "fixtures" / "context" / "cases.json"
     )
     payload = cast(list[dict[str, object]], json.loads(fixture_path.read_text()))
-    return tuple(
-        ContextFixtureCase(
-            case_id=cast(str, item["case_id"]),
-            task=cast(str, item["task"]),
-            include_syntax=cast(bool, item["include_syntax"]),
-            gold_files=tuple(cast(list[str], item["gold_files"])),
-            files=cast(dict[str, str], item["files"]),
-            recent_paths=tuple(cast(list[str], item.get("recent_paths", []))),
+    cases: list[ContextFixtureCase] = []
+    for item in payload:
+        raw_semantic = item.get("semantic")
+        semantic: SemanticFixture | None = None
+        if isinstance(raw_semantic, dict):
+            semantic_mapping = cast(dict[str, object], raw_semantic)
+            semantic = SemanticFixture(
+                operation=cast(str, semantic_mapping["operation"]),
+                document_path=cast(str, semantic_mapping["document_path"]),
+                line=cast(int, semantic_mapping["line"]),
+                character=cast(int, semantic_mapping["character"]),
+            )
+        gold_files = tuple(cast(list[str], item["gold_files"]))
+        cases.append(
+            ContextFixtureCase(
+                case_id=cast(str, item["case_id"]),
+                task=cast(str, item["task"]),
+                include_syntax=cast(bool, item["include_syntax"]),
+                gold_files=gold_files,
+                files=cast(dict[str, str], item["files"]),
+                recent_paths=tuple(cast(list[str], item.get("recent_paths", []))),
+                relevant_files=tuple(
+                    cast(list[str], item.get("relevant_files", list(gold_files)))
+                ),
+                semantic=semantic,
+            )
         )
-        for item in payload
-    )
+    return tuple(cases)
 
 
 def materialize_context_case(case: ContextFixtureCase, root: Path) -> Path:
