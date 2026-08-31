@@ -20,11 +20,17 @@ export interface KeyDescriptor {
 }
 
 export type CtrlCAction = "cancel" | "exit";
-export type CtrlCIntent = "cancel-task" | "clear-input" | "prompt-exit" | "exit";
+export type CtrlCIntent =
+  | "cancel-task"
+  | "close-overlay"
+  | "clear-input"
+  | "prompt-exit"
+  | "exit";
 
 export interface CtrlCContext {
   running: boolean;
   inputEmpty: boolean;
+  overlayOpen: boolean;
 }
 
 export const CTRL_C_EXIT_WINDOW_MS = 1500;
@@ -50,6 +56,7 @@ export function resolveCtrlCIntent(
 ): CtrlCIntent {
   if (resolveCtrlCAction(previousAt, now) === "exit") return "exit";
   if (context.running) return "cancel-task";
+  if (context.overlayOpen) return "close-overlay";
   if (!context.inputEmpty) return "clear-input";
   return "prompt-exit";
 }

@@ -598,6 +598,56 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderer.destroy());
   });
 
+  test("closes the Slash overlay before exiting on a second Ctrl+C", async () => {
+    let exitCount = 0;
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState()}
+        noColor={true}
+        onExit={() => exitCount++}
+      />,
+      { width: 100, height: 28, exitOnCtrlC: false, kittyKeyboard: true },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.typeText("/"));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("/全部操作");
+
+    await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
+    await setup.flush();
+    expect(exitCount).toBe(0);
+    expect(setup.captureCharFrame()).not.toContain("/全部操作");
+
+    await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
+    expect(exitCount).toBe(1);
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("closes the file picker before exiting on a second Ctrl+C", async () => {
+    let exitCount = 0;
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState()}
+        noColor={true}
+        onExit={() => exitCount++}
+      />,
+      { width: 100, height: 28, exitOnCtrlC: false, kittyKeyboard: true },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("o", { ctrl: true }));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("搜索仓库内文件");
+
+    await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
+    await setup.flush();
+    expect(exitCount).toBe(0);
+    expect(setup.captureCharFrame()).not.toContain("搜索仓库内文件");
+
+    await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
+    expect(exitCount).toBe(1);
+    await act(async () => setup.renderer.destroy());
+  });
+
   test("loads recent sessions through IPC only when a session view is requested", async () => {
     const transport = new CaptureTransport();
     const client = new WorkerClient(transport, { requireHandshake: false });

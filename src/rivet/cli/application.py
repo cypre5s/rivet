@@ -10,25 +10,15 @@ import sys
 from argparse import Namespace
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
-from rivet.cli.config import ConfigOverrides, ResolvedConfig, load_config
-from rivet.cli.doctor import DoctorSection, doctor_json, inspect_doctor, render_doctor
 from rivet.cli.errors import CliConfigurationError, CliError, CliSecurityError
 from rivet.cli.exit_codes import ExitCode
-from rivet.cli.modules import run_module_command
 from rivet.cli.parser import build_internal_parser, build_parser
-from rivet.contracts.tools import SideEffectClass
-from rivet.storage.git_exclude import configure_runtime_excludes
-from rivet.storage.ownership import SafeCleaner
-from rivet.storage.sessions import (
-    SessionCheckpoint,
-    SessionStage,
-    SessionStatus,
-    SessionStore,
-    ToolRecoveryStatus,
-)
-from rivet.trace.paths import RuntimePaths
+
+if TYPE_CHECKING:
+    from rivet.cli.config import ConfigOverrides, ResolvedConfig
+    from rivet.storage.sessions import SessionCheckpoint, SessionStatus
 
 PROJECT_CONFIG = """schema_version = 1
 
@@ -68,6 +58,8 @@ def run_cli(
         repository = _repository(arguments)
         if command == "internal":
             return asyncio.run(_worker(arguments, repository))
+        from rivet.cli.config import load_config
+
         config = load_config(
             repository,
             environment=selected_environment,
@@ -115,6 +107,8 @@ def _dispatch(
         _print_payload(payload, json_output=json_output)
         return int(ExitCode.SUCCESS)
     if command == "modules":
+        from rivet.cli.modules import run_module_command
+
         return asyncio.run(
             run_module_command(
                 arguments,
@@ -124,11 +118,21 @@ def _dispatch(
             )
         )
     if command == "doctor":
+        from rivet.cli.doctor import (
+            DoctorSection,
+            doctor_json,
+            inspect_doctor,
+            render_doctor,
+        )
+
         section = cast(DoctorSection, arguments.section)
         report = inspect_doctor(repository, config, section=section)
         print(doctor_json(report) if json_output else render_doctor(report))
         return int(ExitCode.SUCCESS)
     if command == "clean":
+        from rivet.storage.ownership import SafeCleaner
+        from rivet.trace.paths import RuntimePaths
+
         report = SafeCleaner(RuntimePaths.for_repository(repository).cache_root).clean(
             dry_run=cast(bool, arguments.dry_run)
         )
@@ -220,6 +224,8 @@ def _dispatch(
 
 def _initialize(arguments: Namespace) -> int:
     """在明确目录中创建最小、无凭据且可跟踪的项目配置。"""
+    from rivet.storage.git_exclude import configure_runtime_excludes
+
     path_argument = cast(Path | None, arguments.path)
     repository_argument = cast(Path, arguments.repository)
     candidate = path_argument or repository_argument
@@ -357,6 +363,15 @@ async def _resume(
     json_output: bool,
 ) -> int:
     """续跑安全 Agent 阶段，并拒绝自动重放结果未知的工具调用。"""
+    from rivet.contracts.tools import SideEffectClass
+    from rivet.storage.sessions import (
+        SessionStage,
+        SessionStatus,
+        SessionStore,
+        ToolRecoveryStatus,
+    )
+    from rivet.trace.paths import RuntimePaths
+
     session_id = cast(str, arguments.session_id)
     try:
         checkpoint = SessionStore(repository).resume(session_id)
@@ -553,6 +568,7 @@ def _verification_session_status(
     transaction_id: str,
 ) -> SessionStatus:
     """把独立验证后的事务事实原样投影到 Session。"""
+    from rivet.storage.sessions import SessionStatus
     from rivet.transaction.store import TransactionStore
 
     record = TransactionStore(repository / ".rivet" / "transactions").load_record(
@@ -564,6 +580,8 @@ def _verification_session_status(
 def _unresolved_tool_calls(checkpoint: SessionCheckpoint) -> tuple[str, ...]:
     """从消息历史推导没有 ToolMessage 回执的调用，防止副作用重放。"""
     from rivet.contracts.messages import AssistantMessage, ToolMessage
+    from rivet.contracts.tools import SideEffectClass
+    from rivet.storage.sessions import ToolRecoveryStatus
 
     completed = {
         message.tool_call_id
@@ -669,6 +687,8 @@ def _repository(arguments: Namespace) -> Path:
 
 def _overrides(arguments: Namespace) -> ConfigOverrides:
     """只提取正式全局配置选项。"""
+    from rivet.cli.config import ConfigOverrides
+
     return ConfigOverrides(
         model=cast(str | None, arguments.model),
         base_url=cast(str | None, arguments.base_url),

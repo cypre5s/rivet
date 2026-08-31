@@ -1,0 +1,11 @@
+schema_version = 1
+
+[rivet]
+safe_mode = false
+
+[verification]
+acceptance = []
+targeted = []
+related = []
+regression = []
+static = []

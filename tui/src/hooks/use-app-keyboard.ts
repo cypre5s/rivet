@@ -91,6 +91,16 @@ export function useAppKeyboard(
   }, [state.input, state.running]);
 
   useKeyboard((key) => {
+    const command = resolveKeyCommand({
+      name: key.name.toLocaleLowerCase(),
+      shift: key.shift,
+      ctrl: key.ctrl,
+    });
+    if (command === "task.cancel") {
+      key.preventDefault();
+      handleCtrlC();
+      return;
+    }
     if (
       state.rivet.permission !== null &&
       (key.name === "a" || key.name === "d" || key.name === "escape")
@@ -142,11 +152,6 @@ export function useAppKeyboard(
       key.preventDefault();
       return;
     }
-    const command = resolveKeyCommand({
-      name: key.name.toLocaleLowerCase(),
-      shift: key.shift,
-      ctrl: key.ctrl,
-    });
     if (command === "palette.open") {
       key.preventDefault();
       actions.pushOverlay({ kind: "palette" });
@@ -171,9 +176,6 @@ export function useAppKeyboard(
     } else if (command === "mode.next" || command === "mode.previous") {
       key.preventDefault();
       cycleMode(command === "mode.next" ? 1 : -1);
-    } else if (command === "task.cancel") {
-      key.preventDefault();
-      handleCtrlC();
     } else if (command === "worker.recover") {
       key.preventDefault();
       if (state.rivet.connection === "crashed") services.onRecover?.();
@@ -209,6 +211,7 @@ export function useAppKeyboard(
     const intent = resolveCtrlCIntent(lastCtrlCAt.current, now, {
       running: state.running,
       inputEmpty: state.input.length === 0,
+      overlayOpen: state.topOverlay !== null,
     });
     if (intent === "cancel-task") {
       lastCtrlCAt.current = now;
@@ -216,6 +219,10 @@ export function useAppKeyboard(
         services.client.cancel(state.activeRequestId);
       }
       actions.setNotice("正在取消当前任务；再次按 Ctrl+C 安全退出");
+    } else if (intent === "close-overlay") {
+      lastCtrlCAt.current = now;
+      actions.closeTopOverlay();
+      actions.setNotice("已关闭弹层；再次按 Ctrl+C 安全退出");
     } else if (intent === "clear-input") {
       lastCtrlCAt.current = null;
       actions.setInput("");

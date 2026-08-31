@@ -62,16 +62,49 @@ describe("Ctrl+C lifecycle", () => {
 
   test("implements cancel, clear and double-press exit intents", () => {
     expect(
-      resolveCtrlCIntent(null, 1_000, { running: true, inputEmpty: true }),
+      resolveCtrlCIntent(null, 1_000, {
+        running: true,
+        inputEmpty: true,
+        overlayOpen: false,
+      }),
     ).toBe("cancel-task");
     expect(
-      resolveCtrlCIntent(null, 1_000, { running: false, inputEmpty: false }),
+      resolveCtrlCIntent(null, 1_000, {
+        running: false,
+        inputEmpty: false,
+        overlayOpen: false,
+      }),
     ).toBe("clear-input");
     expect(
-      resolveCtrlCIntent(null, 1_000, { running: false, inputEmpty: true }),
+      resolveCtrlCIntent(null, 1_000, {
+        running: false,
+        inputEmpty: true,
+        overlayOpen: false,
+      }),
     ).toBe("prompt-exit");
     expect(
-      resolveCtrlCIntent(1_000, 1_100, { running: true, inputEmpty: true }),
+      resolveCtrlCIntent(1_000, 1_100, {
+        running: true,
+        inputEmpty: true,
+        overlayOpen: false,
+      }),
+    ).toBe("exit");
+  });
+
+  test("closes an overlay first and exits on the second press", () => {
+    expect(
+      resolveCtrlCIntent(null, 1_000, {
+        running: false,
+        inputEmpty: false,
+        overlayOpen: true,
+      }),
+    ).toBe("close-overlay");
+    expect(
+      resolveCtrlCIntent(1_000, 1_100, {
+        running: false,
+        inputEmpty: false,
+        overlayOpen: false,
+      }),
     ).toBe("exit");
   });
 });
