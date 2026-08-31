@@ -27,7 +27,11 @@ from rivet.storage.sessions import (
 from rivet.tools.files import TransactionFileWriter
 from rivet.transaction.manager import TransactionManager
 from rivet.transaction.store import TransactionStore
-from tests.transaction_helpers import acceptance_spec, initialize_repository
+from tests.transaction_helpers import (
+    acceptance_spec,
+    initialize_repository,
+    passed_verdict,
+)
 
 
 @pytest.mark.asyncio
@@ -105,6 +109,71 @@ def test_cli_resume_loads_provider_state_without_replaying_tools(
     assert exit_code == 0
     assert '"provider_state_restored":true' in output
     assert "opaque" not in output
+
+
+def test_cli_resume_terminal_fix_restores_verified_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """终态恢复只投影重新验真的 Evidence，而不是遗失验证上下文。"""
+    repository = initialize_repository(tmp_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    assert configure_runtime_excludes(repository) is True
+
+    async def prepare() -> tuple[str, str]:
+        scope = ResourceScope("resume.verified.prepare")
+        manager = TransactionManager(repository, scope=scope)
+        record = await manager.create(transaction_id="tx_resume_verified")
+        await manager.freeze_acceptance(
+            record.transaction_id,
+            acceptance_spec(acceptance_id="acceptance_resume_verified"),
+            confirmed=True,
+        )
+        TransactionFileWriter(
+            manager.transaction_boundary(record.transaction_id)
+        ).write("tracked.txt", "verified resume\n")
+        await manager.record_patch_set(
+            record.transaction_id,
+            patch_id="patch_resume_verified",
+        )
+        verifying = await manager.begin_verification(record.transaction_id)
+        verified = await manager.record_verdict(passed_verdict(verifying, manager))
+        manager.suspend(record.transaction_id)
+        scope.assert_empty()
+        await scope.close()
+        assert verified.evidence_id is not None
+        return verified.transaction_id, verified.evidence_id
+
+    transaction_id, evidence_id = asyncio.run(prepare())
+    SessionStore(repository).save(
+        SessionCheckpoint(
+            session_id="session_resume_verified",
+            run_id="run_resume_verified",
+            transaction_id=transaction_id,
+            command="fix",
+            query="修改 tracked.txt",
+            status=SessionStatus.VERIFIED,
+            stage=SessionStage.TERMINAL,
+        )
+    )
+
+    exit_code = run_cli(
+        (
+            "--repository",
+            str(repository),
+            "--json",
+            "resume",
+            "session_resume_verified",
+        ),
+        environment={"XDG_CONFIG_HOME": str(tmp_path / "config")},
+    )
+    output = capsys.readouterr().out
+
+    assert exit_code == int(ExitCode.SUCCESS)
+    assert f'"evidence_id":"{evidence_id}"' in output
+    assert '"transaction_status":"VERIFIED"' in output
+    assert '"verification_status":"PASSED"' in output
 
 
 def test_cli_resume_dispatches_saved_history_back_to_agent_loop(

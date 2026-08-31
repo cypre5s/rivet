@@ -42,6 +42,11 @@ describe("trace event presentation", () => {
     expect(
       presentTraceEvent(event("agent.answered", { status: "ANSWERED" })),
     ).toMatchObject({ title: "回复已生成", kind: "assistant" });
+    expect(presentTraceEvent(event("config.updated"))).toMatchObject({
+      title: "运行配置已更新",
+      kind: "status",
+      status: "success",
+    });
   });
 
   test("keeps unknown events generic instead of exposing raw protocol names", () => {

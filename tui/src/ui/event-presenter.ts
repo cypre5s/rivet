@@ -46,6 +46,8 @@ const EVENT_TITLES: Record<string, string> = {
   "reader.completed": "文件读取完成",
   "command.completed": "命令执行完成",
   "sessions.snapshot": "近期会话已更新",
+  "transactions.snapshot": "近期事务已更新",
+  "config.updated": "运行配置已更新",
 };
 
 export function presentTraceEvent(event: IpcEvent): PresentedEvent {
@@ -113,6 +115,12 @@ function specializedTitle(
   if (eventType === "agent.patch_ready") {
     return "补丁生成完成，等待独立验证";
   }
+  if (eventType === "reader.completed") {
+    const status = text(payload.status).toUpperCase();
+    if (status === "DEGRADED") return "文件读取已降级";
+    if (status === "TRUNCATED") return "文件读取已截断";
+    if (status === "FAILED") return "文件读取失败";
+  }
   return null;
 }
 
@@ -137,6 +145,7 @@ function eventStatus(
   if (eventType.endsWith("started") || status === "RUNNING") return "running";
   if (eventType.includes("cancel") || status === "CANCELLED") return "cancelled";
   if (status === "BLOCKED" || status === "INCONCLUSIVE") return "blocked";
+  if (status === "DEGRADED") return "blocked";
   if (eventType.endsWith("blocked")) return "blocked";
   if (eventType.includes("failed") || status === "FAILED") return "failed";
   return "success";

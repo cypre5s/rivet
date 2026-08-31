@@ -6,6 +6,7 @@ import { createRoot } from "@opentui/react";
 import { RivetApp } from "./app.tsx";
 import { BunWorkerTransport } from "./ipc/bun-worker-transport.ts";
 import { WorkerClient } from "./ipc/client.ts";
+import { buildWorkerEnvironment } from "./ipc/worker-environment.ts";
 
 const repository = process.env.RIVET_REPOSITORY ?? process.cwd();
 const workerCommand = parseWorkerCommand(
@@ -66,7 +67,7 @@ function createTransport(): BunWorkerTransport {
   return new BunWorkerTransport({
     command: workerCommand,
     cwd: repository,
-    environment: workerEnvironment(),
+    environment: buildWorkerEnvironment(),
   });
 }
 
@@ -92,26 +93,4 @@ function parseWorkerCommand(value: string | undefined, cwd: string): string[] {
     throw new Error("RIVET_WORKER_COMMAND_JSON 必须是非空 argv 数组");
   }
   return parsed;
-}
-
-function workerEnvironment(): Record<string, string> {
-  const allowed = [
-    "DEEPSEEK_API_KEY",
-    "LANG",
-    "LC_ALL",
-    "PATH",
-    "RIVET_BWRAP_PATH",
-    "TERM",
-    "TZ",
-    "XDG_CACHE_HOME",
-    "XDG_CONFIG_HOME",
-    "XDG_DATA_HOME",
-    "XDG_STATE_HOME",
-  ];
-  const environment: Record<string, string> = {};
-  for (const name of allowed) {
-    const value = process.env[name];
-    if (value !== undefined) environment[name] = value;
-  }
-  return environment;
 }

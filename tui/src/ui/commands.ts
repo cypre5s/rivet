@@ -62,7 +62,10 @@ export function parseCommandInput(
           verificationStatus:
             argument === context.transactionId
               ? context.verificationStatus
-              : "NOT_RUN",
+              : context.transactionStates?.[argument]?.toUpperCase() === "VERIFIED"
+                ? "PASSED"
+                : "NOT_RUN",
+          transactionStates: {},
         }
       : context;
   const availability = commandAvailability(command, executionContext);
@@ -94,6 +97,7 @@ export function commandArgumentRequest(value: string): CommandArgumentRequest | 
   if (match?.[1] === undefined || match[2] === undefined) return null;
   const command = findCommand(match[1]);
   if (command === null || !hasFiniteChoices(command.argumentKind)) return null;
+  if (command.name === "read" && /\s--/.test(match[2])) return null;
   return { commandName: command.name, query: match[2] };
 }
 

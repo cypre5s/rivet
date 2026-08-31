@@ -27,7 +27,7 @@ class DeepSeekConfig(BaseModel):
     )
 
     base_url: str = "https://api.deepseek.com"
-    timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+    timeout_seconds: float = Field(default=180.0, gt=0, le=600)
     max_attempts: int = Field(default=3, ge=1, le=8)
     base_backoff_seconds: float = Field(default=0.5, ge=0, le=60)
     max_backoff_seconds: float = Field(default=30.0, ge=0, le=300)

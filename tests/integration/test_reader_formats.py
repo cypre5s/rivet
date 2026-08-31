@@ -96,6 +96,36 @@ async def test_unknown_binary_returns_unsupported_metadata() -> None:
     await scope.close()
 
 
+@pytest.mark.asyncio
+async def test_video_frame_budget_extracts_real_bounded_frame_evidence() -> None:
+    """--frames 必须真实解码视频帧，而不只是返回容器元数据。"""
+    scope = ResourceScope("reader.integration.video_frames")
+    service = ReaderService(FIXTURE_ROOT, scope=scope)
+
+    result = await service.read(
+        ReaderRequest(
+            source_path="sample.mp4",
+            max_video_frames=3,
+            timeout_seconds=15,
+        )
+    )
+
+    frames = result.metadata["extracted_frames"]
+    assert isinstance(frames, list)
+    assert 1 <= len(frames) <= 3
+    for frame in frames:
+        assert isinstance(frame, dict)
+        size_bytes = frame.get("size_bytes")
+        digest = frame.get("sha256")
+        assert isinstance(size_bytes, int)
+        assert size_bytes > 0
+        assert isinstance(digest, str)
+        assert digest.startswith("sha256:")
+    assert f"video_frames={len(frames)}" in result.content
+    await scope.close()
+    scope.assert_empty()
+
+
 def test_rivet_read_json_returns_contract() -> None:
     completed = subprocess.run(
         [

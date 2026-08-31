@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import wave
+from pathlib import Path
 
 from pydantic import JsonValue
 
@@ -12,6 +14,51 @@ from rivet.contracts.readers import ReaderStatus, SupportLevel
 
 from .base import ReaderContext, ReaderError, ReaderPayload
 from .worker_protocol import parse_worker_output, run_reader_worker
+
+
+def _configured_transcription_model() -> Path | None:
+    """解析显式模型或用户数据目录中的固定 tiny 模型，绝不自动下载。"""
+    configured = os.environ.get("RIVET_TRANSCRIPTION_MODEL_PATH")
+    if configured:
+        candidate = Path(configured).expanduser()
+        cache_root: Path | None = None
+    else:
+        data_home = os.environ.get("XDG_DATA_HOME")
+        root = (
+            Path(data_home).expanduser() if data_home else Path.home() / ".local/share"
+        )
+        candidate = root / "rivet/models/faster-whisper-tiny"
+        cache_root = candidate
+
+    def valid_model(path: Path) -> Path | None:
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError:
+            return None
+        if resolved.is_dir() and (resolved / "model.bin").is_file():
+            return resolved
+        return None
+
+    direct = valid_model(candidate)
+    if direct is not None:
+        return direct
+    if cache_root is None:
+        return None
+    try:
+        reference = (
+            (cache_root / "models--Systran--faster-whisper-tiny/refs/main")
+            .read_text(encoding="ascii")
+            .strip()
+        )
+    except (OSError, UnicodeError):
+        return None
+    if len(reference) != 40 or any(
+        character not in "0123456789abcdef" for character in reference
+    ):
+        return None
+    return valid_model(
+        cache_root / "models--Systran--faster-whisper-tiny/snapshots" / reference
+    )
 
 
 class MediaReader:
@@ -44,11 +91,26 @@ class MediaReader:
             )
             warnings: list[str] = []
         else:
-            output = parse_worker_output(await run_reader_worker(context, mode="media"))
+            output = parse_worker_output(
+                await run_reader_worker(
+                    context,
+                    mode="media",
+                    arguments=(
+                        "--max-frames",
+                        str(context.request.max_video_frames),
+                        "--max-image-pixels",
+                        str(context.request.max_image_pixels),
+                    ),
+                )
+            )
             metadata = output.metadata
             content = output.content
             warnings = list(output.warnings)
         status = ReaderStatus.SUCCESS
+        if "reader.video.pixel_limit_exceeded" in warnings:
+            status = ReaderStatus.FAILED
+        elif "reader.video.frame_extraction_failed" in warnings:
+            status = ReaderStatus.DEGRADED
         duration = metadata.get("duration_seconds")
         if (
             isinstance(duration, (int, float))
@@ -59,9 +121,30 @@ class MediaReader:
         if context.request.enable_transcription:
             if importlib.util.find_spec("faster_whisper") is None:
                 warnings.append("reader.media.transcription_unavailable")
+                status = ReaderStatus.DEGRADED
             else:
-                warnings.append("reader.media.transcription_model_not_configured")
-            status = ReaderStatus.DEGRADED
+                model_path = _configured_transcription_model()
+                if model_path is None:
+                    warnings.append("reader.media.transcription_model_not_configured")
+                    status = ReaderStatus.DEGRADED
+                else:
+                    try:
+                        transcription = parse_worker_output(
+                            await run_reader_worker(
+                                context,
+                                mode="transcription",
+                                arguments=("--model-path", str(model_path)),
+                            )
+                        )
+                    except ReaderError:
+                        warnings.append("reader.media.transcription_failed")
+                        status = ReaderStatus.DEGRADED
+                    else:
+                        content += f"\n## Transcription\n{transcription.content}"
+                        metadata.update(transcription.metadata)
+                        warnings.extend(transcription.warnings)
+                        if transcription.warnings:
+                            status = ReaderStatus.DEGRADED
         if context.request.enable_ocr and context.inspection.media_type.startswith(
             "video/"
         ):

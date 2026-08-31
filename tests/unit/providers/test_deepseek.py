@@ -35,6 +35,11 @@ DEEPSEEK_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 LOCAL_TOOL_CALL_ID_PATTERN = re.compile(r"^call_[a-z0-9][a-z0-9_-]{0,62}$")
 
 
+def test_default_timeout_allows_reasoning_tool_turns() -> None:
+    """推理模型在工具观察后的续写不应被一分钟默认值过早终止。"""
+    assert DeepSeekConfig().timeout_seconds == 180.0
+
+
 def _tool_definition(name: str) -> ToolDefinition:
     """构造带点分本地名称的最小工具契约。"""
     return ToolDefinition(

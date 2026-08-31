@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import signal
 import sys
 import unicodedata
@@ -17,7 +18,7 @@ from typing import TypedDict, cast
 
 from pydantic import JsonValue
 
-from rivet.cli.config import load_config
+from rivet.cli.config import CONFIG_FIELDS, load_config, save_user_config
 from rivet.cli.errors import CliConfigurationError
 from rivet.cli.modules import ModuleCommandController
 from rivet.contracts.ipc import IpcRequest
@@ -32,6 +33,8 @@ MAX_COMMAND_OUTPUT_BYTES = 8 * 1024 * 1024
 MAX_FILE_LIST_RESULTS = 2_000
 MAX_SELECTED_CONTEXT_FILES = 20
 MAX_TUI_QUERY_CHARS = 65_536
+MAX_SESSION_API_KEY_CHARS = 4_096
+MODEL_NAME_PATTERN = re.compile(r"[a-z0-9][a-z0-9._-]{0,127}")
 OFFICIAL_TUI_COMMANDS = frozenset(
     {
         "abort",
@@ -99,7 +102,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
     ) -> None:
         super().__init__(repository)
         self._repository = repository.resolve(strict=True)
-        self._environment = os.environ if environment is None else environment
+        self._environment = dict(os.environ if environment is None else environment)
         self._runner = runner or self._run_subprocess
         self._command_lock = asyncio.Lock()
         self._permissions: dict[str, asyncio.Future[bool]] = {}
@@ -121,12 +124,8 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 }
             )
             return payload
-        payload.update(
-            {
-                "credential_configured": config.credential_configured,
-                "model": config.model,
-            }
-        )
+        payload.update(cast(dict[str, JsonValue], config.public_mapping()))
+        payload["sources"] = cast(JsonValue, config.sources)
         return payload
 
     async def handle(
@@ -143,12 +142,19 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 emit=emit,
                 cancel_event=cancel_event,
             )
+        if request.method == "config.get":
+            return self._public_configuration()
+        if request.method == "config.update":
+            async with self._command_lock:
+                return await self._update_configuration(request, emit=emit)
         if request.method == "permission.resolve":
             return await self._resolve_permission(request, emit=emit)
         if request.method == "workspace.files":
             return await self._list_repository_files(request, emit=emit)
         if request.method == "sessions.list":
             return await self._list_sessions(request, emit=emit)
+        if request.method == "transactions.list":
+            return await self._list_transactions(request, emit=emit)
         if request.method in {"module.list", "module.show", "module.operation"}:
             async with self._command_lock:
                 return await self._handle_module_request(request, emit=emit)
@@ -184,15 +190,19 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 command,
                 context_paths=context_paths,
             )
-            if command == "fix":
+            resumes_fix = command == "resume" and self._resume_command_is_fix(request)
+            if command == "fix" or resumes_fix:
                 await self._request_fix_permission(
+                    command=command,
                     emit=emit,
                     cancel_event=cancel_event,
                 )
                 arguments = (*arguments, "--yes")
             execution = await self._runner(arguments, emit)
             payload = self._decode_execution(execution)
-            accepted_return_codes = {0, 4} if command in {"fix", "verify"} else {0}
+            accepted_return_codes = (
+                {0, 4} if command in {"fix", "read", "resume", "verify"} else {0}
+            )
             if execution.return_code not in accepted_return_codes:
                 self._raise_execution_error(execution)
             await self._emit_payload(command, payload, emit=emit)
@@ -287,6 +297,92 @@ class CommandWorkerApplication(BaseWorkerApplication):
             },
         )
         return cast(JsonValue, payload)
+
+    def _public_configuration(self) -> dict[str, JsonValue]:
+        """返回可投影到 TUI 的非秘密有效配置。"""
+        try:
+            config = load_config(
+                self._repository,
+                environment=self._environment,
+            )
+        except CliConfigurationError as error:
+            raise WorkerMethodError(
+                "config.load_failed",
+                "运行时配置无法读取",
+                error.next_action,
+            ) from error
+        payload = cast(dict[str, JsonValue], config.public_mapping())
+        payload["sources"] = cast(JsonValue, config.sources)
+        return payload
+
+    async def _update_configuration(
+        self,
+        request: IpcRequest,
+        *,
+        emit: EmitEvent,
+    ) -> dict[str, JsonValue]:
+        """原子保存非秘密配置，并只在 Worker 内存中更新会话凭据。"""
+        allowed = {*CONFIG_FIELDS, "api_key", "api_key_action"}
+        if set(request.params) - allowed:
+            raise self._configuration_update_error()
+        action = request.params.get("api_key_action", "keep")
+        if action not in {"keep", "replace", "clear"}:
+            raise self._configuration_update_error()
+        raw_key = request.params.get("api_key")
+        if action == "replace":
+            if (
+                not isinstance(raw_key, str)
+                or not raw_key
+                or len(raw_key) > MAX_SESSION_API_KEY_CHARS
+                or raw_key != raw_key.strip()
+                or any(
+                    character.isspace() or unicodedata.category(character) == "Cc"
+                    for character in raw_key
+                )
+            ):
+                raise self._configuration_update_error()
+        elif raw_key is not None:
+            raise self._configuration_update_error()
+
+        values = {
+            field: request.params[field]
+            for field in CONFIG_FIELDS
+            if field in request.params
+        }
+        models = values.get("models")
+        model = values.get("model")
+        if models is not None and (
+            not isinstance(models, list)
+            or model is not None
+            and (not isinstance(model, str) or model.strip() not in models)
+        ):
+            raise self._configuration_update_error()
+        try:
+            if values:
+                save_user_config(values, environment=self._environment)
+        except CliConfigurationError as error:
+            raise WorkerMethodError(
+                "config.update_invalid",
+                "运行时配置无效或无法安全保存",
+                error.next_action,
+            ) from error
+
+        if action == "replace":
+            self._environment["DEEPSEEK_API_KEY"] = cast(str, raw_key)
+        elif action == "clear":
+            self._environment.pop("DEEPSEEK_API_KEY", None)
+        payload = self._public_configuration()
+        await emit("config.updated", payload)
+        return payload
+
+    @staticmethod
+    def _configuration_update_error() -> WorkerMethodError:
+        """返回不会包含请求原值的稳定配置更新错误。"""
+        return WorkerMethodError(
+            "config.update_invalid",
+            "运行时配置参数无效",
+            "检查模型列表、连接参数和会话凭据后重试",
+        )
 
     async def _module_application(self) -> ModuleCommandController:
         """惰性创建长驻控制器，打开面板不会唤醒可选模块。"""
@@ -564,9 +660,57 @@ class CommandWorkerApplication(BaseWorkerApplication):
         )
         return {"sessions": json_sessions}
 
+    async def _list_transactions(
+        self,
+        request: IpcRequest,
+        *,
+        emit: EmitEvent,
+    ) -> JsonValue:
+        """按需读取经过事务契约校验的近期事务摘要。"""
+        limit = request.params.get("limit", 20)
+        if (
+            not isinstance(limit, int)
+            or isinstance(limit, bool)
+            or not 1 <= limit <= 100
+        ):
+            raise WorkerMethodError(
+                "transaction.limit_invalid",
+                "事务数量上限无效",
+                "使用 1 到 100 之间的结果上限",
+            )
+        from rivet.transaction.errors import TransactionError
+        from rivet.transaction.store import TransactionStore
+
+        store = TransactionStore(self._repository / ".rivet" / "transactions")
+        try:
+            records = store.list_recent_records(limit=limit)
+        except TransactionError as error:
+            raise WorkerMethodError(
+                "transaction.list_invalid",
+                "近期事务目录无法安全读取",
+                "运行 rivet doctor 并检查本地事务状态",
+            ) from error
+        transactions: list[JsonValue] = [
+            {
+                "evidence_id": record.evidence_id,
+                "state": record.state.value,
+                "transaction_id": record.transaction_id,
+            }
+            for record in records
+        ]
+        await emit(
+            "transactions.snapshot",
+            {
+                "summary": f"已加载 {len(transactions)} 个近期事务",
+                "transactions": transactions,
+            },
+        )
+        return {"transactions": transactions}
+
     async def _request_fix_permission(
         self,
         *,
+        command: str,
         emit: EmitEvent,
         cancel_event: asyncio.Event,
     ) -> None:
@@ -577,7 +721,11 @@ class CommandWorkerApplication(BaseWorkerApplication):
         await emit(
             "permission.requested",
             {
-                "argv": "rivet fix --yes",
+                "argv": (
+                    "rivet fix --yes"
+                    if command == "fix"
+                    else "rivet resume SESSION_ID --yes"
+                ),
                 "cwd": ".",
                 "network": "仅模型 Provider",
                 "paths": "隔离事务 Worktree",
@@ -603,9 +751,22 @@ class CommandWorkerApplication(BaseWorkerApplication):
         if not approved:
             raise WorkerMethodError(
                 "guard.permission_denied",
-                "用户拒绝 fix 权限请求",
+                "用户拒绝 fix 或其恢复操作的权限请求",
                 "调整任务范围后重新提交",
             )
+
+    def _resume_command_is_fix(self, request: IpcRequest) -> bool:
+        """只对经过完整性校验且来源为 fix 的会话恢复请求追加授权。"""
+        session_id = request.params.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        from rivet.storage.sessions import SessionStore
+
+        try:
+            checkpoint = SessionStore(self._repository).load(session_id)
+        except (KeyError, OSError, ValueError):
+            return False
+        return checkpoint.command == "fix"
 
     async def _resolve_permission(
         self,
@@ -656,9 +817,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
         if model is not None:
             if (
                 not isinstance(model, str)
-                or not model
-                or len(model) > 128
-                or model.startswith("-")
+                or MODEL_NAME_PATTERN.fullmatch(model) is None
             ):
                 raise WorkerMethodError(
                     "config.model_invalid",
@@ -691,9 +850,69 @@ class CommandWorkerApplication(BaseWorkerApplication):
                     )
                 query = f"{query}{context_suffix}"
             return (*prefix, query)
-        if command in {"read", "init"}:
+        if command == "read":
             path = request.params.get("file")
-            if path is None and command == "init":
+            if not isinstance(path, str) or not path or len(path) > 4_096:
+                raise WorkerMethodError(
+                    "workspace.path_invalid",
+                    "仓库路径无效",
+                    "从 /files 选择仓库内路径",
+                )
+            allowed_keys = {
+                "file",
+                "frames",
+                "max_audio_duration",
+                "max_image_pixels",
+                "max_ocr_pages",
+                "max_output_chars",
+                "ocr",
+                "timeout",
+                "transcribe",
+            }
+            if not set(request.params).issubset(allowed_keys):
+                raise WorkerMethodError(
+                    "reader.options_invalid",
+                    "Reader 包含不支持的增强参数",
+                    "使用 /read 帮助中列出的有界参数",
+                )
+            arguments = (*prefix, path)
+            for parameter, option in (("ocr", "--ocr"), ("transcribe", "--transcribe")):
+                enabled = request.params.get(parameter, False)
+                if not isinstance(enabled, bool):
+                    raise WorkerMethodError(
+                        "reader.options_invalid",
+                        "Reader 开关参数无效",
+                        "OCR 和转录开关只能显式启用或关闭",
+                    )
+                if enabled:
+                    arguments = (*arguments, option)
+            numeric_options = (
+                ("frames", "--frames", 0, 20),
+                ("max_ocr_pages", "--max-ocr-pages", 0, 100),
+                ("max_image_pixels", "--max-image-pixels", 1, 100_000_000),
+                ("max_audio_duration", "--max-audio-duration", 1, 86_400),
+                ("max_output_chars", "--max-output-chars", 1, 4_000_000),
+                ("timeout", "--timeout", 1, 3_600),
+            )
+            for parameter, option, minimum, maximum in numeric_options:
+                value = request.params.get(parameter)
+                if value is None:
+                    continue
+                if (
+                    isinstance(value, bool)
+                    or not isinstance(value, int)
+                    or not minimum <= value <= maximum
+                ):
+                    raise WorkerMethodError(
+                        "reader.options_invalid",
+                        f"Reader 参数 {option} 超出允许范围",
+                        f"使用 {minimum} 到 {maximum} 的整数",
+                    )
+                arguments = (*arguments, option, str(value))
+            return arguments
+        if command == "init":
+            path = request.params.get("file")
+            if path is None:
                 return prefix
             if not isinstance(path, str) or not path or len(path) > 4_096:
                 raise WorkerMethodError(
@@ -829,6 +1048,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 "RIVET_MAX_ROUNDS",
                 "RIVET_MAX_TOTAL_TOKENS",
                 "RIVET_MODEL",
+                "RIVET_MODELS",
                 "RIVET_SAFE_MODE",
                 "TZ",
                 "XDG_CACHE_HOME",
@@ -1111,6 +1331,46 @@ class CommandWorkerApplication(BaseWorkerApplication):
         emit: EmitEvent,
     ) -> None:
         """把同一命令结果投影为 TUI 各面板消费的结构化事件。"""
+        if command == "read":
+            status = payload.get("status")
+            warnings = payload.get("warnings")
+            warning_text = (
+                "；".join(item for item in warnings if isinstance(item, str))
+                if isinstance(warnings, list)
+                else ""
+            )
+            content = payload.get("content")
+            content_text = content if isinstance(content, str) else ""
+            metadata = payload.get("metadata")
+            metadata_text = (
+                json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
+                if isinstance(metadata, dict)
+                else ""
+            )
+            detail = content_text.strip() or metadata_text or "Reader 未返回可显示正文"
+            if warning_text:
+                detail = f"{detail}\n警告：{warning_text}"
+            detail = "".join(
+                character
+                for character in detail
+                if character in {"\n", "\t"}
+                or unicodedata.category(character) not in {"Cc", "Cf"}
+            )
+            if len(detail) > 12_000:
+                detail = f"{detail[:12_000]}\n…TUI 展示已截断"
+            await emit(
+                "reader.completed",
+                {
+                    "detected_format": payload.get("detected_format", "unknown"),
+                    "path": payload.get("source_path", "unknown"),
+                    "reader_id": payload.get("reader_id", "unknown"),
+                    "status": status if isinstance(status, str) else "UNKNOWN",
+                    "summary": f"[不可信文件内容]\n{detail}",
+                    "support_level": payload.get("support_level", "C"),
+                    "truncated": payload.get("truncated", False),
+                    "untrusted": True,
+                },
+            )
         answer = payload.get("answer")
         if isinstance(answer, str) and answer:
             model_status = payload.get("model_status", payload.get("status"))
@@ -1147,10 +1407,25 @@ class CommandWorkerApplication(BaseWorkerApplication):
         if isinstance(diff, str):
             await emit("patch.updated", {"diff": diff, "summary": "补丁已更新"})
         status = payload.get("status")
-        if isinstance(status, str) and command in {"fix", "verify"}:
+        verification_status = payload.get("verification_status")
+        projected_verification_status = (
+            verification_status
+            if command == "resume" and isinstance(verification_status, str)
+            else status
+            if command in {"fix", "verify"}
+            else None
+        )
+        if isinstance(projected_verification_status, str) and command in {
+            "fix",
+            "resume",
+            "verify",
+        }:
             await emit(
                 "verification.completed",
-                {"status": status, "summary": "验证已完成"},
+                {
+                    "status": projected_verification_status,
+                    "summary": "验证已完成",
+                },
             )
         evidence_id = payload.get("evidence_id")
         if isinstance(evidence_id, str):

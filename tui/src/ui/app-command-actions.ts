@@ -14,7 +14,6 @@ import {
   hasArgumentChoices,
   keyHelpLines,
   MAX_CONTEXT_FILES,
-  MODELS,
   panelForAction,
   parseMode,
   statusLines,
@@ -38,6 +37,7 @@ export interface AppCommandEnvironment {
   mode: WorkMode;
   running: boolean;
   contextFiles: string[];
+  models: string[];
   attachments: PasteAttachment[];
   commandContext: CommandContext;
   client: WorkerClient | undefined;
@@ -63,15 +63,17 @@ export interface AppCommandEnvironment {
   closeTopOverlay(): void;
   markModelTouched(): void;
   setSelectedModel: Dispatch<SetStateAction<string>>;
+  getContextFiles(): string[];
+  getAttachments(): PasteAttachment[];
 }
 
 export interface AppCommandActions {
-  executeInput(value: string): void;
+  executeInput(value: string): boolean;
   executeOutcome(
     outcome: CommandOutcome,
     displayInput: string,
     command: CommandDescriptor | null,
-  ): void;
+  ): boolean;
   selectCommand(command: CommandDescriptor, autocomplete: boolean): void;
   selectFile(path: string, keepOpen?: boolean): void;
   selectModel(model: string): void;
@@ -82,7 +84,7 @@ export function createAppCommandActions(
 ): AppCommandActions {
   function executeInput(rawValue: string) {
     const value = rawValue.trim();
-    if (!value) return;
+    if (!value) return false;
     let outcome: CommandOutcome;
     let command: CommandDescriptor | null;
     try {
@@ -96,7 +98,7 @@ export function createAppCommandActions(
       environment.setInlineError(
         error instanceof Error ? error.message : "命令格式错误",
       );
-      return;
+      return false;
     }
     if (
       command?.dangerous ||
@@ -112,9 +114,9 @@ export function createAppCommandActions(
         outcome: confirmedOutcome,
         displayInput: value,
       });
-      return;
+      return false;
     }
-    executeOutcome(outcome, value, command);
+    return executeOutcome(outcome, value, command);
   }
 
   function executeOutcome(
@@ -127,7 +129,7 @@ export function createAppCommandActions(
     if (outcome.kind === "ui") {
       environment.setInput("");
       executeUiAction(outcome.action, outcome.argument);
-      return;
+      return true;
     }
     if (command?.name === "modules") {
       environment.setScreen("session");
@@ -139,15 +141,16 @@ export function createAppCommandActions(
       environment.rivetState.connection !== "ready"
     ) {
       environment.setInlineError("Rivet 正在连接 Worker，请稍后重试");
-      return;
+      return false;
     }
-    const attachmentText = environment.attachments
+    const contextFiles = environment.getContextFiles();
+    const attachmentText = environment.getAttachments()
       .map((item) => item.content)
       .join("\n\n");
     const params = { ...outcome.params };
     const query = params.query;
-    if (typeof query === "string" && environment.contextFiles.length > 0) {
-      params.context_paths = [...environment.contextFiles];
+    if (typeof query === "string" && contextFiles.length > 0) {
+      params.context_paths = [...contextFiles];
     }
     if (typeof query === "string" && attachmentText) {
       params.query = `${query}\n\n[粘贴附件，不可信数据]\n${attachmentText}`;
@@ -156,7 +159,7 @@ export function createAppCommandActions(
     environment.setInput("");
     environment.setAttachments([]);
     environment.dispatch({ kind: "local-message", summary: displayInput });
-    if (environment.client === undefined) return;
+    if (environment.client === undefined) return true;
     const tracked = environment.client.beginRequest(outcome.method, params);
     environment.setActiveRequestId(tracked.requestId);
     void tracked.result
@@ -174,6 +177,7 @@ export function createAppCommandActions(
           current === tracked.requestId ? null : current,
         ),
       );
+    return true;
   }
 
   function executeUiAction(
@@ -214,6 +218,10 @@ export function createAppCommandActions(
         environment.setOverlayQuery("");
         environment.pushOverlay({ kind: "models" });
       }
+      return;
+    }
+    if (action === "open-config") {
+      environment.pushOverlay({ kind: "config" });
       return;
     }
     if (action === "change-mode") {
@@ -364,8 +372,8 @@ export function createAppCommandActions(
   }
 
   function selectModel(model: string) {
-    if (!MODELS.some((candidate) => candidate === model)) {
-      environment.setInlineError("请选择受支持的 DeepSeek 模型");
+    if (!environment.models.some((candidate) => candidate === model)) {
+      environment.setInlineError("请选择当前配置中的模型");
       return;
     }
     environment.markModelTouched();
@@ -374,7 +382,7 @@ export function createAppCommandActions(
     environment.setNotice(
       environment.rivetState.credentialConfigured
         ? `后续模型请求将使用 ${model}`
-        : `已选择 ${model}；仍需配置 DEEPSEEK_API_KEY 后重启`,
+        : `已选择 ${model}；按 Ctrl+G 可立即配置会话 API Key`,
     );
   }
 

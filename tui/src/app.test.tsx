@@ -9,6 +9,7 @@ import { initialRivetState, type RivetState } from "./state/reducer.ts";
 
 class CaptureTransport implements WorkerTransport {
   readonly writes: string[] = [];
+  private nextSequence = 0;
   private readonly stdoutListeners = new Set<(chunk: string) => void>();
   private readonly stderrListeners = new Set<(chunk: string) => void>();
   private readonly exitListeners = new Set<(exitCode: number | null) => void>();
@@ -18,7 +19,10 @@ class CaptureTransport implements WorkerTransport {
     const request = JSON.parse(line) as IpcRequest;
     if (
       request.method === "worker.handshake" ||
-      request.method === "sessions.list"
+      request.method === "sessions.list" ||
+      request.method === "transactions.list" ||
+      request.method === "command.read" ||
+      request.method === "config.update"
     ) {
       queueMicrotask(() => {
         if (request.method === "sessions.list") {
@@ -28,11 +32,46 @@ class CaptureTransport implements WorkerTransport {
             protocol_version: 1,
             event_id: "event_sessions",
             event_type: "sessions.snapshot",
-            sequence: 0,
+            sequence: this.nextSequence++,
             payload: { sessions: ["session_recent"] },
           })}\n`;
           for (const listener of this.stdoutListeners) listener(event);
         }
+        if (request.method === "transactions.list") {
+          const event = `${JSON.stringify({
+            schema_version: 1,
+            message_type: "event",
+            protocol_version: 1,
+            event_id: "event_transactions",
+            event_type: "transactions.snapshot",
+            sequence: this.nextSequence++,
+            payload: {
+              transactions: [
+                {
+                  transaction_id: "tx_recent",
+                  state: "VERIFIED",
+                  evidence_id: "evidence_recent",
+                },
+              ],
+            },
+          })}\n`;
+          for (const listener of this.stdoutListeners) listener(event);
+        }
+        const configResult =
+          request.method === "config.update"
+            ? {
+                base_url: request.params.base_url,
+                credential_configured:
+                  request.params.api_key_action !== "clear",
+                max_cost_usd: request.params.max_cost_usd,
+                max_rounds: request.params.max_rounds,
+                max_total_tokens: request.params.max_total_tokens,
+                model: request.params.model,
+                models: request.params.models,
+                safe_mode: request.params.safe_mode,
+                sources: {},
+              }
+            : null;
         const response = `${JSON.stringify({
           schema_version: 1,
           message_type: "response",
@@ -42,7 +81,25 @@ class CaptureTransport implements WorkerTransport {
           result:
             request.method === "sessions.list"
               ? { sessions: ["session_recent"] }
-              : { status: "ready" },
+              : request.method === "transactions.list"
+                ? {
+                    transactions: [
+                      {
+                        transaction_id: "tx_recent",
+                        state: "VERIFIED",
+                        evidence_id: "evidence_recent",
+                      },
+                    ],
+                  }
+              : request.method === "command.read"
+                ? {
+                    detected_format: "image",
+                    source_path: request.params.file,
+                    reader_id: "reader.image",
+                    status: "DEGRADED",
+                    content: "OCR dependency unavailable",
+                  }
+                : configResult ?? { status: "ready" },
           error: null,
         })}\n`;
         for (const listener of this.stdoutListeners) listener(response);
@@ -66,6 +123,19 @@ class CaptureTransport implements WorkerTransport {
   }
 
   close(): void {}
+
+  emitEvent(eventType: string, payload: Record<string, unknown>, sequence = 0): void {
+    const line = `${JSON.stringify({
+      schema_version: 1,
+      message_type: "event",
+      protocol_version: 1,
+      event_id: `event_capture_${sequence}`,
+      event_type: eventType,
+      sequence,
+      payload,
+    })}\n`;
+    for (const listener of this.stdoutListeners) listener(line);
+  }
 }
 
 function readyState(overrides: Partial<RivetState> = {}): RivetState {
@@ -75,12 +145,198 @@ function readyState(overrides: Partial<RivetState> = {}): RivetState {
     repository: "/home/tester/rivet",
     branch: "main",
     model: "deepseek-v4-pro",
+    models: ["deepseek-v4-pro", "deepseek-v4-flash"],
     credentialConfigured: true,
     ...overrides,
   };
 }
 
 describe("Rivet OpenTUI experience", () => {
+  test("refreshes the model picker from a live Worker ready event", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp
+        initialState={initialRivetState()}
+        noColor={true}
+        client={client}
+      />,
+      { width: 100, height: 28 },
+    );
+    await act(async () => setup.renderOnce());
+    transport.emitEvent("worker.ready", {
+      repository: "/repo",
+      branch: "main",
+      credential_configured: true,
+      model: "live-reasoner",
+      models: ["live-chat", "live-reasoner"],
+      base_url: "https://gateway.example.test/v1",
+      max_rounds: 12,
+      max_total_tokens: 64_000,
+      max_cost_usd: null,
+      safe_mode: false,
+    });
+    await act(async () => Bun.sleep(30));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("模型 live-reasoner");
+
+    await act(async () => setup.mockInput.pressKey("k", { ctrl: true }));
+    await setup.flush();
+    const picker = setup.captureCharFrame();
+    expect(picker).toContain("live-chat");
+    expect(picker).not.toContain("deepseek-v4-flash");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("renders the configured model below the composer and selects dynamic models", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          model: "team-chat",
+          models: ["team-chat", "team-reasoner", "team-code"],
+        })}
+        noColor={true}
+        client={client}
+      />,
+      { width: 100, height: 28 },
+    );
+    await act(async () => setup.renderOnce());
+
+    const initial = setup.captureCharFrame();
+    expect(initial).toContain("模型 team-chat");
+    expect(initial).toContain("3 个可用模型");
+    await act(async () => setup.mockInput.pressKey("k", { ctrl: true }));
+    await setup.flush();
+    const picker = setup.captureCharFrame();
+    expect(picker).toContain("team-reasoner");
+    expect(picker).toContain("team-code");
+    expect(picker).not.toContain("deepseek-v4-flash");
+    await act(async () => setup.mockInput.pressArrow("down"));
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("模型 team-reasoner");
+    await act(async () => setup.mockInput.typeText("解释配置"));
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+    const command = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .find((item) => item.method === "command.ask");
+    expect(command?.params.model).toBe("team-reasoner");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("opens quick configuration without rendering or echoing the API key", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({ credentialConfigured: false })}
+        noColor={true}
+        client={client}
+      />,
+      { width: 110, height: 32 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("g", { ctrl: true }));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("连接与模型配置");
+    expect(setup.captureCharFrame()).toContain("仅保存在当前 Worker 会话");
+
+    const secret = "fixture-tui-value-that-must-be-masked";
+    await act(async () => setup.mockInput.typeText(secret));
+    await setup.flush();
+    const masked = setup.captureCharFrame();
+    expect(masked).not.toContain(secret);
+    expect(masked).toContain("•".repeat(secret.length));
+
+    await act(async () => setup.mockInput.pressKey("s", { ctrl: true }));
+    await act(async () => Bun.sleep(30));
+    await setup.flush();
+    const request = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .find((item) => item.method === "config.update");
+    expect(request?.params.api_key_action).toBe("replace");
+    expect(request?.params.api_key).toBe(secret);
+    expect(setup.captureCharFrame()).not.toContain(secret);
+    expect(setup.captureCharFrame()).toContain("配置已保存");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("clears a session API key only after an explicit configuration save", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 100, height: 28 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("g", { ctrl: true }));
+    await setup.flush();
+    await act(async () => setup.mockInput.pressKey("d", { ctrl: true }));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("保存后清除当前会话 Key");
+    await act(async () => setup.mockInput.pressKey("s", { ctrl: true }));
+    await setup.flush();
+
+    const request = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .find((item) => item.method === "config.update");
+    expect(request?.params.api_key_action).toBe("clear");
+    expect(request?.params.api_key).toBeUndefined();
+    expect(setup.captureCharFrame()).toContain("Key ○");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("keeps the configuration dialog open when endpoint validation fails", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 100, height: 28 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("g", { ctrl: true }));
+    await setup.flush();
+    await act(async () => setup.mockInput.pressTab());
+    await setup.flush();
+    await act(async () => setup.mockInput.pressKey("a", { ctrl: true }));
+    await act(async () => setup.mockInput.typeText("file:///tmp/provider"));
+    await setup.flush();
+    await act(async () => setup.mockInput.pressKey("s", { ctrl: true }));
+    await setup.flush();
+
+    expect(setup.captureCharFrame()).toContain("HTTP(S)");
+    expect(
+      transport.writes.some(
+        (line) =>
+          (JSON.parse(line) as IpcRequest).method === "config.update",
+      ),
+    ).toBeFalse();
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("keeps every configuration field reachable in a 40x12 terminal", async () => {
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} />,
+      { width: 40, height: 12 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("g", { ctrl: true }));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("连接与模型配置");
+
+    for (let index = 0; index < 7; index += 1) {
+      await act(async () => setup.mockInput.pressTab());
+      await setup.flush();
+    }
+    const compact = setup.captureCharFrame();
+    expect(compact).toContain("Safe Mode");
+    expect(compact.split("\n")).toHaveLength(13);
+    await act(async () => setup.renderer.destroy());
+  });
+
   test("renders a focused minimal welcome screen at every supported breakpoint", async () => {
     const sizes = [
       [40, 12],
@@ -387,6 +643,94 @@ describe("Rivet OpenTUI experience", () => {
     expect(frame).toContain("YOU");
     expect(frame).toContain("解释当前架构");
     expect(frame).not.toContain("● Tip");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("clears the composer after submitting a worker command", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 120, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+
+    await act(async () => {
+      await setup.mockInput.typeText("/read samples/image.png --ocr");
+      setup.mockInput.pressEnter();
+      await setup.flush();
+    });
+
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe("");
+    const request = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .find((item) => item.method === "command.read");
+    expect(request?.params).toEqual({
+      file: "samples/image.png",
+      ocr: true,
+    });
+
+    await act(async () => {
+      await setup.mockInput.typeText("/read samples/report.pdf --ocr");
+      setup.mockInput.pressEnter();
+      await setup.flush();
+    });
+    const readRequests = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .filter((item) => item.method === "command.read");
+    expect(readRequests).toHaveLength(2);
+    expect(readRequests[1]?.params).toEqual({
+      file: "samples/report.pdf",
+      ocr: true,
+    });
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe("");
+    expect(
+      setup.captureCharFrame().split("\n").slice(-4).join("\n"),
+    ).not.toContain("/read samples/report.pdf");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("keeps a rejected command in the composer for correction", async () => {
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} />,
+      { width: 120, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+
+    await act(async () => {
+      await setup.mockInput.typeText("/read sample.png --frames 21");
+      setup.mockInput.pressEnter();
+      await setup.flush();
+    });
+
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe(
+      "/read sample.png --frames 21",
+    );
+    expect(setup.captureCharFrame()).toContain("--frames");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("loads a verified historical transaction into the apply picker", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 120, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+
+    await act(async () => {
+      await setup.mockInput.typeText("/apply ");
+    });
+    await act(async () => Bun.sleep(30));
+    await setup.flush();
+
+    expect(
+      transport.writes
+        .map((line) => JSON.parse(line) as IpcRequest)
+        .some((request) => request.method === "transactions.list"),
+    ).toBeTrue();
+    expect(setup.captureCharFrame()).toContain("tx_recent");
     await act(async () => setup.renderer.destroy());
   });
 

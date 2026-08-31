@@ -49,15 +49,29 @@ export interface ModuleStatus {
   lastError: string | null;
 }
 
+export interface TransactionSummary {
+  transactionId: string;
+  state: string;
+  evidenceId: string | null;
+}
+
 export interface RivetState {
   connection: ConnectionState;
   repository: string;
   branch: string;
   model: string;
+  models: string[];
+  baseUrl: string;
+  maxRounds: number;
+  maxTotalTokens: number;
+  maxCostUsd: string | null;
+  safeMode: boolean;
+  configSources: Record<string, string>;
   credentialConfigured: boolean;
   sessionId: string | null;
   sessions: string[];
   transaction: string;
+  transactions: TransactionSummary[];
   plan: { phase: string; summary: string };
   context: Array<{ path: string; reason: string }>;
   fileTree: string[];
@@ -83,6 +97,7 @@ export type RivetAction =
     }
   | { kind: "local-error"; summary: string }
   | { kind: "local-message"; summary: string }
+  | { kind: "configuration-loaded"; payload: Record<string, JsonValue> }
   | { kind: "timeline-clear" };
 
 const MAX_TIMELINE_ITEMS = 500;
@@ -93,10 +108,18 @@ export function initialRivetState(): RivetState {
     repository: "未连接",
     branch: "",
     model: "未连接",
+    models: ["deepseek-v4-pro", "deepseek-v4-flash"],
+    baseUrl: "https://api.deepseek.com",
+    maxRounds: 24,
+    maxTotalTokens: 128_000,
+    maxCostUsd: null,
+    safeMode: false,
+    configSources: {},
     credentialConfigured: false,
     sessionId: null,
     sessions: [],
     transaction: "无",
+    transactions: [],
     plan: { phase: "IDLE", summary: "等待任务" },
     context: [],
     fileTree: [],
@@ -124,18 +147,18 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
   switch (event.event_type) {
     case "worker.ready":
     case "worker.recovered":
-      return {
-        ...next,
-        connection: "ready",
-        repository: text(event.payload.repository, state.repository),
-        model: text(event.payload.model, state.model),
-        branch: text(event.payload.branch, state.branch),
-        credentialConfigured: boolean(
-          event.payload.credential_configured,
-          state.credentialConfigured,
-        ),
-        error: null,
-      };
+      return projectConfiguration(
+        {
+          ...next,
+          connection: "ready",
+          repository: text(event.payload.repository, state.repository),
+          branch: text(event.payload.branch, state.branch),
+          error: null,
+        },
+        event.payload,
+      );
+    case "config.updated":
+      return projectConfiguration(next, event.payload);
     case "worker.crashed":
       return {
         ...next,
@@ -183,6 +206,11 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       return {
         ...next,
         transaction: text(event.payload.transaction_id, state.transaction),
+      };
+    case "transactions.snapshot":
+      return {
+        ...next,
+        transactions: transactionSummaryArray(event.payload.transactions),
       };
     case "patch.updated":
       return { ...next, diff: text(event.payload.diff, "") };
@@ -280,6 +308,9 @@ export function reduceRivetState(state: RivetState, action: RivetAction): RivetS
       timeline: [...state.timeline, item].slice(-MAX_TIMELINE_ITEMS),
     };
   }
+  if (action.kind === "configuration-loaded") {
+    return projectConfiguration(state, action.payload);
+  }
   if (action.kind === "local-error") {
     return { ...state, error: action.summary };
   }
@@ -290,6 +321,31 @@ export function reduceRivetState(state: RivetState, action: RivetAction): RivetS
     ...state,
     connection: "crashed",
     error: action.summary,
+  };
+}
+
+function projectConfiguration(
+  state: RivetState,
+  payload: Record<string, JsonValue>,
+): RivetState {
+  const models = stringArray(payload.models);
+  return {
+    ...state,
+    model: text(payload.model, state.model),
+    models: models.length > 0 ? models : state.models,
+    baseUrl: text(payload.base_url, state.baseUrl),
+    maxRounds: number(payload.max_rounds, state.maxRounds),
+    maxTotalTokens: number(payload.max_total_tokens, state.maxTotalTokens),
+    maxCostUsd:
+      payload.max_cost_usd === null
+        ? null
+        : text(payload.max_cost_usd, state.maxCostUsd ?? "") || null,
+    safeMode: boolean(payload.safe_mode, state.safeMode),
+    credentialConfigured: boolean(
+      payload.credential_configured,
+      state.credentialConfigured,
+    ),
+    configSources: stringRecord(payload.sources, state.configSources),
   };
 }
 
@@ -341,6 +397,37 @@ function boolean(value: JsonValue | undefined, fallback: boolean): boolean {
 
 function stringArray(value: JsonValue | undefined): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function transactionSummaryArray(value: JsonValue | undefined): TransactionSummary[] {
+  if (!Array.isArray(value)) return [];
+  const transactions: TransactionSummary[] = [];
+  for (const item of value) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
+    const transactionId = text(item.transaction_id, "");
+    const state = text(item.state, "");
+    if (!transactionId || !state) continue;
+    transactions.push({
+      transactionId,
+      state,
+      evidenceId: typeof item.evidence_id === "string" ? item.evidence_id : null,
+    });
+  }
+  return transactions;
+}
+
+function stringRecord(
+  value: JsonValue | undefined,
+  fallback: Record<string, string>,
+): Record<string, string> {
+  if (value === null || Array.isArray(value) || typeof value !== "object") {
+    return fallback;
+  }
+  const result: Record<string, string> = {};
+  for (const [key, item] of Object.entries(value)) {
+    if (typeof item === "string") result[key] = item;
+  }
+  return result;
 }
 
 function moduleStatusArray(value: JsonValue | undefined): ModuleStatus[] {

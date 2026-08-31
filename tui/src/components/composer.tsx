@@ -31,6 +31,8 @@ export function Composer({
   placeholder,
   mode,
   modelLabel,
+  modelCount,
+  credentialConfigured,
   focused,
   compact,
   running,
@@ -44,11 +46,15 @@ export function Composer({
   onRemoveAttachment,
   onLargePaste,
   onPathPaste,
+  onOpenModels,
+  onOpenConfig,
 }: {
   value: string;
   placeholder: string;
   mode: WorkMode;
   modelLabel: string;
+  modelCount: number;
+  credentialConfigured: boolean;
   focused: boolean;
   compact: boolean;
   running: boolean;
@@ -57,11 +63,13 @@ export function Composer({
   error: string | null;
   theme: RivetTheme;
   onInput(value: string): void;
-  onSubmit(value: string): void;
+  onSubmit(value: string): boolean;
   onRemoveContext(path: string): void;
   onRemoveAttachment(id: string): void;
   onLargePaste(content: string): void;
   onPathPaste(path: string): void;
+  onOpenModels(): void;
+  onOpenConfig(): void;
 }) {
   const editor = useRef<TextareaRenderable | null>(null);
 
@@ -70,7 +78,7 @@ export function Composer({
     if (current === null || current.plainText === value) return;
     current.setText(value);
     current.cursorOffset = value.length;
-  }, [value]);
+  });
 
   usePaste((event) => {
     if (!focused) return;
@@ -145,13 +153,32 @@ export function Composer({
           cursorColor={theme.accent}
           keyBindings={COMPOSER_KEY_BINDINGS}
           onContentChange={() => onInput(editor.current?.plainText ?? "")}
-          onSubmit={() => onSubmit(editor.current?.plainText ?? value)}
+          onSubmit={() => {
+            const current = editor.current;
+            const submitted = current?.plainText ?? value;
+            if (!onSubmit(submitted) || current === null) return;
+            current.setText("");
+            current.cursorOffset = 0;
+            onInput("");
+          }}
         />
         <box height={1} flexDirection="row" justifyContent="space-between">
-          <text
-            fg={theme.textSecondary}
-            content={`${mode} · ${modelLabel}`}
-          />
+          <box flexDirection="row" gap={1}>
+            <box onMouseDown={onOpenModels}>
+              <text
+                fg={theme.textSecondary}
+                content={`${mode} · 模型 ${modelLabel} ▾ · ${modelCount} 个可用模型`}
+              />
+            </box>
+            {compact ? null : (
+              <box onMouseDown={onOpenConfig}>
+                <text
+                  fg={credentialConfigured ? theme.success : theme.warning}
+                  content={credentialConfigured ? "Key ●" : "Key ○ · Ctrl+G 配置"}
+                />
+              </box>
+            )}
+          </box>
           <text
             fg={running ? theme.warning : theme.textMuted}
             content={

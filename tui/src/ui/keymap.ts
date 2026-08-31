@@ -4,6 +4,8 @@ export type KeyCommand =
   | "palette.open"
   | "files.open"
   | "history.open"
+  | "models.open"
+  | "config.open"
   | "leader.open"
   | "timeline.clear"
   | "task.cancel"
@@ -76,6 +78,8 @@ export function resolveKeyCommand(key: KeyDescriptor): KeyCommand | null {
   if (key.ctrl && key.name === "o") return "files.open";
   if (key.ctrl && key.shift && key.name === "r") return "worker.recover";
   if (key.ctrl && key.name === "r") return "history.open";
+  if (key.ctrl && key.name === "k") return "models.open";
+  if (key.ctrl && key.name === "g") return "config.open";
   if (key.ctrl && key.name === "x") return "leader.open";
   if (key.ctrl && key.name === "l") return "timeline.clear";
   if (key.ctrl && key.name === "c") return "task.cancel";

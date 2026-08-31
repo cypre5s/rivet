@@ -16,13 +16,15 @@ import {
 import { SessionScreen } from "./components/session-screen.tsx";
 import { createTheme, type ThemeName } from "./components/theme.ts";
 import { WelcomeScreen } from "./components/welcome-screen.tsx";
+import type { JsonValue } from "./contracts/ipc.ts";
 import { useCommandOptions } from "./hooks/use-command-options.ts";
 import { useAppKeyboard } from "./hooks/use-app-keyboard.ts";
 import { useRepositoryFiles } from "./hooks/use-repository-files.ts";
 import { useSessionList } from "./hooks/use-session-list.ts";
+import { useTransactionList } from "./hooks/use-transaction-list.ts";
 import { useTuiPreferences } from "./hooks/use-tui-preferences.ts";
 import { useWorkerConnection } from "./hooks/use-worker-connection.ts";
-import type { WorkerClient } from "./ipc/client.ts";
+import { WorkerResponseError, type WorkerClient } from "./ipc/client.ts";
 import {
   initialRivetState,
   reduceRivetState,
@@ -46,9 +48,17 @@ import {
   slashQuery,
 } from "./ui/commands.ts";
 import { computeLayout } from "./ui/layout.ts";
+import {
+  configurationPayload,
+  createConfigurationDraft,
+  validateConfigurationDraft,
+  type ConfigurationDraft,
+  type PublicRuntimeConfiguration,
+} from "./ui/runtime-config.ts";
 
 export interface RivetAppProps {
   initialState?: RivetState;
+  loadPreferences?: boolean;
   noColor?: boolean;
   client?: WorkerClient;
   onPermission?: (requestId: string, approved: boolean) => void;
@@ -57,13 +67,15 @@ export interface RivetAppProps {
 }
 
 export function RivetApp({
-  initialState = initialRivetState(),
+  initialState: suppliedInitialState,
+  loadPreferences,
   noColor = process.env.NO_COLOR !== undefined,
   client,
   onPermission,
   onRecover,
   onExit,
 }: RivetAppProps) {
+  const initialState = suppliedInitialState ?? initialRivetState();
   const [state, dispatch] = useReducer(reduceRivetState, initialState);
   const [screen, setScreen] = useState<"welcome" | "session">(
     initialState.sessionId !== null || initialState.timeline.length > 0
@@ -86,9 +98,16 @@ export function RivetApp({
   const [recentCommandIds, setRecentCommandIds] = useState<string[]>([]);
   const [inlineError, setInlineError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [configurationDraft, setConfigurationDraft] = useState(
+    createConfigurationDraft(configurationFromState(initialState)),
+  );
+  const [configurationErrors, setConfigurationErrors] = useState<string[]>([]);
+  const [configurationSaving, setConfigurationSaving] = useState(false);
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
   const [welcomeIndex, setWelcomeIndex] = useState(0);
   const modelTouched = useRef(false);
+  const contextFilesRef = useRef(contextFiles);
+  const attachmentsRef = useRef(attachments);
   const nextAttachmentIndex = useRef(0);
   const dimensions = useTerminalDimensions();
   const layout = computeLayout(dimensions.width, dimensions.height);
@@ -96,19 +115,25 @@ export function RivetApp({
   const theme = createTheme(noColor, themeName);
   const topOverlay = overlays.at(-1) ?? null;
   const running = activeRequestId !== null;
+  contextFilesRef.current = contextFiles;
+  attachmentsRef.current = attachments;
 
   useWorkerConnection(client, dispatch);
   useTuiPreferences(
     { mode, theme: themeName, panel: openPanel },
     { setMode, setTheme: setThemeName, setPanel: setOpenPanel },
-    client !== undefined,
+    client !== undefined &&
+      (loadPreferences ?? suppliedInitialState === undefined),
   );
 
   useEffect(() => {
-    if (!modelTouched.current && state.model !== "未连接") {
+    if (
+      (!modelTouched.current || !state.models.includes(selectedModel)) &&
+      state.model !== "未连接"
+    ) {
       setSelectedModel(state.model);
     }
-  }, [state.model]);
+  }, [selectedModel, state.model, state.models]);
 
   useEffect(() => {
     if (screen !== "welcome" || input.length > 0) return;
@@ -136,6 +161,10 @@ export function RivetApp({
     topOverlay?.kind === "palette" ||
     (topOverlay?.kind === "arguments" &&
       argumentCommand?.name === "resume");
+  const transactionListRequested =
+    topOverlay?.kind === "palette" ||
+    (topOverlay?.kind === "arguments" &&
+      argumentCommand?.requiresTransaction === true);
   const readyClient = state.connection === "ready" ? client : undefined;
 
   const { files, loading: filesLoading } = useRepositoryFiles(
@@ -145,17 +174,24 @@ export function RivetApp({
     setInlineError,
   );
   useSessionList(readyClient, sessionListRequested, setInlineError);
+  useTransactionList(readyClient, transactionListRequested, setInlineError);
 
   const commandContext: CommandContext = {
     modelConfigured: state.credentialConfigured,
     currentModel:
       selectedModel === "未连接" || selectedModel === "未配置"
-        ? "deepseek-v4-pro"
+        ? state.models[0] ?? "deepseek-v4-pro"
         : selectedModel,
     hasSession: screen === "session" || state.sessionId !== null,
     transactionId: state.transaction === "无" ? null : state.transaction,
     verificationStatus: state.verifyStatus,
     evidenceId: state.evidenceId === "无" ? null : state.evidenceId,
+    transactionStates: Object.fromEntries(
+      state.transactions.map((transaction) => [
+        transaction.transactionId,
+        transaction.state,
+      ]),
+    ),
   };
   const {
     argumentOptions,
@@ -176,9 +212,16 @@ export function RivetApp({
     fileQuery,
     contextFiles,
     argumentRequest,
+    models: state.models,
   });
 
   const pushOverlay = (overlay: Overlay) => {
+    if (overlay.kind === "config") {
+      setConfigurationDraft(
+        createConfigurationDraft(configurationFromState(state)),
+      );
+      setConfigurationErrors([]);
+    }
     setSelectedIndex(0);
     setOverlays((current) => [
       ...current.filter((item) => item.kind !== overlay.kind),
@@ -235,6 +278,7 @@ export function RivetApp({
     mode,
     running,
     contextFiles,
+    models: state.models,
     attachments,
     commandContext,
     client,
@@ -262,6 +306,8 @@ export function RivetApp({
       modelTouched.current = true;
     },
     setSelectedModel,
+    getContextFiles: () => contextFilesRef.current,
+    getAttachments: () => attachmentsRef.current,
   });
 
   useAppKeyboard(
@@ -315,15 +361,58 @@ export function RivetApp({
     state.permission === null &&
     (topOverlay === null || topOverlay.kind === "slash") &&
     (screen === "welcome" || openPanel === null);
-  const modelLabel = state.credentialConfigured
-    ? selectedModel
-    : "模型未配置 · 输入 /model 进行设置";
+  const saveConfiguration = () => {
+    const errors = validateConfigurationDraft(configurationDraft);
+    setConfigurationErrors(errors);
+    if (errors.length > 0) return;
+    if (client === undefined || state.connection !== "ready") {
+      setConfigurationErrors(["Worker 尚未就绪，无法保存配置"]);
+      return;
+    }
+    setConfigurationSaving(true);
+    void client
+      .request("config.update", configurationPayload(configurationDraft))
+      .then((result) => {
+        if (
+          result !== null &&
+          !Array.isArray(result) &&
+          typeof result === "object"
+        ) {
+          dispatch({
+            kind: "configuration-loaded",
+            payload: result as Record<string, JsonValue>,
+          });
+        }
+        modelTouched.current = true;
+        setSelectedModel(configurationDraft.model.trim());
+        setConfigurationDraft((current) => ({
+          ...current,
+          apiKey: "",
+          apiKeyAction: "keep",
+        }));
+        setNotice("配置已保存；API Key 仅在当前 Worker 会话生效");
+        closeTopOverlay();
+      })
+      .catch((error: unknown) => {
+        setConfigurationErrors([
+          error instanceof WorkerResponseError
+            ? `${error.code}：${error.message}`
+            : error instanceof Error
+              ? error.message
+              : "配置保存失败",
+        ]);
+      })
+      .finally(() => setConfigurationSaving(false));
+  };
+  const modelLabel = selectedModel;
   const composer = (
     <Composer
       value={input}
       placeholder={PLACEHOLDERS[welcomeIndex] ?? PLACEHOLDERS[0]}
       mode={mode}
       modelLabel={modelLabel}
+      modelCount={state.models.length}
+      credentialConfigured={state.credentialConfigured}
       focused={composerFocused}
       compact={compact}
       running={running}
@@ -365,6 +454,8 @@ export function RivetApp({
         setFileQuery(path);
         pushOverlay({ kind: "files" });
       }}
+      onOpenModels={() => pushOverlay({ kind: "models" })}
+      onOpenConfig={() => pushOverlay({ kind: "config" })}
     />
   );
 
@@ -413,6 +504,9 @@ export function RivetApp({
           filesLoading,
           contextFiles,
           notice,
+          configurationDraft,
+          configurationErrors,
+          configurationSaving,
         }}
         actions={{
           queryPalette: (value) => {
@@ -443,6 +537,14 @@ export function RivetApp({
             closeTopOverlay();
           },
           hover: setSelectedIndex,
+          changeConfiguration: (draft: ConfigurationDraft) => {
+            setConfigurationDraft(draft);
+            if (configurationErrors.length > 0) {
+              setConfigurationErrors(validateConfigurationDraft(draft));
+            }
+          },
+          saveConfiguration,
+          closeConfiguration: closeTopOverlay,
         }}
         state={state}
         commandContext={commandContext}
@@ -453,4 +555,20 @@ export function RivetApp({
     </box>
   );
 
+}
+
+function configurationFromState(state: RivetState): PublicRuntimeConfiguration {
+  return {
+    baseUrl: state.baseUrl,
+    credentialConfigured: state.credentialConfigured,
+    maxCostUsd: state.maxCostUsd,
+    maxRounds: state.maxRounds,
+    maxTotalTokens: state.maxTotalTokens,
+    model:
+      state.model === "未连接"
+        ? state.models[0] ?? "deepseek-v4-pro"
+        : state.model,
+    models: state.models,
+    safeMode: state.safeMode,
+  };
 }

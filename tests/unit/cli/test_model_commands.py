@@ -75,6 +75,7 @@ def _config() -> ResolvedConfig:
     """返回不携带凭据值的已解析配置。"""
     return ResolvedConfig(
         model="deepseek-v4-pro",
+        models=("deepseek-v4-pro", "deepseek-v4-flash"),
         base_url="https://api.deepseek.com",
         max_rounds=5,
         max_total_tokens=4_000,
@@ -87,6 +88,7 @@ def _config() -> ResolvedConfig:
             "max_rounds": "default",
             "max_total_tokens": "default",
             "model": "default",
+            "models": "default",
             "safe_mode": "default",
         },
     )

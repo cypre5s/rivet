@@ -25,6 +25,8 @@ from .models import ApplyIntent
 MAX_RECORD_BYTES = 1024 * 1024
 MAX_ACCEPTANCE_BYTES = 4 * 1024 * 1024
 MAX_PATCH_BYTES = 64 * 1024 * 1024
+MAX_TRANSACTION_LIST_ENTRIES = 10_000
+MAX_TRANSACTION_LIST_LIMIT = 100
 ModelT = TypeVar(
     "ModelT",
     AcceptanceSpec,
@@ -502,6 +504,58 @@ class TransactionStore:
                 if path.is_dir() and not path.is_symlink()
             )
         )
+
+    def list_recent_records(self, *, limit: int = 20) -> tuple[TransactionRecord, ...]:
+        """按记录修改时间列出经过契约校验的近期事务。"""
+        if isinstance(limit, bool) or not 1 <= limit <= MAX_TRANSACTION_LIST_LIMIT:
+            raise TransactionError(
+                "transaction.list_limit_invalid",
+                "事务列表上限无效",
+            )
+        if self.state_root.is_symlink():
+            raise TransactionError(
+                "transaction.state_root_symlink",
+                "事务状态根不得是符号链接",
+            )
+        if not self.state_root.exists():
+            return ()
+        if not self.state_root.is_dir():
+            raise TransactionError(
+                "transaction.state_root_invalid",
+                "事务状态根不是目录",
+            )
+        candidates: list[tuple[int, TransactionRecord]] = []
+        try:
+            for index, directory in enumerate(self.state_root.iterdir()):
+                if index >= MAX_TRANSACTION_LIST_ENTRIES:
+                    raise TransactionError(
+                        "transaction.list_too_large",
+                        "事务目录数量超过上限",
+                    )
+                if (
+                    directory.is_symlink()
+                    or not directory.is_dir()
+                    or not TRANSACTION_ID_PATTERN.fullmatch(directory.name)
+                ):
+                    continue
+                record_path = directory / "record.json"
+                if record_path.is_symlink() or not record_path.is_file():
+                    continue
+                try:
+                    record = self.load_record(directory.name)
+                    modified_ns = record_path.stat().st_mtime_ns
+                except (OSError, TransactionError):
+                    continue
+                candidates.append((modified_ns, record))
+        except OSError as error:
+            raise TransactionError(
+                "transaction.list_unreadable",
+                "事务状态目录无法读取",
+            ) from error
+        candidates.sort(
+            key=lambda item: (-item[0], item[1].transaction_id),
+        )
+        return tuple(record for _, record in candidates[:limit])
 
     @staticmethod
     def _load_model(

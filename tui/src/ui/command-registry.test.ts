@@ -74,4 +74,13 @@ describe("unified command registry", () => {
     expect(findCommand("apply")?.dangerous).toBeTrue();
     expect(findCommand("clean")?.dangerous).toBeTrue();
   });
+
+  test("opens runtime configuration locally without invoking the display-only CLI", () => {
+    expect(findCommand("config")?.execute("", BASE_CONTEXT)).toEqual({
+      kind: "ui",
+      action: "open-config",
+      argument: "",
+    });
+    expect(findCommand("config")?.shortcut).toBe("Ctrl+G");
+  });
 });

@@ -170,8 +170,221 @@ def test_ready_payload_exposes_only_model_and_credential_presence(
 
     assert payload["credential_configured"] is True
     assert payload["model"] == "deepseek-v4-pro"
+    assert payload["models"] == ["deepseek-v4-pro", "deepseek-v4-flash"]
+    assert payload["base_url"] == "https://api.deepseek.com"
+    assert payload["max_rounds"] == 24
+    assert payload["max_total_tokens"] == 128_000
+    assert isinstance(payload["sources"], dict)
     assert "configured-placeholder" not in serialized
     assert "api_key" not in serialized.casefold()
+
+
+@pytest.mark.asyncio
+async def test_tui_runtime_configuration_updates_models_and_session_key_without_echo(
+    tmp_path: Path,
+) -> None:
+    caller_environment = {"XDG_CONFIG_HOME": str(tmp_path / "config")}
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(
+        tmp_path,
+        environment=caller_environment,
+    )
+    secret = "fixture-session-value-that-must-never-be-echoed"
+    result = await application.handle(
+        _request(
+            "request_config_update",
+            "config.update",
+            {
+                "api_key_action": "replace",
+                "api_key": secret,
+                "base_url": "https://gateway.example.test/v1",
+                "max_cost_usd": "2.50",
+                "max_rounds": 18,
+                "max_total_tokens": 64_000,
+                "model": "reasoner-large",
+                "models": ["chat-fast", "reasoner-large"],
+                "safe_mode": True,
+            },
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    serialized = json.dumps({"result": result, "events": events})
+    assert isinstance(result, dict)
+    assert result["credential_configured"] is True
+    assert result["model"] == "reasoner-large"
+    assert result["models"] == ["chat-fast", "reasoner-large"]
+    assert result["base_url"] == "https://gateway.example.test/v1"
+    assert secret not in serialized
+    assert "api_key" not in serialized.casefold()
+    assert caller_environment == {"XDG_CONFIG_HOME": str(tmp_path / "config")}
+    persisted = (tmp_path / "config" / "rivet" / "config.toml").read_text(
+        encoding="utf-8"
+    )
+    assert secret not in persisted
+    assert "reasoner-large" in persisted
+    assert any(event_type == "config.updated" for event_type, _ in events)
+    assert application.ready_payload()["credential_configured"] is True
+    restarted = CommandWorkerApplication(tmp_path, environment=caller_environment)
+    restarted_payload = restarted.ready_payload()
+    assert restarted_payload["model"] == "reasoner-large"
+    assert restarted_payload["models"] == ["chat-fast", "reasoner-large"]
+    assert restarted_payload["credential_configured"] is False
+
+
+@pytest.mark.asyncio
+async def test_tui_runtime_configuration_can_clear_only_the_session_key(
+    tmp_path: Path,
+) -> None:
+    async def emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        return None
+
+    application = CommandWorkerApplication(
+        tmp_path,
+        environment={
+            "DEEPSEEK_API_KEY": "existing-session-value",
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        },
+    )
+    result = await application.handle(
+        _request(
+            "request_config_clear",
+            "config.update",
+            {"api_key_action": "clear"},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert isinstance(result, dict)
+    assert result["credential_configured"] is False
+    assert application.ready_payload()["credential_configured"] is False
+
+
+@pytest.mark.asyncio
+async def test_tui_session_key_reaches_the_cli_subprocess_without_entering_argv(
+    tmp_path: Path,
+) -> None:
+    class ProbeApplication(CommandWorkerApplication):
+        """只向测试暴露默认无 shell 子进程 runner。"""
+
+        async def run_probe(self) -> CommandExecution:
+            async def discard(
+                _event_type: str,
+                _payload: dict[str, JsonValue],
+            ) -> None:
+                return None
+
+            return await self._run_subprocess(
+                (
+                    sys.executable,
+                    "-c",
+                    "import os; print('configured' if os.environ.get("
+                    "'DEEPSEEK_API_KEY') else 'missing')",
+                ),
+                discard,
+            )
+
+    async def emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        return None
+
+    secret = "fixture-session-subprocess-value"
+    application = ProbeApplication(
+        tmp_path,
+        environment={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "XDG_CONFIG_HOME": str(tmp_path / "config"),
+        },
+    )
+    await application.handle(
+        _request(
+            "request_config_subprocess",
+            "config.update",
+            {"api_key_action": "replace", "api_key": secret},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    execution = await application.run_probe()
+
+    assert execution.return_code == 0
+    assert execution.stdout == b"configured\n"
+    assert secret not in execution.stdout.decode()
+
+
+@pytest.mark.asyncio
+async def test_tui_runtime_configuration_rejects_invalid_models_without_secret_leak(
+    tmp_path: Path,
+) -> None:
+    async def emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        return None
+
+    application = CommandWorkerApplication(
+        tmp_path,
+        environment={"XDG_CONFIG_HOME": str(tmp_path / "config")},
+    )
+    secret = "fixture-invalid-request-value"
+    with pytest.raises(WorkerMethodError) as captured:
+        await application.handle(
+            _request(
+                "request_config_invalid",
+                "config.update",
+                {
+                    "api_key_action": "replace",
+                    "api_key": secret,
+                    "model": "missing-from-list",
+                    "models": ["valid-model", "valid-model"],
+                },
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+
+    assert captured.value.code == "config.update_invalid"
+    assert secret not in str(captured.value)
+    assert not (tmp_path / "config" / "rivet" / "config.toml").exists()
+
+    with pytest.raises(WorkerMethodError) as invalid_key:
+        await application.handle(
+            _request(
+                "request_config_invalid_key",
+                "config.update",
+                {
+                    "api_key_action": "replace",
+                    "api_key": "fixture value with spaces",
+                },
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+    assert invalid_key.value.code == "config.update_invalid"
+
+    with pytest.raises(WorkerMethodError) as invalid_command_model:
+        await application.handle(
+            _request(
+                "request_command_invalid_model",
+                "command.ask",
+                {"model": "Bad Model", "query": "解释"},
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+    assert invalid_command_model.value.code == "config.model_invalid"
 
 
 @pytest.mark.asyncio
@@ -311,6 +524,158 @@ async def test_recent_sessions_are_loaded_only_on_explicit_request(
 
 
 @pytest.mark.asyncio
+async def test_recent_transactions_are_loaded_only_on_explicit_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """事务选择器只接收经过事务记录校验的近期状态。"""
+    from rivet.kernel.resources import ResourceScope
+    from rivet.storage.git_exclude import configure_runtime_excludes
+    from rivet.transaction.manager import TransactionManager
+    from tests.transaction_helpers import initialize_repository
+
+    repository = initialize_repository(tmp_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    assert configure_runtime_excludes(repository) is True
+    scope = ResourceScope("ipc.transactions.list")
+    manager = TransactionManager(repository, scope=scope)
+    first = await manager.create(transaction_id="tx_history_first")
+    manager.suspend(first.transaction_id)
+    second = await manager.create(transaction_id="tx_history_second")
+    manager.suspend(second.transaction_id)
+    await scope.close()
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(repository)
+    result = await application.handle(
+        _request("request_transactions", "transactions.list", {"limit": 20}),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert isinstance(result, dict)
+    assert result == {
+        "transactions": [
+            {
+                "evidence_id": None,
+                "state": "BASELINED",
+                "transaction_id": "tx_history_second",
+            },
+            {
+                "evidence_id": None,
+                "state": "BASELINED",
+                "transaction_id": "tx_history_first",
+            },
+        ]
+    }
+    assert events == [
+        (
+            "transactions.snapshot",
+            {
+                "summary": "已加载 2 个近期事务",
+                "transactions": result["transactions"],
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resume_projects_verified_evidence_back_to_tui(tmp_path: Path) -> None:
+    """恢复终态 fix 时必须恢复 Evidence 和独立验证状态。"""
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def runner(
+        _argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        return CommandExecution(
+            0,
+            json.dumps(
+                {
+                    "command": "fix",
+                    "evidence_id": "evidence_resume_verified",
+                    "session_id": "session_resume_verified",
+                    "status": "VERIFIED",
+                    "transaction_id": "tx_resume_verified",
+                    "transaction_status": "VERIFIED",
+                    "verification_status": "PASSED",
+                }
+            ).encode(),
+            b"",
+        )
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    await application.handle(
+        _request(
+            "request_resume_verified",
+            "command.resume",
+            {"session_id": "session_resume_verified"},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert (
+        "verification.completed",
+        {"status": "PASSED", "summary": "验证已完成"},
+    ) in events
+    assert (
+        "evidence.published",
+        {
+            "evidence_id": "evidence_resume_verified",
+            "summary": "证据已发布",
+        },
+    ) in events
+
+
+@pytest.mark.asyncio
+async def test_resume_read_only_session_does_not_claim_verification(
+    tmp_path: Path,
+) -> None:
+    """恢复普通 ask 终态不得把会话状态伪装成补丁验证结论。"""
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def runner(
+        _argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        return CommandExecution(
+            0,
+            json.dumps(
+                {
+                    "command": "ask",
+                    "session_id": "session_resume_answered",
+                    "status": "ANSWERED",
+                }
+            ).encode(),
+            b"",
+        )
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    await application.handle(
+        _request(
+            "request_resume_answered",
+            "command.resume",
+            {"session_id": "session_resume_answered"},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert not any(event_type == "verification.completed" for event_type, _ in events)
+    assert not any(event_type == "evidence.published" for event_type, _ in events)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "params", "expected_tail"),
     [
@@ -358,6 +723,119 @@ async def test_published_worker_commands_share_the_formal_cli_parser(
     )
 
     assert arguments[0][-len(expected_tail) :] == expected_tail
+
+
+@pytest.mark.asyncio
+async def test_read_enhancement_options_reach_the_formal_cli_parser(
+    tmp_path: Path,
+) -> None:
+    """TUI Reader 的受限增强参数必须逐项传给正式 CLI。"""
+    arguments: list[tuple[str, ...]] = []
+
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        arguments.append(argv)
+        return CommandExecution(0, b"{}", b"")
+
+    async def emit(
+        _event_type: str,
+        _payload: dict[str, JsonValue],
+    ) -> None:
+        pass
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    await application.handle(
+        _request(
+            "request_read_enhanced",
+            "command.read",
+            {
+                "file": "samples/video.mp4",
+                "frames": 8,
+                "max_audio_duration": 600,
+                "max_image_pixels": 2_000_000,
+                "max_ocr_pages": 12,
+                "max_output_chars": 5_000,
+                "ocr": True,
+                "timeout": 15,
+                "transcribe": True,
+            },
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert arguments[0][-16:] == (
+        "read",
+        "samples/video.mp4",
+        "--ocr",
+        "--transcribe",
+        "--frames",
+        "8",
+        "--max-ocr-pages",
+        "12",
+        "--max-image-pixels",
+        "2000000",
+        "--max-audio-duration",
+        "600",
+        "--max-output-chars",
+        "5000",
+        "--timeout",
+        "15",
+    )
+
+
+@pytest.mark.asyncio
+async def test_failed_read_is_projected_as_a_structured_reader_event(
+    tmp_path: Path,
+) -> None:
+    """Reader 的领域失败仍应抵达 TUI，而不是退化为 IPC 异常。"""
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+
+    async def runner(
+        _argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        return CommandExecution(
+            4,
+            json.dumps(
+                {
+                    "content": "",
+                    "detected_format": "image",
+                    "metadata": {"height": 500, "width": 640},
+                    "reader_id": "reader.image",
+                    "source_path": "samples/large.png",
+                    "status": "FAILED",
+                    "support_level": "A",
+                    "truncated": False,
+                    "warnings": ["reader.image.pixel_limit_exceeded"],
+                }
+            ).encode(),
+            b"",
+        )
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    result = await application.handle(
+        _request(
+            "request_read_failed",
+            "command.read",
+            {"file": "samples/large.png", "max_image_pixels": 10},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    assert isinstance(result, dict)
+    assert result["status"] == "FAILED"
+    reader_event = next(
+        payload for event_type, payload in events if event_type == "reader.completed"
+    )
+    assert reader_event["status"] == "FAILED"
+    assert "pixel_limit_exceeded" in str(reader_event["summary"])
 
 
 @pytest.mark.asyncio
@@ -617,6 +1095,86 @@ async def test_fix_waits_for_explicit_permission_then_adds_yes(
     assert event_types.index("agent.patch_ready") < event_types.index(
         "verification.completed"
     )
+
+
+@pytest.mark.asyncio
+async def test_resume_fix_waits_for_explicit_permission_then_adds_yes(
+    tmp_path: Path,
+) -> None:
+    """恢复 fix 也必须经 TUI 授权，并把批准传给正式 CLI。"""
+    from rivet.storage.sessions import SessionCheckpoint, SessionStatus, SessionStore
+
+    session_id = "session_resume_fix"
+    SessionStore(tmp_path).save(
+        SessionCheckpoint(
+            session_id=session_id,
+            run_id="run_resume_fix",
+            command="fix",
+            query="继续隔离修复",
+            status=SessionStatus.FAILED,
+        )
+    )
+    arguments: list[tuple[str, ...]] = []
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+    permission_ready = asyncio.Event()
+
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        arguments.append(argv)
+        return CommandExecution(
+            4,
+            json.dumps(
+                {
+                    "answer": "补丁验证未通过",
+                    "evidence_id": "evidence_resume_fix",
+                    "model_status": "READY_FOR_VERIFICATION",
+                    "status": "REJECTED",
+                    "transaction_id": "tx_resume_fix",
+                }
+            ).encode(),
+            b"",
+        )
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+        if event_type == "permission.requested":
+            permission_ready.set()
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    resume_task = asyncio.create_task(
+        application.handle(
+            _request(
+                "request_resume_fix",
+                "command.resume",
+                {"session_id": session_id},
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+    )
+    await asyncio.wait_for(permission_ready.wait(), timeout=1)
+    permission = next(
+        payload
+        for event_type, payload in events
+        if event_type == "permission.requested"
+    )
+    await application.handle(
+        _request(
+            "request_resume_fix_permission",
+            "permission.resolve",
+            {"approved": True, "request_id": permission["request_id"]},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+
+    result = await resume_task
+
+    assert arguments[0][-3:] == ("resume", session_id, "--yes")
+    assert isinstance(result, dict)
+    assert result["status"] == "REJECTED"
 
 
 @pytest.mark.asyncio

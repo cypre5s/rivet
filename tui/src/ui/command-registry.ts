@@ -28,6 +28,7 @@ export type UiCommandAction =
   | "open-context"
   | "open-search"
   | "open-models"
+  | "open-config"
   | "change-mode"
   | "open-modules"
   | "open-trace"
@@ -61,6 +62,7 @@ export interface CommandContext {
   transactionId: string | null;
   verificationStatus: string;
   evidenceId: string | null;
+  transactionStates?: Readonly<Record<string, string>>;
 }
 
 export type CommandOutcome =
@@ -151,6 +153,67 @@ const exportCommand: CommandHandler = (argument) => {
   const params: Record<string, JsonValue> = { export_kind: exportKind };
   if (tokens[0]) params.output_path = tokens[0];
   return { kind: "worker", method: "command.export", params };
+};
+
+const readCommand: CommandHandler = (argument) => {
+  const trimmed = argument.trim();
+  const optionStart = trimmed.search(/\s--/);
+  const file = required(
+    optionStart < 0 ? trimmed : trimmed.slice(0, optionStart).trim(),
+    "/read 需要仓库内文件路径",
+  );
+  const params: Record<string, JsonValue> = { file };
+  if (optionStart < 0) return { kind: "worker", method: "command.read", params };
+
+  const tokens = trimmed.slice(optionStart).trim().split(/\s+/).filter(Boolean);
+  const seen = new Set<string>();
+  const numericOptions: Record<
+    string,
+    { key: string; minimum: number; maximum: number }
+  > = {
+    "--frames": { key: "frames", minimum: 0, maximum: 20 },
+    "--max-ocr-pages": { key: "max_ocr_pages", minimum: 0, maximum: 100 },
+    "--max-image-pixels": {
+      key: "max_image_pixels",
+      minimum: 1,
+      maximum: 100_000_000,
+    },
+    "--max-audio-duration": {
+      key: "max_audio_duration",
+      minimum: 1,
+      maximum: 86_400,
+    },
+    "--max-output-chars": {
+      key: "max_output_chars",
+      minimum: 1,
+      maximum: 4_000_000,
+    },
+    "--timeout": { key: "timeout", minimum: 1, maximum: 3_600 },
+  };
+  while (tokens.length > 0) {
+    const option = tokens.shift()!;
+    if (seen.has(option)) throw new Error(`/read 不允许重复参数 ${option}`);
+    seen.add(option);
+    if (option === "--ocr" || option === "--transcribe") {
+      params[option === "--ocr" ? "ocr" : "transcribe"] = true;
+      continue;
+    }
+    const bounds = numericOptions[option];
+    if (bounds === undefined) throw new Error(`/read 不支持参数 ${option}`);
+    const rawValue = tokens.shift();
+    const value = rawValue === undefined ? Number.NaN : Number(rawValue);
+    if (
+      !Number.isInteger(value) ||
+      value < bounds.minimum ||
+      value > bounds.maximum
+    ) {
+      throw new Error(
+        `/read ${option} 必须是 ${bounds.minimum} 到 ${bounds.maximum} 的整数`,
+      );
+    }
+    params[bounds.key] = value;
+  }
+  return { kind: "worker", method: "command.read", params };
 };
 
 const modulesCommand: CommandHandler = (argument) => {
@@ -282,7 +345,7 @@ export const COMMAND_REGISTRY: readonly CommandDescriptor[] = [
   ),
   descriptor(
     "read", "文件与上下文", "读取文件", "使用 Rivet Reader 安全读取仓库内文件",
-    "FILE", "path", worker("read", "path"),
+    "FILE [--ocr|--transcribe|--frames N]", "path", readCommand,
     { aliases: ["读取"], shortcut: "Ctrl+O" },
   ),
   descriptor(
@@ -346,9 +409,9 @@ export const COMMAND_REGISTRY: readonly CommandDescriptor[] = [
     { aliases: ["评测"] },
   ),
   descriptor(
-    "config", "项目与系统", "查看配置", "查看非秘密有效配置及来源", "", "none",
-    worker("config", "none"),
-    { aliases: ["配置"] },
+    "config", "项目与系统", "快速配置", "配置会话 Key、API 地址、模型目录与运行预算", "", "none",
+    ui("open-config"),
+    { aliases: ["配置"], shortcut: "Ctrl+G" },
   ),
   descriptor(
     "clean", "项目与系统", "清理运行产物", "只清理带 Rivet ownership marker 的资源",
@@ -387,12 +450,18 @@ export function commandAvailability(
   if (command.requiresSession && !context.hasSession) {
     return { available: false, reason: "当前没有活动会话" };
   }
-  if (command.requiresTransaction && context.transactionId === null) {
+  const historicalStates = Object.values(context.transactionStates ?? {});
+  if (
+    command.requiresTransaction &&
+    context.transactionId === null &&
+    historicalStates.length === 0
+  ) {
     return { available: false, reason: "当前没有活动事务" };
   }
   if (
     command.name === "apply" &&
-    context.verificationStatus.toUpperCase() !== "PASSED"
+    context.verificationStatus.toUpperCase() !== "PASSED" &&
+    !historicalStates.some((state) => state.toUpperCase() === "VERIFIED")
   ) {
     return { available: false, reason: "只有验证通过的事务可以应用" };
   }

@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
+import re
 import tomllib
+import uuid
 from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -15,6 +19,7 @@ from rivet.providers.models import DeepSeekConfig, DeepSeekModel
 
 CONFIG_FIELDS = (
     "model",
+    "models",
     "base_url",
     "max_rounds",
     "max_total_tokens",
@@ -23,6 +28,7 @@ CONFIG_FIELDS = (
 )
 ENVIRONMENT_FIELDS = {
     "RIVET_MODEL": "model",
+    "RIVET_MODELS": "models",
     "RIVET_BASE_URL": "base_url",
     "RIVET_MAX_ROUNDS": "max_rounds",
     "RIVET_MAX_TOTAL_TOKENS": "max_total_tokens",
@@ -33,6 +39,7 @@ SECRET_FIELD_PARTS = ("api_key", "credential", "password", "secret", "token")
 MAX_CONFIG_BYTES = 256 * 1024
 DEFAULT_VALUES: dict[str, object] = {
     "model": DeepSeekModel.V4_PRO.value,
+    "models": [model.value for model in DeepSeekModel],
     "base_url": "https://api.deepseek.com",
     "max_rounds": 24,
     "max_total_tokens": 128_000,
@@ -46,6 +53,7 @@ class ConfigOverrides:
     """保存命令行显式提供、未提供时为 None 的配置覆盖。"""
 
     model: str | None = None
+    models: tuple[str, ...] | list[str] | None = None
     base_url: str | None = None
     max_rounds: int | None = None
     max_total_tokens: int | None = None
@@ -58,6 +66,7 @@ class ResolvedConfig:
     """保存已经校验的有效值、来源和仅布尔形式的凭据状态。"""
 
     model: str
+    models: tuple[str, ...]
     base_url: str
     max_rounds: int
     max_total_tokens: int
@@ -81,6 +90,7 @@ class ResolvedConfig:
             "max_rounds": self.max_rounds,
             "max_total_tokens": self.max_total_tokens,
             "model": self.model,
+            "models": list(self.models),
             "safe_mode": self.safe_mode,
         }
 
@@ -90,6 +100,7 @@ class _ValidatedValues:
     """保存已完成跨层类型与范围校验的配置字段。"""
 
     model: str
+    models: tuple[str, ...]
     base_url: str
     max_rounds: int
     max_total_tokens: int
@@ -126,6 +137,7 @@ def load_config(
     credential = selected_environment.get("DEEPSEEK_API_KEY")
     return ResolvedConfig(
         model=normalized.model,
+        models=normalized.models,
         base_url=normalized.base_url,
         max_rounds=normalized.max_rounds,
         max_total_tokens=normalized.max_total_tokens,
@@ -147,6 +159,90 @@ def _user_config_path(environment: Mapping[str, str]) -> Path:
             "设置绝对 XDG_CONFIG_HOME 后重试",
         )
     return root / "rivet" / "config.toml"
+
+
+def save_user_config(
+    values: Mapping[str, object],
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """校验并原子保存用户级非秘密配置，永不接受凭据字段。"""
+    selected_environment = os.environ if environment is None else environment
+    _reject_secret_fields(values)
+    unknown = set(values) - set(CONFIG_FIELDS)
+    if unknown:
+        raise CliConfigurationError(
+            "config.field_unknown",
+            "[rivet] 包含未知配置字段",
+            "删除未知字段后重试",
+        )
+    path = _user_config_path(selected_environment)
+    existing = _load_document(path, project=False)
+    merged = {**DEFAULT_VALUES, **existing, **values}
+    normalized = _validate_values(merged)
+    serialized = _serialize_user_config(normalized)
+    directory = path.parent
+    temporary: Path | None = None
+    try:
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if directory.is_symlink() or not directory.is_dir():
+            raise CliConfigurationError(
+                "config.file_invalid",
+                "用户配置目录不能是符号链接且必须是目录",
+                "替换为受控用户配置目录",
+            )
+        if path.is_symlink() or (path.exists() and not path.is_file()):
+            raise CliConfigurationError(
+                "config.file_invalid",
+                "配置路径必须是普通文件且不能是符号链接",
+                "替换为受控普通 TOML 文件",
+            )
+        temporary = directory / f"config.toml.{uuid.uuid4().hex}.tmp"
+        with temporary.open("x", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            stream.write(serialized)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        temporary = None
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except CliConfigurationError:
+        raise
+    except OSError as error:
+        raise CliConfigurationError(
+            "config.write_failed",
+            "用户配置无法安全写入",
+            "检查 XDG_CONFIG_HOME 权限和路径类型后重试",
+        ) from error
+    finally:
+        if temporary is not None:
+            with suppress(OSError):
+                temporary.unlink(missing_ok=True)
+    return path
+
+
+def _serialize_user_config(values: _ValidatedValues) -> str:
+    """只序列化固定白名单字段，保持输出确定且不含秘密。"""
+    lines = ["schema_version = 1", "", "[rivet]"]
+    lines.append(f"model = {_toml_string(values.model)}")
+    rendered_models = ", ".join(_toml_string(model) for model in values.models)
+    lines.append(f"models = [{rendered_models}]")
+    lines.append(f"base_url = {_toml_string(values.base_url)}")
+    lines.append(f"max_rounds = {values.max_rounds}")
+    lines.append(f"max_total_tokens = {values.max_total_tokens}")
+    if values.max_cost_usd is not None:
+        lines.append(f"max_cost_usd = {_toml_string(str(values.max_cost_usd))}")
+    lines.append(f"safe_mode = {'true' if values.safe_mode else 'false'}")
+    return "\n".join(lines) + "\n"
+
+
+def _toml_string(value: str) -> str:
+    """用 TOML 兼容的 JSON 基本字符串编码非秘密文本。"""
+    return json.dumps(value, ensure_ascii=False)
 
 
 def _load_document(path: Path, *, project: bool) -> dict[str, object]:
@@ -235,6 +331,8 @@ def _environment_values(environment: Mapping[str, str]) -> dict[str, object]:
         try:
             if field in {"max_rounds", "max_total_tokens"}:
                 values[field] = int(raw)
+            elif field == "models":
+                values[field] = [item.strip() for item in raw.split(",")]
             elif field == "safe_mode":
                 values[field] = _parse_boolean(raw)
             else:
@@ -270,12 +368,17 @@ def _override_values(overrides: ConfigOverrides) -> dict[str, object]:
 def _validate_values(values: Mapping[str, object]) -> _ValidatedValues:
     """规范数值、URL 和模型名并返回可构造结果。"""
     model = values["model"]
+    models = values["models"]
     base_url = values["base_url"]
     max_rounds = values["max_rounds"]
     max_total_tokens = values["max_total_tokens"]
     safe_mode = values["safe_mode"]
-    if not isinstance(model, str) or not model.strip() or len(model) > 128:
+    if not isinstance(model, str) or not _valid_model_name(model.strip()):
         raise _value_error("model")
+    normalized_model = model.strip()
+    normalized_models = _validate_models(models)
+    if normalized_model not in normalized_models:
+        normalized_models = (normalized_model, *normalized_models)
     if not isinstance(base_url, str):
         raise _value_error("base_url")
     try:
@@ -304,13 +407,37 @@ def _validate_values(values: Mapping[str, object]) -> _ValidatedValues:
     if max_cost is not None and (not max_cost.is_finite() or max_cost < 0):
         raise _value_error("max_cost_usd")
     return _ValidatedValues(
-        model=model.strip(),
+        model=normalized_model,
+        models=normalized_models,
         base_url=base_url,
         max_rounds=max_rounds,
         max_total_tokens=max_total_tokens,
         max_cost_usd=max_cost,
         safe_mode=safe_mode,
     )
+
+
+def _validate_models(value: object) -> tuple[str, ...]:
+    """校验有界、去空白且顺序稳定的模型目录。"""
+    if not isinstance(value, (list, tuple)):
+        raise _value_error("models")
+    items = cast(list[object] | tuple[object, ...], value)
+    if not 1 <= len(items) <= 32:
+        raise _value_error("models")
+    models: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            raise _value_error("models")
+        model = item.strip()
+        if not _valid_model_name(model) or model in models:
+            raise _value_error("models")
+        models.append(model)
+    return tuple(models)
+
+
+def _valid_model_name(value: str) -> bool:
+    """拒绝会破坏 argv 或终端显示的模型标识。"""
+    return re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,127}", value) is not None
 
 
 def _value_error(field: str) -> CliConfigurationError:

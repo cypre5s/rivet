@@ -63,6 +63,42 @@ describe("TUI command input", () => {
     })).toMatchObject({ kind: "worker", method: "command.apply" });
   });
 
+  test("routes bounded multi-format reader options to the worker", () => {
+    expect(
+      parseCommandInput(
+        "/read samples/scan image.png --ocr --transcribe --frames 8 " +
+          "--max-ocr-pages 12 --max-image-pixels 2000000 " +
+          "--max-audio-duration 600 --max-output-chars 5000 --timeout 15",
+      ),
+    ).toEqual({
+      kind: "worker",
+      method: "command.read",
+      params: {
+        file: "samples/scan image.png",
+        ocr: true,
+        transcribe: true,
+        frames: 8,
+        max_ocr_pages: 12,
+        max_image_pixels: 2_000_000,
+        max_audio_duration: 600,
+        max_output_chars: 5_000,
+        timeout: 15,
+      },
+    });
+    expect(
+      commandArgumentRequest("/read samples/scan.png --ocr"),
+    ).toBeNull();
+  });
+
+  test("rejects invalid reader enhancement options", () => {
+    expect(() => parseCommandInput("/read image.png --frames 21")).toThrow(
+      "--frames",
+    );
+    expect(() => parseCommandInput("/read image.png --unknown")).toThrow(
+      "不支持参数",
+    );
+  });
+
   test("rejects incomplete or unknown commands", () => {
     expect(() => parseCommandInput("/fix")).toThrow("需要任务文本");
     expect(() => parseCommandInput("/apply")).toThrow("需要事务 ID");
@@ -80,6 +116,21 @@ describe("TUI command input", () => {
         evidenceId: "evidence_one",
       }),
     ).toThrow("只有验证通过的事务可以应用");
+    expect(
+      parseCommandInput("/apply tx_historical", {
+        modelConfigured: true,
+        currentModel: "deepseek-v4-pro",
+        hasSession: true,
+        transactionId: "tx_current",
+        verificationStatus: "FAILED",
+        evidenceId: null,
+        transactionStates: { tx_historical: "VERIFIED" },
+      }),
+    ).toEqual({
+      kind: "worker",
+      method: "command.apply",
+      params: { transaction_id: "tx_historical" },
+    });
   });
 
   test("detects slash and file mention triggers at the composer boundary", () => {

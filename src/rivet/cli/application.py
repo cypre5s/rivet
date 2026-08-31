@@ -472,6 +472,9 @@ async def _resume(
     except TraceError:
         trace_status = "INVALID"
     transaction_status: str | None = None
+    transaction_recovery: str | None = None
+    evidence_id: str | None = None
+    verification_status: str | None = None
     if checkpoint.transaction_id is not None:
         from rivet.cli.errors import CliVerificationError
         from rivet.contracts.transactions import TransactionState
@@ -488,15 +491,27 @@ async def _resume(
                 RuntimePaths.for_repository(repository).runtime_root / "transactions"
             )
             record = store.load_record(checkpoint.transaction_id)
+            if record.current_patch_id is not None and record.evidence_id is not None:
+                patch, _ = store.load_patch(
+                    record.transaction_id,
+                    record.current_patch_id,
+                )
+                verdict = store.verify_record_evidence(
+                    record,
+                    expected_patch_sha256=patch.patch_sha256,
+                )
+                evidence_id = verdict.evidence_id
+                verification_status = verdict.status.value
+            transaction_status = record.state.value
             if record.state in {
                 TransactionState.APPLIED,
                 TransactionState.ABORTED,
             }:
-                transaction_status = record.state.value
+                transaction_recovery = "NOT_REQUIRED"
             else:
                 await manager.recover(checkpoint.transaction_id)
                 manager.suspend(checkpoint.transaction_id)
-                transaction_status = "RECOVERED"
+                transaction_recovery = "RECOVERED"
         except TransactionError as error:
             raise CliVerificationError(
                 error.code,
@@ -507,6 +522,7 @@ async def _resume(
             await scope.close()
     payload: dict[str, object] = {
         "command": checkpoint.command,
+        "evidence_id": evidence_id,
         "pending_tools": [
             {
                 "next_action": tool.next_action,
@@ -524,7 +540,9 @@ async def _resume(
         "trace_event_count": trace_event_count,
         "trace_status": trace_status,
         "transaction_id": checkpoint.transaction_id,
+        "transaction_recovery": transaction_recovery,
         "transaction_status": transaction_status,
+        "verification_status": verification_status,
     }
     _print_payload(payload, json_output=json_output)
     return int(ExitCode.SUCCESS)

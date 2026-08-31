@@ -29,7 +29,13 @@ describe("Trace-driven reducer", () => {
       event(0, "worker.ready", {
         repository: "/repo",
         branch: "main",
-        model: "deepseek",
+        model: "reasoner-large",
+        models: ["chat-fast", "reasoner-large"],
+        base_url: "https://gateway.example.test/v1",
+        max_rounds: 18,
+        max_total_tokens: 64000,
+        max_cost_usd: "2.50",
+        safe_mode: true,
         credential_configured: true,
       }),
       event(1, "plan.updated", { phase: "VERIFY", summary: "执行验证" }),
@@ -46,6 +52,13 @@ describe("Trace-driven reducer", () => {
     expect(state.repository).toBe("/repo");
     expect(state.branch).toBe("main");
     expect(state.credentialConfigured).toBeTrue();
+    expect(state.model).toBe("reasoner-large");
+    expect(state.models).toEqual(["chat-fast", "reasoner-large"]);
+    expect(state.baseUrl).toBe("https://gateway.example.test/v1");
+    expect(state.maxRounds).toBe(18);
+    expect(state.maxTotalTokens).toBe(64_000);
+    expect(state.maxCostUsd).toBe("2.50");
+    expect(state.safeMode).toBeTrue();
     expect(state.plan.phase).toBe("VERIFY");
     expect(state.context).toEqual([{ path: "src/app.py", reason: "错误栈" }]);
     expect(state.diff).toContain("@@");
@@ -131,6 +144,39 @@ describe("Trace-driven reducer", () => {
     expect(state.timeline.filter((item) => item.eventType === "worker.ready")).toHaveLength(1);
     expect(state.sessionId).toBe("session_one");
     expect(state.sessions).toEqual(["session_one", "session_two"]);
+  });
+
+  test("tracks validated historical transaction snapshots", () => {
+    const state = reduceTraceEvent(
+      initialRivetState(),
+      event(0, "transactions.snapshot", {
+        transactions: [
+          {
+            transaction_id: "tx_verified",
+            state: "VERIFIED",
+            evidence_id: "evidence_verified",
+          },
+          {
+            transaction_id: "tx_rejected",
+            state: "REJECTED",
+            evidence_id: "evidence_rejected",
+          },
+        ],
+      }),
+    );
+
+    expect(state.transactions).toEqual([
+      {
+        transactionId: "tx_verified",
+        state: "VERIFIED",
+        evidenceId: "evidence_verified",
+      },
+      {
+        transactionId: "tx_rejected",
+        state: "REJECTED",
+        evidenceId: "evidence_rejected",
+      },
+    ]);
   });
 
   test("projects structured module snapshots and lifecycle updates", () => {

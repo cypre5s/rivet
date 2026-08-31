@@ -8,7 +8,9 @@ import type {
 import type { CommandSearchResult } from "../ui/command-search.ts";
 import type { CommandArgumentRequest } from "../ui/commands.ts";
 import { slashQuery } from "../ui/commands.ts";
+import type { ConfigurationDraft } from "../ui/runtime-config.ts";
 import { CommandPalette } from "./command-palette.tsx";
+import { ConfigDialog } from "./config-dialog.tsx";
 import { ConfirmDialog } from "./confirm-dialog.tsx";
 import { FilePicker } from "./file-picker.tsx";
 import { InfoOverlay } from "./info-overlay.tsx";
@@ -33,6 +35,9 @@ export interface OverlayDisplayState {
   filesLoading: boolean;
   contextFiles: string[];
   notice: string | null;
+  configurationDraft: ConfigurationDraft;
+  configurationErrors: string[];
+  configurationSaving: boolean;
 }
 
 export interface OverlayActions {
@@ -45,6 +50,9 @@ export interface OverlayActions {
   selectModel(option: PickerOption): void;
   selectArgument(commandName: string, option: PickerOption): void;
   hover(index: number): void;
+  changeConfiguration(draft: ConfigurationDraft): void;
+  saveConfiguration(): void;
+  closeConfiguration(): void;
 }
 
 export function AppOverlays({
@@ -133,6 +141,20 @@ export function AppOverlays({
           onQuery={actions.queryPalette}
           onSelect={actions.selectModel}
           onHover={actions.hover}
+        />
+      ) : null}
+      {overlay?.kind === "config" ? (
+        <ConfigDialog
+          draft={display.configurationDraft}
+          credentialConfigured={state.credentialConfigured}
+          errors={display.configurationErrors}
+          saving={display.configurationSaving}
+          compact={compact}
+          viewportHeight={viewportHeight}
+          theme={theme}
+          onChange={actions.changeConfiguration}
+          onSave={actions.saveConfiguration}
+          onClose={actions.closeConfiguration}
         />
       ) : null}
       {overlay?.kind === "arguments" && display.argumentRequest !== null ? (

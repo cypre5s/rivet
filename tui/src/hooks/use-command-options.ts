@@ -2,7 +2,7 @@ import { useMemo } from "react";
 
 import { rankFilePaths } from "../components/file-picker.tsx";
 import type { RivetState } from "../state/reducer.ts";
-import { MODELS, type Overlay } from "../ui/app-model.ts";
+import type { Overlay } from "../ui/app-model.ts";
 import { COMMAND_REGISTRY } from "../ui/command-registry.ts";
 import { searchCommands } from "../ui/command-search.ts";
 import {
@@ -26,6 +26,7 @@ export function useCommandOptions({
   fileQuery,
   contextFiles,
   argumentRequest,
+  models,
 }: {
   state: RivetState;
   topOverlay: Overlay | null;
@@ -38,6 +39,7 @@ export function useCommandOptions({
   fileQuery: string;
   contextFiles: string[];
   argumentRequest: CommandArgumentRequest | null;
+  models: string[];
 }) {
   const slashResults = useMemo(
     () =>
@@ -49,8 +51,8 @@ export function useCommandOptions({
     [input, recentCommandIds],
   );
   const paletteResources = useMemo(
-    () => createPaletteResources(state, files, MODELS),
-    [files, state],
+    () => createPaletteResources(state, files, models),
+    [files, models, state],
   );
   const paletteResults = useMemo(
     () =>
@@ -69,7 +71,7 @@ export function useCommandOptions({
       })),
     [history, overlayQuery],
   );
-  const modelOptions = MODELS.filter((model) =>
+  const modelOptions = models.filter((model) =>
     model.toLocaleLowerCase().includes(overlayQuery.toLocaleLowerCase()),
   ).map((model) => ({
     id: model,
@@ -92,10 +94,14 @@ export function useCommandOptions({
       topOverlay.commandName,
       argumentRequest.query,
       {
-        models: [...MODELS],
+        models,
         sessions: state.sessions,
-        transactions:
-          state.transaction === "无" ? [] : [state.transaction],
+        transactions: [
+          ...(state.transaction === "无" ? [] : [state.transaction]),
+          ...state.transactions
+            .map((transaction) => transaction.transactionId)
+            .filter((transactionId) => transactionId !== state.transaction),
+        ],
         modules: state.modules,
         moduleStatuses: state.moduleStatuses,
         files,
@@ -120,10 +126,12 @@ export function useCommandOptions({
     argumentRequest,
     contextFiles,
     files,
+    models,
     state.modules,
     state.moduleStatuses,
     state.sessions,
     state.transaction,
+    state.transactions,
     topOverlay,
   ]);
 

@@ -14,6 +14,7 @@ export type Overlay =
   | { kind: "files" }
   | { kind: "history" }
   | { kind: "models" }
+  | { kind: "config" }
   | { kind: "arguments"; commandName: string }
   | { kind: "leader" }
   | { kind: "info"; title: string; lines: string[] }
@@ -25,7 +26,6 @@ export type Overlay =
     };
 
 export const MODES: readonly WorkMode[] = ["ASK", "PLAN", "FIX"];
-export const MODELS = ["deepseek-v4-pro", "deepseek-v4-flash"] as const;
 export const MAX_CONTEXT_FILES = 20;
 export const PLACEHOLDERS = [
   "修复失败的测试并给出验证证据",
@@ -37,6 +37,7 @@ export const TIPS = [
   "输入 / 可以查看 Rivet 的全部操作",
   "输入 @ 可以把仓库文件加入上下文",
   "修改只发生在隔离事务，验证通过后才能 Apply",
+  "Ctrl+G 快速配置会话 Key、API 地址和模型目录",
   "Ctrl+X 打开 Leader 快捷键提示",
 ] as const;
 
@@ -140,6 +141,8 @@ export function keyHelpLines(): string[] {
     "Ctrl+P      全局命令面板",
     "Ctrl+O      文件选择器",
     "Ctrl+R      输入历史",
+    "Ctrl+K      快速选择已配置模型",
+    "Ctrl+G      连接、Key 与模型配置",
     "Ctrl+X      Leader 快捷键",
     "Tab         ASK → PLAN → FIX",
     "Shift+Tab   反向切换模式",
@@ -160,7 +163,8 @@ export function statusLines(
     `连接：${state.connection}`,
     `模式：${mode}`,
     `阶段：${running ? "RUNNING" : state.plan.phase}`,
-    `模型：${state.credentialConfigured ? state.model : "未配置"}`,
+    `模型：${state.model}（${state.models.length} 个可用）`,
+    `凭据：${state.credentialConfigured ? "当前会话已配置" : "未配置"}`,
     `会话：${state.sessionId ?? "无"}`,
     `事务：${state.transaction}`,
     `验证：${state.verifyStatus}`,

@@ -131,6 +131,9 @@ export function useAppKeyboard(
       }
       return;
     }
+    if (state.topOverlay?.kind === "config") {
+      return;
+    }
     if (state.topOverlay !== null) {
       if (handleOverlayKey(key.name, key.shift)) key.preventDefault();
       return;
@@ -153,6 +156,12 @@ export function useAppKeyboard(
     } else if (command === "history.open") {
       key.preventDefault();
       actions.pushOverlay({ kind: "history" });
+    } else if (command === "models.open") {
+      key.preventDefault();
+      actions.pushOverlay({ kind: "models" });
+    } else if (command === "config.open") {
+      key.preventDefault();
+      actions.pushOverlay({ kind: "config" });
     } else if (command === "leader.open") {
       key.preventDefault();
       actions.pushOverlay({ kind: "leader" });

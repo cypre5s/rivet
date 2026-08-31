@@ -31,6 +31,12 @@ describe("Rivet keymap", () => {
     expect(resolveKeyCommand({ name: "r", shift: true, ctrl: true })).toBe(
       "worker.recover",
     );
+    expect(resolveKeyCommand({ name: "k", shift: false, ctrl: true })).toBe(
+      "models.open",
+    );
+    expect(resolveKeyCommand({ name: "g", shift: false, ctrl: true })).toBe(
+      "config.open",
+    );
     expect(resolveKeyCommand({ name: "return", shift: false, ctrl: false })).toBe(
       "input.submit",
     );
