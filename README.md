@@ -85,8 +85,8 @@ Reader 的真实结果会标记不可信文件内容，并保留命令与完成�
 当前仓库为 Private，克隆前需要相应的 GitHub 访问权限。Ubuntu 24.04 上从源码启动：
 
 ```bash
-git clone https://github.com/cypre5s/rivet_cli.git
-cd rivet_cli
+git clone https://github.com/cypre5s/rivet.git
+cd rivet
 uv sync --all-extras --dev --frozen
 bun install --cwd tui --frozen-lockfile
 
