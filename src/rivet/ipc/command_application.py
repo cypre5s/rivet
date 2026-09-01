@@ -19,7 +19,7 @@ from typing import TypedDict, cast
 from pydantic import JsonValue
 
 from rivet.cli.config import CONFIG_FIELDS, load_config, save_user_config
-from rivet.cli.errors import CliConfigurationError
+from rivet.cli.errors import CliConfigurationError, CliVerificationError
 from rivet.cli.modules import ModuleCommandController
 from rivet.contracts.ipc import IpcRequest
 from rivet.contracts.modules import ModuleOperationSource
@@ -185,15 +185,20 @@ class CommandWorkerApplication(BaseWorkerApplication):
                     "context.selected",
                     {"path": path, "reason": "用户显式选择"},
                 )
+            fix_write_scope = (
+                self._preview_fix_write_scope(request) if command == "fix" else ()
+            )
             arguments = self._arguments(
                 request,
                 command,
                 context_paths=context_paths,
+                fix_write_scope=fix_write_scope,
             )
             resumes_fix = command == "resume" and self._resume_command_is_fix(request)
             if command == "fix" or resumes_fix:
                 await self._request_fix_permission(
                     command=command,
+                    write_scope=fix_write_scope,
                     emit=emit,
                     cancel_event=cancel_event,
                 )
@@ -711,6 +716,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
         self,
         *,
         command: str,
+        write_scope: tuple[str, ...],
         emit: EmitEvent,
         cancel_event: asyncio.Event,
     ) -> None:
@@ -726,9 +732,13 @@ class CommandWorkerApplication(BaseWorkerApplication):
                     if command == "fix"
                     else "rivet resume SESSION_ID --yes"
                 ),
-                "cwd": ".",
+                "cwd": "独立 Transaction Worktree",
                 "network": "仅模型 Provider",
-                "paths": "隔离事务 Worktree",
+                "paths": (
+                    f"允许修改：{', '.join(write_scope)}；禁止修改：其他文件"
+                    if write_scope
+                    else "由冻结 AcceptanceSpec 限定；禁止修改范围外文件"
+                ),
                 "permission": "WRITE+EXECUTE+NETWORK",
                 "reason": "修改隔离副本并运行冻结验证命令",
                 "request_id": permission_id,
@@ -803,6 +813,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
         command: str,
         *,
         context_paths: tuple[str, ...] = (),
+        fix_write_scope: tuple[str, ...] = (),
     ) -> tuple[str, ...]:
         """严格把 JSON 参数转成无 shell argv。"""
         prefix: tuple[str, ...] = (
@@ -849,7 +860,11 @@ class CommandWorkerApplication(BaseWorkerApplication):
                         "减少输入文本或上下文文件后重试",
                     )
                 query = f"{query}{context_suffix}"
-            return (*prefix, query)
+            arguments = (*prefix, query)
+            if command == "fix":
+                for path in fix_write_scope:
+                    arguments = (*arguments, "--allow-write", path)
+            return arguments
         if command == "read":
             path = request.params.get("file")
             if not isinstance(path, str) or not path or len(path) > 4_096:
@@ -975,6 +990,31 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 "刷新事务状态并使用有效 TX_ID",
             )
         return (*prefix, transaction_id)
+
+    def _preview_fix_write_scope(self, request: IpcRequest) -> tuple[str, ...]:
+        """在权限确认前复用正式解析器冻结并展示候选写范围。"""
+        query = request.params.get("query")
+        if not isinstance(query, str) or not query:
+            return ()
+        from rivet.cli.model_commands import resolve_task_acceptance_scope
+
+        try:
+            return resolve_task_acceptance_scope(
+                self._repository,
+                query,
+                explicit_paths=(),
+            ).write_scope
+        except (CliConfigurationError, CliVerificationError) as error:
+            if error.code in {
+                "acceptance.write_scope_required",
+                "workspace.git_inventory_failed",
+            }:
+                return ()
+            raise WorkerMethodError(
+                error.code,
+                error.summary,
+                error.next_action,
+            ) from error
 
     def _selected_context_paths(self, request: IpcRequest) -> tuple[str, ...]:
         """校验用户显式选择的仓库文件，且不读取文件正文。"""
@@ -1429,9 +1469,24 @@ class CommandWorkerApplication(BaseWorkerApplication):
             )
         evidence_id = payload.get("evidence_id")
         if isinstance(evidence_id, str):
+            evidence_payload: dict[str, JsonValue] = {
+                "evidence_id": evidence_id,
+                "summary": "证据已发布",
+            }
+            for key in (
+                "acceptance_sha256",
+                "changed_files",
+                "changed_symbols",
+                "manifest_sha256",
+                "patch_sha256",
+                "verification_results",
+            ):
+                value = payload.get(key)
+                if value is not None:
+                    evidence_payload[key] = value
             await emit(
                 "evidence.published",
-                {"evidence_id": evidence_id, "summary": "证据已发布"},
+                evidence_payload,
             )
         usage = payload.get("usage")
         if isinstance(usage, dict):

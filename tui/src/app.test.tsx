@@ -892,6 +892,46 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderer.destroy());
   });
 
+  test("shows hash-bound evidence and verification stages", async () => {
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          sessionId: "session_demo",
+          evidenceId: "evidence_demo",
+          evidence: {
+            evidenceId: "evidence_demo",
+            acceptanceSha256: "a".repeat(64),
+            patchSha256: "p".repeat(64),
+            manifestSha256: "m".repeat(64),
+            changedFiles: ["calculator.py"],
+            changedSymbols: ["total_with_tax"],
+            verificationResults: [
+              { kind: "V0_ENVIRONMENT", status: "PASSED" },
+              { kind: "V10_RESOURCE", status: "PASSED" },
+            ],
+          },
+          verifyStatus: "PASSED",
+        })}
+        noColor={true}
+      />,
+      { width: 120, height: 34 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
+    await act(async () => setup.mockInput.pressKey("e"));
+    await setup.flush();
+
+    const panel = setup.captureCharFrame();
+    expect(panel).toContain("AcceptanceSpec SHA-256");
+    expect(panel).toContain("Patch SHA-256");
+    expect(panel).toContain("Manifest SHA-256");
+    expect(panel).toContain("calculator.py");
+    expect(panel).toContain("total_with_tax");
+    expect(panel).toContain("V0_ENVIRONMENT");
+    expect(panel).toContain("V10_RESOURCE");
+    await act(async () => setup.renderer.destroy());
+  });
+
   test("treats Escape on a permission prompt as an explicit denial", async () => {
     const decisions: Array<[string, boolean]> = [];
     const setup = await testRender(

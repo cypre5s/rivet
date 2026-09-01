@@ -7,7 +7,7 @@ import os
 import subprocess
 import uuid
 from argparse import Namespace
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -47,6 +47,7 @@ from rivet.contracts.messages import (
 from rivet.contracts.provider import TokenUsage
 from rivet.contracts.tools import SideEffectClass, ToolExecutionStatus
 from rivet.contracts.transactions import Command, TransactionState
+from rivet.contracts.verification import VerificationResult
 from rivet.kernel.agent_loop import AgentLoop, AgentProgress
 from rivet.kernel.agent_models import (
     AgentCompletionStatus,
@@ -657,9 +658,12 @@ async def run_model_command(
             transaction_id=transaction_id,
             patch_id=patch.patch_id,
             evidence_id=outcome.verdict.evidence_id,
+            acceptance_sha256=patch.acceptance_sha256,
             manifest_sha256=outcome.manifest_sha256,
+            patch_sha256=patch.patch_sha256,
             changed_files=patch.changed_files,
             changed_symbols=patch.changed_symbols,
+            verification_results=outcome.verdict.results,
             status=outcome.verdict.status.value,
             passed=outcome.verdict.passed,
             json_output=json_output,
@@ -819,10 +823,15 @@ def resolve_task_acceptance_scope(
     boundary = WorkspaceBoundary(repository)
     tracked = _tracked_paths(repository)
     tracked_set = set(tracked)
+    exclusive_paths = _exclusive_task_write_paths(task, tracked)
     if explicit_paths:
         requested = explicit_paths
         source = "explicit"
         reason = "用户通过 --allow-write 显式确认的写范围"
+    elif exclusive_paths:
+        requested = exclusive_paths
+        source = "task"
+        reason = "用户在任务文本中明确限定的独占写范围"
     else:
         requested = tuple(path for path in tracked if path in task)
         source = "task"
@@ -856,7 +865,7 @@ def resolve_task_acceptance_scope(
         normalized.add(relative)
         if relative not in tracked_set:
             allowed_new.add(relative)
-    if not explicit_paths:
+    if not explicit_paths and not exclusive_paths:
         for selected in tuple(normalized):
             normalized.update(_corresponding_test_paths(selected, tracked_set))
     return TaskAcceptanceScope(
@@ -865,6 +874,37 @@ def resolve_task_acceptance_scope(
         source=source,
         reason=reason,
     )
+
+
+def _exclusive_task_write_paths(
+    task: str,
+    tracked_paths: tuple[str, ...],
+) -> tuple[str, ...]:
+    """提取用户以“只允许修改”明确限定的单句写范围。"""
+    markers = (
+        "只允许修改",
+        "仅允许修改",
+        "只修改",
+        "仅修改",
+        "only modify",
+        "modify only",
+    )
+    folded = task.casefold()
+    for marker in markers:
+        start = folded.find(marker.casefold())
+        if start < 0:
+            continue
+        clause_start = start + len(marker)
+        clause_end = len(task)
+        for delimiter in ("，", ",", "；", ";", "\n"):
+            position = task.find(delimiter, clause_start)
+            if position >= 0:
+                clause_end = min(clause_end, position)
+        clause = task[clause_start:clause_end]
+        selected = tuple(path for path in tracked_paths if path in clause)
+        if selected:
+            return selected
+    return ()
 
 
 def _corresponding_test_paths(
@@ -1380,9 +1420,12 @@ def _print_fix_result(
     transaction_id: str,
     patch_id: str,
     evidence_id: str,
+    acceptance_sha256: str,
     manifest_sha256: str,
+    patch_sha256: str,
     changed_files: tuple[str, ...],
     changed_symbols: tuple[str, ...],
+    verification_results: Sequence[VerificationResult],
     status: str,
     passed: bool,
     json_output: bool,
@@ -1390,6 +1433,7 @@ def _print_fix_result(
     """展示隔离补丁结论并明确 apply 仍需用户动作。"""
     payload: dict[str, object] = {
         "answer": result.answer or "",
+        "acceptance_sha256": acceptance_sha256,
         "apply_required": passed,
         "evidence_id": evidence_id,
         "manifest_sha256": manifest_sha256,
@@ -1397,8 +1441,13 @@ def _print_fix_result(
         "changed_symbols": list(changed_symbols),
         "model_status": result.completion_status.value,
         "patch_id": patch_id,
+        "patch_sha256": patch_sha256,
         "status": status,
         "transaction_id": transaction_id,
+        "verification_results": [
+            {"kind": item.step.kind.value, "status": item.status.value}
+            for item in verification_results
+        ],
     }
     if json_output:
         _print_json(payload)

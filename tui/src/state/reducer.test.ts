@@ -41,7 +41,18 @@ describe("Trace-driven reducer", () => {
       event(1, "plan.updated", { phase: "VERIFY", summary: "执行验证" }),
       event(2, "context.selected", { path: "src/app.py", reason: "错误栈" }),
       event(3, "patch.updated", { diff: "@@ -1 +1 @@" }),
-      event(4, "evidence.published", { evidence_id: "evidence_one" }),
+      event(4, "evidence.published", {
+        evidence_id: "evidence_one",
+        acceptance_sha256: "a".repeat(64),
+        patch_sha256: "p".repeat(64),
+        manifest_sha256: "m".repeat(64),
+        changed_files: ["calculator.py"],
+        changed_symbols: ["total_with_tax"],
+        verification_results: [
+          { kind: "V0_ENVIRONMENT", status: "PASSED" },
+          { kind: "V10_RESOURCE", status: "PASSED" },
+        ],
+      }),
       event(5, "module.activated", { module_id: "reader.pdf" }),
       event(6, "budget.updated", { tokens: 120, cost_usd: 0.02, elapsed_ms: 80 }),
     ];
@@ -63,6 +74,12 @@ describe("Trace-driven reducer", () => {
     expect(state.context).toEqual([{ path: "src/app.py", reason: "错误栈" }]);
     expect(state.diff).toContain("@@");
     expect(state.evidenceId).toBe("evidence_one");
+    expect(state.evidence?.changedFiles).toEqual(["calculator.py"]);
+    expect(state.evidence?.changedSymbols).toEqual(["total_with_tax"]);
+    expect(state.evidence?.verificationResults).toEqual([
+      { kind: "V0_ENVIRONMENT", status: "PASSED" },
+      { kind: "V10_RESOURCE", status: "PASSED" },
+    ]);
     expect(state.modules).toEqual(["reader.pdf"]);
     expect(state.budget.tokens).toBe(120);
     expect(state.timeline).toHaveLength(7);

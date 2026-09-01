@@ -1,7 +1,7 @@
 schema_version = 1
 
 [rivet]
-model = "deepseek-v4-pro"
+model = "deepseek-v4-flash"
 max_rounds = 16
 max_total_tokens = 16000
 

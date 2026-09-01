@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -40,6 +41,17 @@ def test_demo_repository_has_clean_failing_baseline(tmp_path: Path) -> None:
     assert "FAIL" in baseline.stdout
     assert status.stdout == ""
     assert "calculator.py" in DEMO_TASK
+
+
+def test_demo_repository_uses_flash_without_a_cost_ceiling() -> None:
+    configuration = tomllib.loads(
+        (release_demo.FIXTURE_ROOT / ".rivet" / "project.toml").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert configuration["rivet"]["model"] == "deepseek-v4-flash"
+    assert "max_cost_usd" not in configuration["rivet"]
 
 
 def test_recorded_demo_turns_cover_context_patch_verify_and_diff() -> None:

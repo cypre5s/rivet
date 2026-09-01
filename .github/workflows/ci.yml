@@ -24,7 +24,8 @@ jobs:
           node-version: "24"
           cache: npm
           cache-dependency-path: tools/lsp/package-lock.json
-      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: uv sync --all-extras --dev --locked
       - run: bun install --cwd tui --frozen-lockfile
       - run: npm ci --prefix tools/lsp --ignore-scripts --no-audit --no-fund

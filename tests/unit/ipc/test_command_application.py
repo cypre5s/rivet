@@ -1098,6 +1098,116 @@ async def test_fix_waits_for_explicit_permission_then_adds_yes(
 
 
 @pytest.mark.asyncio
+async def test_fix_permission_shows_and_passes_exclusive_task_scope(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    for name in ("calculator.py", "test_calculator.py"):
+        (repository / name).write_text("VALUE = 1\n", encoding="utf-8")
+    subprocess.run(("git", "init", "-q", "-b", "main"), cwd=repository, check=True)
+    subprocess.run(("git", "add", "."), cwd=repository, check=True)
+    subprocess.run(
+        (
+            "git",
+            "-c",
+            "user.name=Fixture",
+            "-c",
+            "user.email=fixture@example.invalid",
+            "commit",
+            "-qm",
+            "initial",
+        ),
+        cwd=repository,
+        check=True,
+    )
+    arguments: list[tuple[str, ...]] = []
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+    permission_ready = asyncio.Event()
+
+    async def runner(argv: tuple[str, ...], _emit: EmitEvent) -> CommandExecution:
+        arguments.append(argv)
+        return CommandExecution(
+            0,
+            json.dumps(
+                {
+                    "acceptance_sha256": "a" * 64,
+                    "answer": "候选补丁已生成",
+                    "changed_files": ["calculator.py"],
+                    "changed_symbols": ["total_with_tax"],
+                    "evidence_id": "evidence_demo",
+                    "manifest_sha256": "m" * 64,
+                    "model_status": "READY_FOR_VERIFICATION",
+                    "patch_sha256": "p" * 64,
+                    "status": "PASSED",
+                    "transaction_id": "tx_demo",
+                    "verification_results": [
+                        {"kind": "V0_ENVIRONMENT", "status": "PASSED"},
+                        {"kind": "V10_RESOURCE", "status": "PASSED"},
+                    ],
+                }
+            ).encode(),
+            b"",
+        )
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+        if event_type == "permission.requested":
+            permission_ready.set()
+
+    application = CommandWorkerApplication(repository, runner=runner)
+    task = asyncio.create_task(
+        application.handle(
+            _request(
+                "request_fix_scope",
+                "command.fix",
+                {
+                    "context_paths": ["calculator.py", "test_calculator.py"],
+                    "query": (
+                        "修复 calculator.py，只允许修改 calculator.py，"
+                        "保留 test_calculator.py。"
+                    ),
+                },
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+    )
+    await permission_ready.wait()
+    permission = next(
+        payload
+        for event_type, payload in events
+        if event_type == "permission.requested"
+    )
+    assert permission["paths"] == "允许修改：calculator.py；禁止修改：其他文件"
+    assert permission["cwd"] == "独立 Transaction Worktree"
+    permission_id = permission["request_id"]
+    assert isinstance(permission_id, str)
+    await application.handle(
+        _request(
+            "request_scope_approval",
+            "permission.resolve",
+            {"approved": True, "request_id": permission_id},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+    await task
+
+    write_index = arguments[0].index("--allow-write")
+    assert arguments[0][write_index + 1] == "calculator.py"
+    evidence = next(
+        payload for event_type, payload in events if event_type == "evidence.published"
+    )
+    assert evidence["acceptance_sha256"] == "a" * 64
+    assert evidence["patch_sha256"] == "p" * 64
+    assert evidence["verification_results"] == [
+        {"kind": "V0_ENVIRONMENT", "status": "PASSED"},
+        {"kind": "V10_RESOURCE", "status": "PASSED"},
+    ]
+
+
+@pytest.mark.asyncio
 async def test_resume_fix_waits_for_explicit_permission_then_adds_yes(
     tmp_path: Path,
 ) -> None:

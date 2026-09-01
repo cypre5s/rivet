@@ -73,6 +73,23 @@ def test_task_scope_selects_named_target_and_corresponding_test(
     assert "README.md" not in scope.write_scope
 
 
+def test_task_scope_honors_exclusive_write_wording_and_preserves_named_test(
+    repository: Path,
+) -> None:
+    scope = resolve_task_acceptance_scope(
+        repository,
+        (
+            "修复 src/auth/login.py 中的登录问题，只允许修改 "
+            "src/auth/login.py，保留 tests/test_login.py 和现有公开接口。"
+        ),
+        explicit_paths=(),
+    )
+
+    assert scope.write_scope == ("src/auth/login.py",)
+    assert scope.allowed_new_paths == ()
+    assert scope.reason == "用户在任务文本中明确限定的独占写范围"
+
+
 def test_explicit_scope_can_allow_one_new_test_but_not_its_directory(
     repository: Path,
 ) -> None:

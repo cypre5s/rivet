@@ -55,6 +55,21 @@ export interface TransactionSummary {
   evidenceId: string | null;
 }
 
+export interface VerificationSummary {
+  kind: string;
+  status: string;
+}
+
+export interface EvidenceSummary {
+  evidenceId: string;
+  acceptanceSha256: string;
+  patchSha256: string;
+  manifestSha256: string;
+  changedFiles: string[];
+  changedSymbols: string[];
+  verificationResults: VerificationSummary[];
+}
+
 export interface RivetState {
   connection: ConnectionState;
   repository: string;
@@ -78,6 +93,7 @@ export interface RivetState {
   diff: string;
   verifyStatus: string;
   evidenceId: string;
+  evidence: EvidenceSummary | null;
   modules: string[];
   moduleStatuses: ModuleStatus[];
   permission: PermissionPrompt | null;
@@ -126,6 +142,7 @@ export function initialRivetState(): RivetState {
     diff: "",
     verifyStatus: "未验证",
     evidenceId: "无",
+    evidence: null,
     modules: [],
     moduleStatuses: [],
     permission: null,
@@ -223,6 +240,7 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       return {
         ...next,
         evidenceId: text(event.payload.evidence_id, "无"),
+        evidence: evidenceSummary(event.payload),
       };
     case "module.activated": {
       const moduleId = text(event.payload.module_id, "");
@@ -414,6 +432,29 @@ function transactionSummaryArray(value: JsonValue | undefined): TransactionSumma
     });
   }
   return transactions;
+}
+
+function evidenceSummary(payload: Record<string, JsonValue>): EvidenceSummary | null {
+  const evidenceId = text(payload.evidence_id, "");
+  if (!evidenceId) return null;
+  const verificationResults: VerificationSummary[] = [];
+  if (Array.isArray(payload.verification_results)) {
+    for (const value of payload.verification_results) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+      const kind = text(value.kind, "");
+      const status = text(value.status, "");
+      if (kind && status) verificationResults.push({ kind, status });
+    }
+  }
+  return {
+    evidenceId,
+    acceptanceSha256: text(payload.acceptance_sha256, "未提供"),
+    patchSha256: text(payload.patch_sha256, "未提供"),
+    manifestSha256: text(payload.manifest_sha256, "未提供"),
+    changedFiles: stringArray(payload.changed_files),
+    changedSymbols: stringArray(payload.changed_symbols),
+    verificationResults,
+  };
 }
 
 function stringRecord(

@@ -177,10 +177,41 @@ function PanelContent({
       <EmptyState text="当前没有可恢复会话" action="提交任务后会自动保存" theme={theme} />
     );
   }
+  if (panel === "Evidence") {
+    if (state.evidence === null) {
+      return (
+        <EmptyState
+          text={state.evidenceId === "无" ? "当前没有验证证据" : state.evidenceId}
+          action={state.evidenceId === "无" ? "完成独立验证后重试" : "当前只加载了证据索引"}
+          theme={theme}
+        />
+      );
+    }
+    const evidence = state.evidence;
+    const lines = [
+      `结论：${state.verifyStatus}`,
+      `Evidence：${evidence.evidenceId}`,
+      `AcceptanceSpec SHA-256：${evidence.acceptanceSha256}`,
+      `Patch SHA-256：${evidence.patchSha256}`,
+      `Manifest SHA-256：${evidence.manifestSha256}`,
+      `Changed Files：\n${evidence.changedFiles.join(", ") || "无"}`,
+      `Changed Symbols：\n${evidence.changedSymbols.join(", ") || "无"}`,
+      ...evidence.verificationResults.map(
+        (result) => `${result.kind}  ${result.status}`,
+      ),
+    ];
+    return (
+      <scrollbox flexGrow={1} focused={true}>
+        {lines.map((line) => (
+          <text key={line} fg={theme.textSecondary} content={line} />
+        ))}
+      </scrollbox>
+    );
+  }
   const content: Record<"Plan" | "Verify" | "Evidence", [string, string]> = {
     Plan: [state.plan.phase, state.plan.summary],
     Verify: [state.verifyStatus, verificationHint(state.verifyStatus)],
-    Evidence: [state.evidenceId, state.evidenceId === "无" ? "当前没有验证证据" : "证据由后端哈希校验"],
+    Evidence: [state.evidenceId, "证据由后端哈希校验"],
   };
   const [title, detail] = content[panel];
   return (
