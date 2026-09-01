@@ -15,6 +15,7 @@ from typing import cast
 from rivet.contracts.common import CapabilityId, ModuleId
 from rivet.contracts.modules import (
     ActivationPolicy,
+    ModuleAvailability,
     ModuleManifest,
     ModuleState,
     SleepPolicy,
@@ -27,9 +28,14 @@ from rivet.kernel.errors import (
     ModuleDependencyError,
     ModuleQuarantinedError,
     ModuleShutdownError,
+    ModuleUnavailableError,
     SafeModeViolationError,
 )
-from rivet.kernel.module_api import ModuleInstance
+from rivet.kernel.module_api import ModuleActivationContext, ModuleInstance
+from rivet.kernel.module_availability import (
+    ModuleAvailabilityReport,
+    probe_module_availability,
+)
 from rivet.kernel.module_graph import stable_activation_order
 from rivet.kernel.resources import ResourceCounts, ResourceScope
 
@@ -123,6 +129,7 @@ class _RuntimeModule:
     state: ModuleState
     lock: asyncio.Lock
     instance: ModuleInstance | None = None
+    capabilities: dict[str, object] | None = None
     scope: ResourceScope | None = None
     lease_count: int = 0
     idle_task: asyncio.Task[None] | None = None
@@ -145,29 +152,37 @@ class ModuleRuntimeSnapshot:
     dependencies: tuple[str, ...]
     dependents: tuple[str, ...]
     capabilities: tuple[str, ...]
+    availability: ModuleAvailability
+    missing_components: tuple[str, ...]
+    availability_action: str | None
     lease_count: int
     resource_counts: ResourceCounts
     quarantine_reason: str | None
     last_error: str | None
 
 
-class ModuleLease:
-    """在调用方使用能力期间阻止提供者及其依赖休眠。"""
+class CapabilityLease[CapabilityT]:
+    """暴露真实 capability，并在使用期间阻止依赖闭包休眠。"""
 
     def __init__(
         self,
         runtime: ModuleRuntime,
         module_ids: tuple[str, ...],
-        instance: ModuleInstance,
+        *,
+        capability_id: str,
+        module_id: str,
+        capability: CapabilityT,
     ) -> None:
         self._runtime = runtime
         self._module_ids = module_ids
-        self.instance = instance
+        self.capability_id = capability_id
+        self.module_id = module_id
+        self.capability = capability
         self._released = False
 
-    async def __aenter__(self) -> ModuleInstance:
-        """返回已激活的提供者实例。"""
-        return self.instance
+    async def __aenter__(self) -> CapabilityT:
+        """返回已激活的真实 capability。"""
+        return self.capability
 
     async def __aexit__(
         self,
@@ -197,9 +212,16 @@ class ModuleRuntime:
         journal: ActivationJournal,
         safe_mode: bool = False,
         enabled_overrides: Mapping[str, bool] | None = None,
+        activation_context: ModuleActivationContext | None = None,
     ) -> None:
         self.journal = journal
         self.safe_mode = safe_mode
+        self._activation_context = activation_context or ModuleActivationContext(
+            repository=journal.path.parent,
+            safe_mode=safe_mode,
+        )
+        if self._activation_context.safe_mode != safe_mode:
+            raise ValueError("ModuleActivationContext 与 Runtime Safe Mode 不一致")
         self._activation_order = stable_activation_order(manifests)
         self._manifest_by_id = {manifest.module_id: manifest for manifest in manifests}
         self._registry = CapabilityRegistry(manifests)
@@ -248,25 +270,33 @@ class ModuleRuntime:
             }:
                 await self._activate_module(module_id)
 
-    async def resolve(self, capability_id: CapabilityId) -> ModuleInstance:
-        """激活唯一提供者并在无 Lease 时安排可选模块休眠。"""
+    async def resolve(self, capability_id: CapabilityId) -> object:
+        """激活唯一提供者并返回 Manifest 对应的真实 capability。"""
         manifest = self._resolve_manifest(capability_id)
-        instance = await self._activate_module(manifest.module_id)
+        await self._activate_module(manifest.module_id)
+        capability = self._capability(manifest.module_id, capability_id)
         for module_id in self._dependency_closure(manifest.module_id):
             self._schedule_idle(module_id)
-        return instance
+        return capability
 
-    async def acquire_lease(self, capability_id: CapabilityId) -> ModuleLease:
+    async def acquire(self, capability_id: CapabilityId) -> CapabilityLease[object]:
         """激活能力并同时租用其完整依赖闭包。"""
         manifest = self._resolve_manifest(capability_id)
-        instance = await self._activate_module(manifest.module_id)
+        await self._activate_module(manifest.module_id)
+        capability = self._capability(manifest.module_id, capability_id)
         module_ids = self._dependency_closure(manifest.module_id)
         for module_id in module_ids:
             node = self._modules[module_id]
             await self._cancel_idle(node)
             node.lease_count += 1
             node.state = ModuleState.ACTIVE
-        return ModuleLease(self, module_ids, instance)
+        return CapabilityLease(
+            self,
+            module_ids,
+            capability_id=capability_id,
+            module_id=manifest.module_id,
+            capability=capability,
+        )
 
     def state(self, module_id: ModuleId) -> ModuleState:
         """返回模块当前状态，未知 ID 使用与 capability 一致的清晰错误。"""
@@ -299,6 +329,13 @@ class ModuleRuntime:
         if self.safe_mode and not node.manifest.safe_mode_allowed:
             return False
         return node.enabled
+
+    def availability(self, module_id: ModuleId) -> ModuleAvailabilityReport:
+        """不导入实现地返回当前本机的激活前提。"""
+        node = self._modules.get(module_id)
+        if node is None:
+            raise CapabilityNotFoundError(f"未知模块 {module_id}")
+        return probe_module_availability(node.manifest, safe_mode=self.safe_mode)
 
     def set_configured_enabled(self, module_id: ModuleId, enabled: bool) -> bool:
         """仅供统一生命周期服务在持久化成功后更新运行策略。"""
@@ -392,6 +429,7 @@ class ModuleRuntime:
         snapshots: list[ModuleRuntimeSnapshot] = []
         for module_id in self._activation_order:
             node = self._modules[module_id]
+            availability = self.availability(module_id)
             snapshots.append(
                 ModuleRuntimeSnapshot(
                     module_id=module_id,
@@ -410,6 +448,9 @@ class ModuleRuntime:
                         if candidate != module_id
                     ),
                     capabilities=node.manifest.provides,
+                    availability=availability.state,
+                    missing_components=availability.missing_components,
+                    availability_action=availability.suggested_action,
                     lease_count=node.lease_count,
                     resource_counts=(
                         node.scope.counts()
@@ -473,9 +514,11 @@ class ModuleRuntime:
                 node.last_error = "模块休眠或资源清理失败"
                 raise ModuleActivationError(f"模块 {module_id} 休眠失败") from error
             node.instance = None
+            node.capabilities = None
             node.scope = None
             with suppress(ValueError):
                 self._active_sequence.remove(module_id)
+            node.state = ModuleState.INACTIVE
             return True
 
     def resource_counts(self) -> ResourceCounts:
@@ -532,6 +575,7 @@ class ModuleRuntime:
                 node.lease_count = 0
                 if cleanup_succeeded:
                     node.instance = None
+                    node.capabilities = None
                     node.scope = None
                 if cleanup_succeeded and node.state is not ModuleState.QUARANTINED:
                     node.state = ModuleState.INACTIVE
@@ -572,6 +616,14 @@ class ModuleRuntime:
                 raise SafeModeViolationError(
                     f"Safe Mode 不允许激活可选模块 {module_id}"
                 )
+            availability = self.availability(module_id)
+            if availability.state is not ModuleAvailability.AVAILABLE:
+                raise ModuleUnavailableError(
+                    f"模块 {module_id} 当前不可用：{availability.state.value}",
+                    availability=availability.state.value,
+                    missing_components=availability.missing_components,
+                    suggested_action=availability.suggested_action,
+                )
             for dependency_id in sorted(node.manifest.requires):
                 await self._activate_module(dependency_id)
 
@@ -585,9 +637,38 @@ class ModuleRuntime:
                 if not isinstance(factory_result, ModuleInstance):
                     raise TypeError("factory 返回对象不满足 ModuleInstance 协议")
                 instance = factory_result
-                await instance.activate(scope)
+                dependency_capabilities: dict[str, object] = {}
+                for dependency_id in node.manifest.requires:
+                    dependency = self._modules[dependency_id]
+                    if dependency.capabilities is None:
+                        raise ModuleDependencyError(
+                            f"依赖模块 {dependency_id} 未提供 capability"
+                        )
+                    dependency_capabilities.update(dependency.capabilities)
+                context = self._activation_context.bind(
+                    module_id,
+                    node.manifest.provides,
+                    dependency_capabilities,
+                )
+                capability_mapping = dict(await instance.activate(context, scope))
+                expected = set(node.manifest.provides)
+                actual = set(capability_mapping)
+                if actual != expected:
+                    missing = sorted(expected - actual)
+                    unexpected = sorted(actual - expected)
+                    raise TypeError(
+                        "模块 capability mapping 与 Manifest 不一致："
+                        f"missing={missing}, unexpected={unexpected}"
+                    )
+                if any(value is None for value in capability_mapping.values()):
+                    raise TypeError("模块不得返回空 capability")
             except asyncio.CancelledError:
                 cleanup_failed = False
+                if instance is not None:
+                    try:
+                        await instance.shutdown()
+                    except Exception:
+                        cleanup_failed = True
                 try:
                     await scope.close()
                 except Exception:
@@ -601,6 +682,11 @@ class ModuleRuntime:
                 raise
             except Exception as error:
                 cleanup_failed = False
+                if instance is not None:
+                    try:
+                        await instance.shutdown()
+                    except Exception:
+                        cleanup_failed = True
                 try:
                     await scope.close()
                 except Exception:
@@ -615,6 +701,7 @@ class ModuleRuntime:
 
             self.journal.clear_pending(module_id)
             node.instance = instance
+            node.capabilities = capability_mapping
             node.scope = scope
             node.state = ModuleState.ACTIVE
             node.last_error = None
@@ -622,6 +709,15 @@ class ModuleRuntime:
                 self._active_sequence.remove(module_id)
             self._active_sequence.append(module_id)
             return instance
+
+    def _capability(self, module_id: str, capability_id: str) -> object:
+        """从已激活模块读取严格校验过的 capability。"""
+        capabilities = self._modules[module_id].capabilities
+        if capabilities is None or capability_id not in capabilities:
+            raise ModuleActivationError(
+                f"模块 {module_id} 未提供 capability {capability_id}"
+            )
+        return capabilities[capability_id]
 
     def _resolve_manifest(self, capability_id: CapabilityId) -> ModuleManifest:
         """应用 registry 与 Safe Mode 权限边界。"""

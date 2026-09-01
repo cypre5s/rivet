@@ -56,6 +56,11 @@ class SecretRedactor:
             redacted = pattern.sub(REDACTED_TEXT, redacted)
         return redacted
 
+    @property
+    def longest_environment_secret_length(self) -> int:
+        """返回流式边界必须保留的最长环境秘密长度。"""
+        return max((len(secret) for secret in self._environment_secrets), default=0)
+
     def redact_payload(self, payload: dict[str, JsonValue]) -> dict[str, JsonValue]:
         """递归删除禁止字段，并保留不含值的字段名审计清单。"""
         return self._redact_mapping(payload)
@@ -109,3 +114,61 @@ class SecretRedactor:
         if isinstance(value, dict):
             return self._redact_mapping(value)
         return value
+
+
+class StreamingSecretRedactor:
+    """保留敏感尾部，只发布可安全替换的累计文本快照。"""
+
+    _BOUNDARIES = frozenset("\n\r\t 。！？；，,;:：")
+
+    def __init__(
+        self,
+        redactor: SecretRedactor,
+        *,
+        min_increment: int = 24,
+    ) -> None:
+        if min_increment < 1:
+            raise ValueError("min_increment 必须大于零")
+        self._redactor = redactor
+        self._min_increment = min_increment
+        self._holdback = max(32, redactor.longest_environment_secret_length)
+        self._raw = ""
+        self._published_cut = 0
+        self._last_snapshot = ""
+        self._finalized = False
+
+    def feed(self, delta: str) -> str | None:
+        """追加模型正文，并在安全边界返回新的累计脱敏快照。"""
+        if self._finalized:
+            raise RuntimeError("流式脱敏器已结束")
+        if not delta:
+            return None
+        self._raw += delta
+        safe_limit = max(0, len(self._raw) - self._holdback)
+        safe_cut = self._last_boundary(safe_limit)
+        if safe_cut <= self._published_cut:
+            return None
+        if safe_cut - self._published_cut < self._min_increment:
+            return None
+        return self._publish(safe_cut)
+
+    def finalize(self) -> str | None:
+        """结束流并发布包含剩余尾部的最终脱敏快照。"""
+        if self._finalized:
+            return None
+        self._finalized = True
+        return self._publish(len(self._raw))
+
+    def _last_boundary(self, limit: int) -> int:
+        for index in range(min(limit, len(self._raw)) - 1, -1, -1):
+            if self._raw[index] in self._BOUNDARIES:
+                return index + 1
+        return 0
+
+    def _publish(self, cut: int) -> str | None:
+        snapshot = self._redactor.redact_text(self._raw[:cut])
+        self._published_cut = cut
+        if snapshot == self._last_snapshot:
+            return None
+        self._last_snapshot = snapshot
+        return snapshot

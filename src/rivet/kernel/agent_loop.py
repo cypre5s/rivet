@@ -29,7 +29,7 @@ from rivet.kernel.agent_models import (
     AgentTerminationReason,
 )
 from rivet.kernel.agent_tools import AgentTool, AgentToolValidationError
-from rivet.kernel.model_provider import ModelProvider
+from rivet.kernel.model_provider import ModelProvider, ModelTextDeltaCallback
 
 Clock = Callable[[], datetime]
 MonotonicClock = Callable[[], float]
@@ -75,6 +75,7 @@ class AgentLoop:
         config: AgentLoopConfig | None = None,
         context_gatherer: ContextGatherer | None = None,
         progress_callback: ProgressCallback | None = None,
+        text_delta_callback: ModelTextDeltaCallback | None = None,
         clock: Clock | None = None,
         monotonic: MonotonicClock = time.monotonic,
     ) -> None:
@@ -82,6 +83,7 @@ class AgentLoop:
         self._config = config or AgentLoopConfig()
         self._context_gatherer = context_gatherer
         self._progress_callback = progress_callback
+        self._text_delta_callback = text_delta_callback
         self._clock = clock or (lambda: datetime.now(UTC))
         self._monotonic = monotonic
         self._tools = {tool.definition.name: tool for tool in tools}
@@ -311,6 +313,7 @@ class AgentLoop:
                 )
 
             round_made_progress = False
+            workspace_changed = False
             for call in response.message.tool_calls:
                 transition(AgentLoopState.AUTHORIZE)
                 fingerprint = self._tool_fingerprint(call)
@@ -383,45 +386,44 @@ class AgentLoop:
                         created_at=self._clock(),
                     )
                 )
-                if self._context_gatherer is not None and _may_change_workspace(
-                    call.tool_name
-                ):
-                    try:
-                        refreshed = await self._gather_context_with_limits(
-                            task,
-                            cancel_event=cancel_event,
-                            timeout_seconds=max(
-                                0.001,
-                                self._config.max_wall_seconds
-                                - (self._monotonic() - started_at),
-                            ),
-                        )
-                    except _RunCancelled:
-                        return result(
-                            AgentLoopState.CANCELLED,
-                            AgentTerminationReason.USER_CANCELLED,
-                        )
-                    except TimeoutError:
-                        return result(
-                            AgentLoopState.FAILED,
-                            AgentTerminationReason.WALL_TIME_EXCEEDED,
-                        )
-                    except Exception:
-                        return result(
-                            AgentLoopState.FAILED,
-                            AgentTerminationReason.CONTEXT_FAILED,
-                        )
-                    messages.extend(refreshed)
-                await self._save_progress(
-                    messages,
-                    round_count=round_count,
-                    tool_call_count=tool_call_count,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    reasoning_tokens=reasoning_tokens,
-                    total_cost=total_cost,
-                )
+                workspace_changed |= _may_change_workspace(call.tool_name)
                 transition(AgentLoopState.OBSERVE)
+            if workspace_changed and self._context_gatherer is not None:
+                try:
+                    refreshed = await self._gather_context_with_limits(
+                        task,
+                        cancel_event=cancel_event,
+                        timeout_seconds=max(
+                            0.001,
+                            self._config.max_wall_seconds
+                            - (self._monotonic() - started_at),
+                        ),
+                    )
+                except _RunCancelled:
+                    return result(
+                        AgentLoopState.CANCELLED,
+                        AgentTerminationReason.USER_CANCELLED,
+                    )
+                except TimeoutError:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.WALL_TIME_EXCEEDED,
+                    )
+                except Exception:
+                    return result(
+                        AgentLoopState.FAILED,
+                        AgentTerminationReason.CONTEXT_FAILED,
+                    )
+                messages.extend(refreshed)
+            await self._save_progress(
+                messages,
+                round_count=round_count,
+                tool_call_count=tool_call_count,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                reasoning_tokens=reasoning_tokens,
+                total_cost=total_cost,
+            )
             transition(AgentLoopState.EVALUATE)
             if round_made_progress:
                 no_progress_rounds = 0
@@ -470,7 +472,12 @@ class AgentLoop:
         timeout_seconds: float,
     ) -> ModelResponse:
         """让墙钟超时和用户取消都能取消正在进行的 HTTP 调用。"""
-        provider_task = asyncio.create_task(self._provider.complete(request))
+        provider_task = asyncio.create_task(
+            self._provider.complete(
+                request,
+                on_text_delta=self._text_delta_callback,
+            )
+        )
         cancel_task = (
             asyncio.create_task(cancel_event.wait())
             if cancel_event is not None

@@ -20,6 +20,7 @@ EXPECTED_CAPABILITIES = {
     "reader.image",
     "reader.media",
     "reader.archive",
+    "reader.archive.sevenzip",
     "reader.email",
     "reader.binary",
 }

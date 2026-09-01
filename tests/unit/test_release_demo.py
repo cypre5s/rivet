@@ -51,6 +51,7 @@ def test_demo_repository_uses_flash_without_a_cost_ceiling() -> None:
     )
 
     assert configuration["rivet"]["model"] == "deepseek-v4-flash"
+    assert configuration["rivet"]["max_total_tokens"] >= 128_000
     assert "max_cost_usd" not in configuration["rivet"]
 
 

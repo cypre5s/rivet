@@ -31,6 +31,7 @@ from tests.transaction_helpers import (
     acceptance_spec,
     initialize_repository,
     passed_verdict,
+    run_git,
 )
 
 
@@ -292,6 +293,18 @@ def test_cli_resume_verification_stage_runs_real_matrix_and_fails_closed(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     repository = initialize_repository(tmp_path)
+    project_config = repository / ".rivet" / "project.toml"
+    project_config.parent.mkdir()
+    project_config.write_text(
+        """schema_version = 1
+
+[verification]
+acceptance = [["git", "diff", "--check"]]
+""",
+        encoding="utf-8",
+    )
+    run_git(repository, "add", "--", ".rivet/project.toml")
+    run_git(repository, "commit", "-qm", "configure independent acceptance")
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     assert configure_runtime_excludes(repository) is True
 

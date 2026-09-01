@@ -81,6 +81,16 @@ class ModuleState(StrEnum):
     QUARANTINED = "QUARANTINED"
 
 
+class ModuleAvailability(StrEnum):
+    """描述 capability 在本机是否具备激活前提。"""
+
+    AVAILABLE = "AVAILABLE"
+    MISSING_DEPENDENCY = "MISSING_DEPENDENCY"
+    MISSING_EXECUTABLE = "MISSING_EXECUTABLE"
+    UNSUPPORTED = "UNSUPPORTED"
+    SAFE_MODE_RESTRICTED = "SAFE_MODE_RESTRICTED"
+
+
 class ResourceKind(StrEnum):
     """标识必须由 ResourceScope 回收的长期或外部资源。"""
 
@@ -110,6 +120,9 @@ class ModuleManifest(ContractModel):
     priority: int = 0
     provides: tuple[CapabilityId, ...] = Field(min_length=1)
     requires: tuple[ModuleId, ...] = ()
+    required_python_packages: tuple[str, ...] = ()
+    required_executables: tuple[str, ...] = ()
+    install_extra: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]*$")
     idle_timeout_seconds: int | None = Field(default=300, ge=0)
 
     @model_validator(mode="after")
@@ -121,6 +134,19 @@ class ModuleManifest(ContractModel):
             raise ValueError("Manifest 不得重复声明依赖")
         if self.module_id in self.requires:
             raise ValueError("Manifest 不得依赖自身")
+        for label, components in (
+            ("Python 依赖", self.required_python_packages),
+            ("executable 依赖", self.required_executables),
+        ):
+            if len(set(components)) != len(components):
+                raise ValueError(f"Manifest 不得重复声明{label}")
+            if any(
+                not component
+                or len(component) > 128
+                or not component.replace("_", "a").replace("-", "a").isalnum()
+                for component in components
+            ):
+                raise ValueError(f"Manifest {label}名称无效")
         if self.activation is ActivationPolicy.REQUIRED and not self.enabled:
             raise ValueError("必需模块不得默认禁用")
         return self
@@ -157,6 +183,9 @@ class ModuleStatus(ContractModel):
     dependencies: tuple[ModuleId, ...] = ()
     dependents: tuple[ModuleId, ...] = ()
     provided_capabilities: tuple[CapabilityId, ...] = ()
+    availability: ModuleAvailability
+    missing_components: tuple[str, ...] = ()
+    availability_action: str | None = None
     lease_count: int = Field(ge=0)
     active_resource_count: int = Field(ge=0)
     last_error: str | None = None

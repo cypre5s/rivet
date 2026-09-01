@@ -6,14 +6,17 @@ import json
 import os
 import subprocess
 from argparse import Namespace
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
 
 import rivet.cli.model_commands as model_commands
+import rivet.kernel.module_availability as module_availability
+import rivet.modules.factories as module_factories
 from rivet.cli.config import ResolvedConfig
-from rivet.cli.errors import CliProviderError
+from rivet.cli.errors import CliProviderError, CliVerificationError
 from rivet.cli.exit_codes import ExitCode
 from rivet.contracts.messages import (
     AssistantMessage,
@@ -69,6 +72,29 @@ def _repository(tmp_path: Path) -> Path:
     _git(repository, "add", "--", "tracked.txt")
     _git(repository, "commit", "-qm", "initial")
     return repository
+
+
+def _configure_independent_acceptance(repository: Path) -> None:
+    """提交一个独立、固定 argv 行为验收，使 FIX Evidence 预检就绪。"""
+    runtime = repository / ".rivet"
+    runtime.mkdir(exist_ok=True)
+    (runtime / "project.toml").write_text(
+        """schema_version = 1
+
+[rivet]
+safe_mode = false
+
+[verification]
+acceptance = [["python", "-c", "raise SystemExit(0)"]]
+targeted = []
+related = []
+regression = []
+static = []
+""",
+        encoding="utf-8",
+    )
+    _git(repository, "add", "--", ".rivet/project.toml")
+    _git(repository, "commit", "-qm", "configure independent acceptance")
 
 
 def _config() -> ResolvedConfig:
@@ -183,17 +209,29 @@ def _install_provider(
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             self.requests: list[ModelRequest] = []
 
-        async def complete(self, request: ModelRequest) -> ModelResponse:
+        async def complete(
+            self,
+            request: ModelRequest,
+            *,
+            on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        ) -> ModelResponse:
             """记录请求并返回下一个响应。"""
             self.requests.append(request)
             requests.append(request)
-            return responses.pop(0)
+            response = responses.pop(0)
+            if on_text_delta is not None and response.message.content:
+                await on_text_delta(response.message.content)
+            return response
 
-    def create_provider(**_kwargs: object) -> ScriptedProvider:
+    def create_provider(*_args: object, **_kwargs: object) -> ScriptedProvider:
         """在正式惰性 Provider 边界注入录制原语。"""
         return ScriptedProvider()
 
-    monkeypatch.setattr(model_commands, "_create_provider", create_provider)
+    monkeypatch.setattr(
+        module_factories,
+        "_create_deepseek_provider",
+        create_provider,
+    )
     return requests
 
 
@@ -225,7 +263,165 @@ async def test_read_only_model_commands_persist_trace_and_checkpoint(
         SessionStatus.ANSWERED if command == "ask" else SessionStatus.PLANNED
     )
     assert checkpoint.provider_state == {"reasoning_content": "opaque"}
-    assert (repository / ".rivet" / "trace" / "events.ndjson").is_file()
+    trace_path = repository / ".rivet" / "trace" / "events.ndjson"
+    assert trace_path.is_file()
+    trace_text = trace_path.read_text(encoding="utf-8")
+    assert '"event_type":"agent.output.delta"' in trace_text
+    assert '"response_id":"response_' in trace_text
+    events = [json.loads(line)["event"] for line in trace_text.splitlines()]
+    event_types = [event["event_type"] for event in events]
+    assert "module.requested" in event_types
+    assert "module.activated" in event_types
+    assert "module.released" in event_types
+    model_stage_releases = [
+        event
+        for event in events
+        if event["event_type"] == "module.released"
+        and event["payload"].get("reason") == "model_stage_complete"
+    ]
+    assert {event["payload"]["module_id"] for event in model_stage_releases} == {
+        "guard.sandbox",
+        "provider.deepseek",
+    }
+    assert all(
+        event["payload"]["state"] == "INACTIVE" for event in model_stage_releases
+    )
+    assert all(
+        event["payload"]["resource_count"] == 0 for event in model_stage_releases
+    )
+
+
+@pytest.mark.asyncio
+async def test_core_profile_ask_degrades_when_syntax_extra_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """缺 Tree-sitter 不得阻止 ASK 使用 lexical fallback 完成。"""
+    repository = _repository(tmp_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _install_provider(monkeypatch, [_response("基础能力回答")])
+    original_find_spec = module_availability.importlib.util.find_spec
+
+    def without_syntax(name: str) -> object:
+        if name.startswith("tree_sitter"):
+            return None
+        return original_find_spec(name)
+
+    monkeypatch.setattr(
+        module_availability.importlib.util,
+        "find_spec",
+        without_syntax,
+    )
+
+    exit_code = await model_commands.run_model_command(
+        Namespace(command="ask", query="解释仓库"),
+        repository=repository,
+        config=_config(),
+        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
+        json_output=True,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    trace_text = (repository / ".rivet" / "trace" / "events.ndjson").read_text(
+        encoding="utf-8"
+    )
+    assert exit_code == 0
+    assert payload["answer"] == "基础能力回答"
+    assert '"event_type":"module.activation_failed"' in trace_text
+    assert '"availability":"MISSING_DEPENDENCY"' in trace_text
+    assert '"event_type":"run.completed"' in trace_text
+
+
+@pytest.mark.asyncio
+async def test_fix_without_independent_acceptance_fails_before_kernel_or_cost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository(tmp_path)
+
+    def forbidden_kernel(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("Evidence 预检失败时不得创建 Kernel 或 Provider")
+
+    monkeypatch.setattr(model_commands, "create_cli_kernel", forbidden_kernel)
+
+    with pytest.raises(CliVerificationError) as captured:
+        await model_commands.run_model_command(
+            Namespace(
+                command="fix",
+                dirty_policy="reject",
+                task="修改 tracked.txt",
+                yes=True,
+            ),
+            repository=repository,
+            config=_config(),
+            environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
+            json_output=True,
+        )
+
+    assert captured.value.code == "verification.acceptance_not_ready"
+    assert not (repository / ".rivet" / "sessions").exists()
+
+
+@pytest.mark.asyncio
+async def test_candidate_only_records_patch_without_verify_or_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    repository = _repository(tmp_path)
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _install_provider(
+        monkeypatch,
+        [
+            _response(
+                "",
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_candidate_write",
+                        tool_name="file.write_transaction",
+                        arguments={"content": "candidate\n", "path": "tracked.txt"},
+                    ),
+                ),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            ),
+            _response("候选修改已完成"),
+        ],
+    )
+
+    exit_code = await model_commands.run_model_command(
+        Namespace(
+            candidate_only=True,
+            command="fix",
+            dirty_policy="reject",
+            task="修改 tracked.txt",
+            yes=True,
+        ),
+        repository=repository,
+        config=_config(),
+        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
+        json_output=True,
+    )
+    payload = json.loads(capsys.readouterr().out)
+    record = TransactionStore(repository / ".rivet" / "transactions").load_record(
+        payload["transaction_id"]
+    )
+    checkpoint = SessionStore(repository).load(payload["session_id"])
+    trace = (repository / ".rivet" / "trace" / "events.ndjson").read_text(
+        encoding="utf-8"
+    )
+
+    assert exit_code == int(ExitCode.SUCCESS)
+    assert payload["status"] == "CANDIDATE_ONLY"
+    assert payload["apply_eligible"] is False
+    assert payload["evidence_id"] is None
+    assert record.state.value == "PATCHING"
+    assert record.evidence_id is None
+    assert checkpoint.status is SessionStatus.READY_FOR_VERIFICATION
+    assert checkpoint.candidate_only is True
+    assert '"event_type":"candidate.ready"' in trace
+    assert '"event_type":"verification.started"' not in trace
+    assert (repository / "tracked.txt").read_text(encoding="utf-8") == "base\n"
 
 
 @pytest.mark.asyncio
@@ -235,6 +431,7 @@ async def test_fix_records_patch_and_fails_closed_when_verification_cannot_pass(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     repository = _repository(tmp_path)
+    _configure_independent_acceptance(repository)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     _install_provider(
         monkeypatch,
@@ -274,10 +471,32 @@ async def test_fix_records_patch_and_fails_closed_when_verification_cannot_pass(
 
     assert exit_code == 4
     assert payload["status"] != "PASSED"
+    assert payload["run_id"].startswith("run_")
+    assert payload["session_id"].startswith("session_")
     assert record.current_patch_id is not None
-    assert record.state.value == "INCONCLUSIVE"
-    assert checkpoint.status is SessionStatus.INCONCLUSIVE
+    assert record.state.value == "REJECTED"
+    assert checkpoint.status is SessionStatus.REJECTED
     assert (repository / "tracked.txt").read_text(encoding="utf-8") == "base\n"
+    trace_events = [
+        json.loads(line)["event"]
+        for line in (repository / ".rivet" / "trace" / "events.ndjson")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    verification_index = next(
+        index
+        for index, event in enumerate(trace_events)
+        if event["event_type"] == "verification.started"
+    )
+    for module_id in ("guard.sandbox", "provider.deepseek"):
+        release_index = next(
+            index
+            for index, event in enumerate(trace_events)
+            if event["event_type"] == "module.released"
+            and event["payload"].get("module_id") == module_id
+            and event["payload"].get("reason") == "model_stage_complete"
+        )
+        assert release_index < verification_index
 
 
 @pytest.mark.asyncio
@@ -384,15 +603,25 @@ async def test_provider_failure_checkpoint_remains_agent_resumable(
     class FailingProvider:
         """稳定模拟一次可恢复 Provider 故障。"""
 
-        async def complete(self, _request: ModelRequest) -> ModelResponse:
+        async def complete(
+            self,
+            _request: ModelRequest,
+            *,
+            on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+        ) -> ModelResponse:
             """在任何网络接触前返回 Kernel 可识别错误。"""
+            del on_text_delta
             raise ModelProviderError("fixture unavailable")
 
-    def create_failing_provider(**_kwargs: object) -> FailingProvider:
+    def create_failing_provider(*_args: object, **_kwargs: object) -> FailingProvider:
         """在惰性 Provider 边界返回稳定失败原语。"""
         return FailingProvider()
 
-    monkeypatch.setattr(model_commands, "_create_provider", create_failing_provider)
+    monkeypatch.setattr(
+        module_factories,
+        "_create_deepseek_provider",
+        create_failing_provider,
+    )
 
     with pytest.raises(CliProviderError):
         await model_commands.run_model_command(
@@ -418,6 +647,7 @@ async def test_patch_finalization_resume_skips_provider_and_finishes_verificatio
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     repository = _repository(tmp_path)
+    _configure_independent_acceptance(repository)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
     prepare_scope = ResourceScope("resume.patch.prepare")
     prepare_manager = TransactionManager(repository, scope=prepare_scope)
@@ -464,14 +694,18 @@ async def test_patch_finalization_resume_skips_provider_and_finishes_verificatio
     )
     SessionStore(repository).save(checkpoint)
 
-    def forbidden_provider(**_kwargs: object) -> object:
+    def forbidden_provider(*_args: object, **_kwargs: object) -> object:
         """证明模型阶段完成后恢复不会再次产生 API 调用。"""
         raise AssertionError("PATCH_FINALIZATION 不得创建 Provider")
 
-    monkeypatch.setattr(model_commands, "_create_provider", forbidden_provider)
+    monkeypatch.setattr(
+        module_factories,
+        "_create_deepseek_provider",
+        forbidden_provider,
+    )
 
     exit_code = await model_commands.run_model_command(
-        Namespace(command="resume", session_id=checkpoint.session_id, yes=True),
+        Namespace(command="resume", session_id=checkpoint.session_id),
         repository=repository,
         config=_config(),
         environment={},

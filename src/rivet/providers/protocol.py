@@ -331,15 +331,15 @@ class DeepSeekStreamAccumulator:
         self._tool_names = tool_names
         self.done = False
 
-    def consume(self, data: str) -> None:
-        """消费单个 SSE data 字段；`[DONE]` 只标记终止。"""
+    def consume(self, data: str) -> str:
+        """消费 SSE data，并返回本次可展示的正文增量。"""
         if self.done:
             raise _protocol_error(
                 "provider.sse_after_done", "模型在 [DONE] 后继续发送数据"
             )
         if data == "[DONE]":
             self.done = True
-            return
+            return ""
         try:
             chunk = WireChatChunk.model_validate_json(data)
         except ValidationError as error:
@@ -352,12 +352,14 @@ class DeepSeekStreamAccumulator:
             self._model = chunk.model
         if chunk.usage is not None:
             self._usage = _usage(chunk.usage)
+        content_deltas: list[str] = []
         for choice in chunk.choices:
             if choice.index != 0:
                 continue
             delta = choice.delta
             if delta.content is not None:
                 self._content_parts.append(delta.content)
+                content_deltas.append(delta.content)
             if delta.reasoning_content is not None:
                 self._reasoning_seen = True
                 self._reasoning_parts.append(delta.reasoning_content)
@@ -376,6 +378,7 @@ class DeepSeekStreamAccumulator:
                         fragments.arguments += tool_delta.function.arguments
             if choice.finish_reason is not None:
                 self._finish_reason = _finish_reason(choice.finish_reason)
+        return "".join(content_deltas)
 
     def response(self, *, created_at: datetime) -> ModelResponse:
         """在收到 [DONE] 后构造与非流式相同的本地响应。"""

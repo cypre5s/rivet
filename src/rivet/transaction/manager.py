@@ -571,6 +571,55 @@ class TransactionManager:
         store.save_record(verifying)
         return verifying
 
+    async def adopt_project_verification_configuration(
+        self,
+        transaction_id: str,
+    ) -> TransactionRecord:
+        """允许候选事务只吸收一次显式项目验收配置，不放宽其他漂移。"""
+        backend = await self._ensure_backend()
+        store = self._require_store()
+        record = store.load_record(transaction_id)
+        if record.state is not TransactionState.PATCHING:
+            raise TransactionError(
+                "transaction.configuration_adoption_state_invalid",
+                "只有待验证候选补丁可以吸收项目验收配置",
+            )
+        self._verify_acceptance(record)
+        self._load_current_patch(record)
+        snapshot = await backend.inspect()
+        if snapshot.repository_fingerprint == record.repository_fingerprint:
+            return record
+        configuration_path = backend.repository_root / ".rivet" / "project.toml"
+        stable_repository = (
+            snapshot.repository_identity == record.repository_identity
+            and snapshot.head_commit == record.head_commit
+            and snapshot.branch == record.branch
+            and snapshot.detached_head == record.detached_head
+            and snapshot.has_submodules == record.has_submodules
+            and snapshot.submodule_status_sha256 == record.submodule_status_sha256
+            and snapshot.git_config_summary == record.git_config_summary
+        )
+        if (
+            record.dirty
+            or not stable_repository
+            or set(snapshot.status_paths) != {".rivet/project.toml"}
+            or configuration_path.is_symlink()
+            or not configuration_path.is_file()
+        ):
+            raise TransactionError(
+                "transaction.verification_repository_drift",
+                "候选补丁生成后主仓库发生了验收配置以外的漂移",
+            )
+        adopted = record.model_copy(
+            update={
+                "repository_fingerprint": snapshot.repository_fingerprint,
+                "dirty": snapshot.dirty,
+                "updated_at": self._now(),
+            }
+        )
+        store.save_record(adopted)
+        return adopted
+
     async def record_verdict(self, verdict: Verdict) -> TransactionRecord:
         """只接受与事务和验收哈希一致的程序化 Verdict。"""
         await self._ensure_backend()

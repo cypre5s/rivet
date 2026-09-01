@@ -83,13 +83,16 @@ def test_init_config_modules_doctor_and_clean_are_offline(
     repository = tmp_path / "repository"
     repository.mkdir()
 
-    initialized = _run(tmp_path, repository, "init")
+    previewed = _run(tmp_path, repository, "--json", "init")
+    assert not (repository / ".rivet").exists()
+    initialized = _run(tmp_path, repository, "init", "--yes")
     configured = _run(tmp_path, repository, "--json", "config")
     modules = _run(tmp_path, repository, "--json", "modules")
     doctor = _run(tmp_path, repository, "--json", "doctor")
     cleaned = _run(tmp_path, repository, "--json", "clean", "--dry-run")
 
     assert initialized.returncode == 0
+    assert json.loads(previewed.stdout)["created"] is False
     project_config = repository / ".rivet" / "project.toml"
     assert project_config.is_file()
     assert "DEEPSEEK_API_KEY" not in project_config.read_text(encoding="utf-8")
@@ -98,8 +101,9 @@ def test_init_config_modules_doctor_and_clean_are_offline(
         cast(dict[str, object], json.loads(completed.stdout))
     module_payload = cast(dict[str, object], json.loads(modules.stdout))
     module_summary = cast(dict[str, object], module_payload["summary"])
-    assert module_payload["source"] == "module_runtime"
+    assert module_payload["source"] == "capability_policy"
     assert module_summary["active"] == 0
+    assert module_summary["locked"] == 4
     assert "credential_value" not in configured.stdout
 
 
@@ -142,7 +146,7 @@ def test_module_lifecycle_cli_persists_policy_and_uses_stable_exit_codes(
         "context.lsp",
         "--json",
     )
-    refused_wake = _run(
+    removed_wake = _run(
         tmp_path,
         repository,
         "modules",
@@ -158,15 +162,7 @@ def test_module_lifecycle_cli_persists_policy_and_uses_stable_exit_codes(
         "context.lsp",
         "--json",
     )
-    woken = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "wake",
-        "context.lsp",
-        "--json",
-    )
-    slept = _run(
+    removed_sleep = _run(
         tmp_path,
         repository,
         "modules",
@@ -182,6 +178,14 @@ def test_module_lifecycle_cli_persists_policy_and_uses_stable_exit_codes(
         "context.lsp",
         "--json",
     )
+    locked = _run(
+        tmp_path,
+        repository,
+        "modules",
+        "disable",
+        "provider.deepseek",
+        "--json",
+    )
     missing = _run(
         tmp_path,
         repository,
@@ -194,7 +198,7 @@ def test_module_lifecycle_cli_persists_policy_and_uses_stable_exit_codes(
         tmp_path,
         repository,
         "modules",
-        "sleep",
+        "disable",
         "context.lsp",
         "--timeout",
         "-1",
@@ -211,18 +215,17 @@ def test_module_lifecycle_cli_persists_policy_and_uses_stable_exit_codes(
     )
     assert persisted_module["persisted_override"] is False
     assert persisted_module["effective_enabled"] is False
-    assert refused_wake.returncode == 5
-    assert "module.dependency_disabled" in refused_wake.stderr
+    assert removed_wake.returncode == 2
+    assert "invalid choice: 'wake'" in removed_wake.stderr
     assert enabled.returncode == 0, enabled.stderr
     assert cast(dict[str, object], json.loads(enabled.stdout))["current_state"] == (
         "INACTIVE"
     )
-    assert woken.returncode == 0, woken.stderr
-    assert cast(dict[str, object], json.loads(woken.stdout))["current_state"] == (
-        "ACTIVE"
-    )
-    assert slept.returncode == 0, slept.stderr
+    assert removed_sleep.returncode == 2
+    assert "invalid choice: 'sleep'" in removed_sleep.stderr
     assert disabled_again.returncode == 0, disabled_again.stderr
+    assert locked.returncode == 4
+    assert "module.manual_control_denied" in locked.stderr
     assert missing.returncode == 3
     assert "module.not_found" in missing.stderr
     assert invalid_timeout.returncode == 2
@@ -240,6 +243,20 @@ def test_model_command_without_key_is_classified_without_traceback(
     assert completed.returncode == 3
     assert "DEEPSEEK_API_KEY" in completed.stderr
     assert "Traceback" not in completed.stderr
+
+
+def test_fix_without_acceptance_fails_before_credential_or_runtime_cost(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+
+    completed = _run(tmp_path, repository, "fix", "修改 tracked.txt", "--yes")
+
+    assert completed.returncode == 4
+    assert "verification.acceptance_not_ready" in completed.stderr
+    assert "DEEPSEEK_API_KEY" not in completed.stderr
+    assert not (repository / ".rivet").exists()
 
 
 def test_init_rejects_symlink_target(tmp_path: Path) -> None:

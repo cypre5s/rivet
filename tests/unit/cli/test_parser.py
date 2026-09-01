@@ -56,6 +56,7 @@ def test_parser_preserves_structured_arguments() -> None:
             "fix",
             "修复边界",
             "--yes",
+            "--candidate-only",
             "--dirty-policy",
             "snapshot",
         )
@@ -65,7 +66,16 @@ def test_parser_preserves_structured_arguments() -> None:
     assert arguments.task == "修复边界"
     assert arguments.model == "deepseek-v4-flash"
     assert arguments.yes is True
+    assert arguments.candidate_only is True
     assert arguments.dirty_policy == "snapshot"
+
+
+def test_init_requires_explicit_yes_only_for_writing() -> None:
+    preview = build_parser().parse_args(("init",))
+    confirmed = build_parser().parse_args(("init", "--yes"))
+
+    assert preview.yes is False
+    assert confirmed.yes is True
 
 
 def test_apply_requires_transaction_id() -> None:

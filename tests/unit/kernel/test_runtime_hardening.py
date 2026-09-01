@@ -9,15 +9,22 @@ from pathlib import Path
 
 import pytest
 
-from rivet.contracts.modules import ActivationPolicy, ModuleManifest, ModuleState
+from rivet.contracts.modules import (
+    ActivationPolicy,
+    ModuleAvailability,
+    ModuleManifest,
+    ModuleState,
+)
 from rivet.kernel.errors import (
     ActivationJournalError,
     CapabilityNotFoundError,
     ModuleActivationError,
     ModuleDependencyError,
     ModuleShutdownError,
+    ModuleUnavailableError,
     SafeModeViolationError,
 )
+from rivet.kernel.module_api import ModuleActivationContext
 from rivet.kernel.module_runtime import ActivationJournal, ModuleRuntime
 from rivet.kernel.resources import ResourceScope
 
@@ -33,18 +40,30 @@ class ControlledModule:
         fail_sleep: bool = False,
         fail_shutdown: bool = False,
         block_activation: bool = False,
+        capability_override: str | None = None,
     ) -> None:
         self.fail_sleep = fail_sleep
         self.fail_shutdown = fail_shutdown
         self.block_activation = block_activation
+        self.capability_override = capability_override
         self.activation_started = asyncio.Event()
 
-    async def activate(self, scope: ResourceScope) -> None:
+    async def activate(
+        self,
+        context: ModuleActivationContext,
+        scope: ResourceScope,
+    ) -> dict[str, object]:
         """记录开始，并可等待取消。"""
         del scope
         self.activation_started.set()
         if self.block_activation:
             await asyncio.Event().wait()
+        capabilities = (
+            (self.capability_override,)
+            if self.capability_override is not None
+            else context.declared_capabilities
+        )
+        return {capability_id: self for capability_id in capabilities}
 
     async def sleep(self) -> None:
         """按配置制造休眠故障。"""
@@ -63,6 +82,8 @@ def _manifest(
     *,
     activation: ActivationPolicy = ActivationPolicy.ON_DEMAND,
     requires: tuple[str, ...] = (),
+    required_python_packages: tuple[str, ...] = (),
+    install_extra: str | None = None,
 ) -> ModuleManifest:
     """构造最小有效 Manifest。"""
     return ModuleManifest(
@@ -72,6 +93,8 @@ def _manifest(
         factory=FACTORY,
         provides=(capability_id,),
         requires=requires,
+        required_python_packages=required_python_packages,
+        install_extra=install_extra,
         idle_timeout_seconds=None,
     )
 
@@ -168,6 +191,44 @@ def test_safe_mode_rejects_required_dependency_on_optional(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
+async def test_missing_optional_dependency_stays_inactive_and_never_loads_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺 extra 是静态 Availability 事实，不得污染 Runtime FAILED。"""
+    runtime = ModuleRuntime(
+        (
+            _manifest(
+                required_python_packages=("rivet_fixture_missing_package",),
+                install_extra="syntax",
+            ),
+        ),
+        journal=ActivationJournal(tmp_path / "journal.json"),
+    )
+    factory_loaded = False
+
+    def fail_if_loaded(_factory_path: str) -> Callable[[], object]:
+        nonlocal factory_loaded
+        factory_loaded = True
+        return lambda: ControlledModule()
+
+    monkeypatch.setattr(ModuleRuntime, "_load_factory", staticmethod(fail_if_loaded))
+
+    report = runtime.availability("test.hardening")
+    assert report.state is ModuleAvailability.MISSING_DEPENDENCY
+    assert report.missing_components == ("rivet_fixture_missing_package",)
+    assert report.suggested_action == "运行 uv sync --extra syntax 安装该能力"
+    with pytest.raises(ModuleUnavailableError) as captured:
+        await runtime.acquire("test.hardening.resolve")
+
+    assert captured.value.availability == "MISSING_DEPENDENCY"
+    assert runtime.state("test.hardening") is ModuleState.INACTIVE
+    assert not factory_loaded
+    assert not runtime.journal.path.exists()
+    await runtime.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_lease_context_release_is_idempotent_and_underflow_is_rejected(
     tmp_path: Path,
 ) -> None:
@@ -175,10 +236,10 @@ async def test_lease_context_release_is_idempotent_and_underflow_is_rejected(
         (_manifest(),),
         journal=ActivationJournal(tmp_path / "journal.json"),
     )
-    lease = await runtime.acquire_lease("test.hardening.resolve")
+    lease = await runtime.acquire("test.hardening.resolve")
 
     async with lease as instance:
-        assert instance is lease.instance
+        assert instance is lease.capability
     await lease.release()
     with pytest.raises(ModuleActivationError, match="下溢"):
         await runtime.release_lease(("test.hardening",))
@@ -246,6 +307,31 @@ async def test_sleep_and_shutdown_failures_are_classified(
     with pytest.raises(ModuleShutdownError):
         await shutdown_runtime.shutdown()
     await shutdown_runtime.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_capability_mapping_must_exactly_match_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ACTIVE 不得建立在缺失或伪造 capability 的模块实例上。"""
+    mismatched = ControlledModule(capability_override="test.unexpected")
+    runtime = ModuleRuntime(
+        (_manifest(),),
+        journal=ActivationJournal(tmp_path / "mapping-journal.json"),
+    )
+    monkeypatch.setattr(
+        ModuleRuntime,
+        "_load_factory",
+        staticmethod(_factory_loader(mismatched)),
+    )
+
+    with pytest.raises(ModuleActivationError):
+        await runtime.resolve("test.hardening.resolve")
+
+    assert runtime.state("test.hardening") is ModuleState.FAILED
+    assert not runtime.journal.path.exists()
+    await runtime.shutdown()
 
 
 @pytest.mark.asyncio

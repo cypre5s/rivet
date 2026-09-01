@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
@@ -177,7 +178,7 @@ async def test_old_test_only_cannot_release_hardcoded_patch(tmp_path: Path) -> N
         baseline_script="check_target.py",
         targeted_script="check_target.py",
     )
-    python_command = ("python", "check_target.py")
+    python_command = (sys.executable, "check_target.py")
     prepared = await run_verification_case(
         tmp_path,
         case,
@@ -185,7 +186,7 @@ async def test_old_test_only_cannot_release_hardcoded_patch(tmp_path: Path) -> N
         project_configuration=ProjectConfiguration(
             related=(python_command,),
             regression=(python_command,),
-            static=(("python", "-m", "compileall", "-q", "app.py"),),
+            static=((sys.executable, "-m", "compileall", "-q", "app.py"),),
         ),
     )
 

@@ -79,7 +79,7 @@ class ModuleTraceSink(ModuleLifecycleEventSink):
 
 
 class ModuleCommandController:
-    """让 CLI 与长驻 TUI Worker 共用同一生命周期应用入口。"""
+    """让 CLI 与长驻 TUI Worker 共用同一能力策略应用入口。"""
 
     def __init__(self, repository: Path, *, safe_mode: bool) -> None:
         self.repository = repository
@@ -136,8 +136,8 @@ class ModuleCommandController:
             )
         return {
             "module": module_status_public_mapping(status),
-            "schema_version": 1,
-            "source": "module_runtime",
+            "schema_version": 2,
+            "source": "capability_policy",
         }
 
     async def operate(
@@ -176,30 +176,11 @@ class ModuleCommandController:
                 request_id=request_id,
                 event_sink=sink,
             )
-        elif operation == "wake":
-            result = await service.wake(
-                module_id,
-                with_dependencies=with_dependencies,
-                source=source,
-                request_id=request_id,
-                event_sink=sink,
-            )
-        elif operation == "sleep":
-            result = await service.sleep(
-                module_id,
-                cascade=cascade,
-                wait=wait,
-                timeout_seconds=timeout_seconds,
-                confirmed=confirmed,
-                source=source,
-                request_id=request_id,
-                event_sink=sink,
-            )
         else:
             raise CliModuleError(
                 "module.operation_unknown",
                 "模块操作不存在",
-                "使用 list/show/enable/disable/wake/sleep",
+                "使用 list/show/enable/disable；运行态由 Kernel 按需管理",
                 exit_code=ExitCode.USAGE,
             )
         return module_result_mapping(result)
@@ -214,6 +195,13 @@ class ModuleCommandController:
 
 def module_status_public_mapping(status: ModuleStatus) -> dict[str, object]:
     """把严格状态契约转换为前后端共享的 JSON 字段。"""
+    policy = (
+        "LOCKED"
+        if not status.manual_control
+        else "ENABLED"
+        if status.configured_enabled
+        else "DISABLED"
+    )
     return {
         "activation": status.activation.value,
         "active_resource_count": status.active_resource_count,
@@ -227,12 +215,16 @@ def module_status_public_mapping(status: ModuleStatus) -> dict[str, object]:
         "leases": status.lease_count,
         "manifest_default_enabled": status.manifest_default_enabled,
         "manual_control": status.manual_control,
+        "missing_components": list(status.missing_components),
         "module_id": status.module_id,
         "persisted_override": status.persisted_override,
+        "policy": policy,
         "provided_capabilities": list(status.provided_capabilities),
         "runtime_state": status.runtime_state.value,
         "scope": status.scope.value,
         "sleep_policy": status.sleep_policy.value,
+        "availability": status.availability.value,
+        "availability_action": status.availability_action,
     }
 
 
@@ -241,14 +233,22 @@ def module_status_mapping(statuses: tuple[ModuleStatus, ...]) -> dict[str, objec
     modules = [module_status_public_mapping(status) for status in statuses]
     return {
         "modules": modules,
-        "schema_version": 1,
-        "source": "module_runtime",
+        "schema_version": 2,
+        "source": "capability_policy",
         "summary": {
             "active": sum(
                 status.runtime_state in {ModuleState.ACTIVE, ModuleState.IDLE}
                 for status in statuses
             ),
             "disabled": sum(not status.configured_enabled for status in statuses),
+            "enabled": sum(
+                status.configured_enabled and status.manual_control
+                for status in statuses
+            ),
+            "locked": sum(not status.manual_control for status in statuses),
+            "unavailable": sum(
+                status.availability.value != "AVAILABLE" for status in statuses
+            ),
             "quarantined": sum(
                 status.runtime_state is ModuleState.QUARANTINED for status in statuses
             ),
@@ -270,7 +270,7 @@ def module_result_mapping(result: ModuleLifecycleResult) -> dict[str, object]:
         "operation": result.operation.value,
         "previous_enabled": result.previous_enabled,
         "previous_state": result.previous_state.value,
-        "schema_version": 1,
+        "schema_version": 2,
         "trace_event_id": result.trace_event_id,
     }
 
@@ -340,7 +340,7 @@ def _print_module_payload(payload: Mapping[str, object], *, json_output: bool) -
     modules = payload.get("modules")
     if isinstance(modules, list):
         module_items = cast(list[object], modules)
-        print("ID\tENABLED\tSTATE\tSCOPE\tPOLICY\tLEASES\tRESOURCES\tDEPENDENCIES")
+        print("ID\tPOLICY\tAVAILABILITY\tSCOPE\tACTIVATION\tDEPENDENCIES")
         for raw_module in module_items:
             if not isinstance(raw_module, dict):
                 continue
@@ -355,12 +355,10 @@ def _print_module_payload(payload: Mapping[str, object], *, json_output: bool) -
                 "\t".join(
                     (
                         str(module.get("module_id", "")),
-                        str(module.get("effective_enabled", False)).lower(),
-                        str(module.get("runtime_state", "UNKNOWN")),
+                        str(module.get("policy", "UNKNOWN")),
+                        str(module.get("availability", "UNKNOWN")),
                         str(module.get("scope", "")),
                         str(module.get("activation", "")),
-                        str(module.get("lease_count", 0)),
-                        str(module.get("active_resource_count", 0)),
                         rendered_dependencies or "-",
                     )
                 )

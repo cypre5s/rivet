@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -114,6 +115,38 @@ async def test_registry_exposes_every_phase_five_tool_and_unique_capability(
     assert registry.resolve_capability("file.read_text").definition.name == (
         "file.read_text"
     )
+    await scope.close()
+
+
+@pytest.mark.asyncio
+async def test_workspace_list_registry_accepts_model_path_argument(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "calculator.py").write_text("value = 1\n", encoding="utf-8")
+    scope = ResourceScope("tools.workspace.list")
+    trace = await _start_trace(tmp_path, repository)
+    registry = build_workspace_tool_registry(WorkspaceBoundary(repository), scope=scope)
+    call = ToolCall(
+        tool_call_id="call_workspace_list",
+        tool_name="workspace.list",
+        arguments={"path": ".", "max_depth": 2},
+    )
+    context = ToolInvocationContext(
+        run_id="run_workspace_list",
+        session_id="session_workspace_list",
+        trace=trace,
+    )
+
+    view = await registry.invoke(call, context=context)
+
+    assert view.result.success
+    assert json.loads(view.model_text) == {
+        "entries": [{"kind": "file", "path": "calculator.py", "size_bytes": 10}],
+        "truncated": False,
+    }
+    await trace.close()
     await scope.close()
 
 
@@ -256,6 +289,47 @@ async def test_process_tool_can_write_transaction_but_not_main_root(
     assert view.result.success
     assert (transaction / "created.txt").read_text(encoding="utf-8") == "ok"
     assert not (repository / "created.txt").exists()
+    await trace.close()
+    await scope.close()
+
+
+@pytest.mark.asyncio
+async def test_process_tool_normalizes_the_reported_effective_root(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "repository"
+    transaction = tmp_path / "transaction"
+    repository.mkdir()
+    transaction.mkdir()
+    scope = ResourceScope("tools.process.effective-root")
+    trace = await _start_trace(tmp_path, repository)
+    boundary = WorkspaceBoundary(repository, transaction)
+    registry = build_workspace_tool_registry(
+        boundary,
+        scope=scope,
+        authorizer=_allow_test_tool,
+        process_executor=ProcessRunner(boundary, scope=scope),
+    )
+    call = ToolCall(
+        tool_call_id="call_process_effective_root",
+        tool_name="process.run",
+        arguments={
+            "argv": [sys.executable, "-c", "print('transaction cwd')"],
+            "cwd": str(boundary.effective_root),
+            "timeout_seconds": 2.0,
+        },
+    )
+    context = ToolInvocationContext(
+        run_id="run_process_effective_root",
+        session_id="session_process_effective_root",
+        transaction_id="tx_process_effective_root",
+        trace=trace,
+    )
+
+    view = await registry.invoke(call, context=context)
+
+    assert view.result.success
+    assert "transaction cwd" in view.model_text
     await trace.close()
     await scope.close()
 

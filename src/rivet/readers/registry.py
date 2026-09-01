@@ -36,6 +36,11 @@ BUILTIN_DESCRIPTORS = (
     ReaderDescriptor(
         "reader.archive", "rivet.readers.archive_reader:ArchiveReader", 100
     ),
+    ReaderDescriptor(
+        "reader.archive.sevenzip",
+        "rivet.readers.archive_reader:SevenZipReader",
+        100,
+    ),
     ReaderDescriptor("reader.email", "rivet.readers.email_reader:EmailReader", 100),
     ReaderDescriptor(
         "reader.binary", "rivet.readers.binary_reader:BinaryFallbackReader", 0

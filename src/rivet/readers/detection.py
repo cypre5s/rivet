@@ -139,7 +139,12 @@ def _magic_format(probe: bytes) -> tuple[str, str, str] | None:
         (b"fLaC", "flac", "audio/flac", "reader.media"),
         (b"OggS", "ogg", "audio/ogg", "reader.media"),
         (b"ID3", "mp3", "audio/mpeg", "reader.media"),
-        (b"7z\xbc\xaf'\x1c", "7z", "application/x-7z-compressed", "reader.archive"),
+        (
+            b"7z\xbc\xaf'\x1c",
+            "7z",
+            "application/x-7z-compressed",
+            "reader.archive.sevenzip",
+        ),
         (
             b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1",
             "ole",

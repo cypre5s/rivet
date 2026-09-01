@@ -127,6 +127,90 @@ async def test_detached_head_is_recorded_and_abort_is_idempotent(
 
 
 @pytest.mark.asyncio
+async def test_candidate_adopts_only_confirmed_project_verification_config(
+    tmp_path: Path,
+) -> None:
+    repository = initialize_repository(tmp_path)
+    scope = ResourceScope("transaction.configuration-adoption")
+    manager = make_manager(repository, tmp_path, scope)
+    record = await manager.create(transaction_id="tx_configuration_adoption")
+    await manager.freeze_acceptance(
+        record.transaction_id,
+        acceptance_spec(),
+        confirmed=True,
+    )
+    TransactionFileWriter(manager.transaction_boundary(record.transaction_id)).write(
+        "tracked.txt", "candidate\n"
+    )
+    await manager.record_patch_set(record.transaction_id)
+    manager.suspend(record.transaction_id)
+
+    runtime = repository / ".rivet"
+    runtime.mkdir()
+    (runtime / "project.toml").write_text(
+        """schema_version = 1
+[rivet]
+safe_mode = false
+[verification]
+acceptance = [["python", "-c", "raise SystemExit(0)"]]
+targeted = []
+related = []
+regression = []
+static = []
+""",
+        encoding="utf-8",
+    )
+    await manager.recover(record.transaction_id)
+    adopted = await manager.adopt_project_verification_configuration(
+        record.transaction_id
+    )
+
+    assert adopted.repository_fingerprint != record.repository_fingerprint
+    assert adopted.dirty is True
+    assert (await manager.begin_verification(record.transaction_id)).state is (
+        TransactionState.VERIFYING
+    )
+    await manager.abort(record.transaction_id)
+    scope.assert_empty()
+    await scope.close()
+
+
+@pytest.mark.asyncio
+async def test_candidate_rejects_config_adoption_with_unrelated_repository_drift(
+    tmp_path: Path,
+) -> None:
+    repository = initialize_repository(tmp_path)
+    scope = ResourceScope("transaction.configuration-drift")
+    manager = make_manager(repository, tmp_path, scope)
+    record = await manager.create(transaction_id="tx_configuration_drift")
+    await manager.freeze_acceptance(
+        record.transaction_id,
+        acceptance_spec(),
+        confirmed=True,
+    )
+    TransactionFileWriter(manager.transaction_boundary(record.transaction_id)).write(
+        "tracked.txt", "candidate\n"
+    )
+    await manager.record_patch_set(record.transaction_id)
+    manager.suspend(record.transaction_id)
+    (repository / ".rivet").mkdir()
+    (repository / ".rivet" / "project.toml").write_text(
+        'schema_version = 1\n[verification]\nacceptance = [["pytest", "-q"]]\n',
+        encoding="utf-8",
+    )
+    (repository / "second.txt").write_text("unrelated drift\n", encoding="utf-8")
+    await manager.recover(record.transaction_id)
+
+    with pytest.raises(TransactionError) as captured:
+        await manager.adopt_project_verification_configuration(record.transaction_id)
+
+    assert captured.value.code == "transaction.verification_repository_drift"
+    await manager.abort(record.transaction_id)
+    scope.assert_empty()
+    await scope.close()
+
+
+@pytest.mark.asyncio
 async def test_repository_with_submodule_records_status_without_initializing_it(
     tmp_path: Path,
 ) -> None:

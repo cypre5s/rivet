@@ -45,6 +45,7 @@ from rivet.contracts.guard import (
 from rivet.contracts.modules import ActivationPolicy, ModuleManifest
 from rivet.guard.permissions import GuardPolicy
 from rivet.kernel.application import RivetKernel
+from rivet.kernel.module_api import ModuleActivationContext
 from rivet.kernel.resources import ResourceScope
 from rivet.tools.paths import WorkspaceBoundary
 from rivet.tools.process import ProcessExecutor, ProcessRunner
@@ -134,9 +135,14 @@ class _TransactionRun:
 class _BenchmarkModule:
     """为消融实验提供无外部资源的真实按需模块。"""
 
-    async def activate(self, scope: ResourceScope) -> None:
-        """接受 Runtime 所有权，且不创建额外资源。"""
+    async def activate(
+        self,
+        context: ModuleActivationContext,
+        scope: ResourceScope,
+    ) -> dict[str, object]:
+        """接受 Runtime 所有权并提供真实 benchmark capability。"""
         del scope
+        return {capability_id: self for capability_id in context.declared_capabilities}
 
     async def sleep(self) -> None:
         """释放按需模块的空内存状态。"""

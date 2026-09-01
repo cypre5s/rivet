@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -66,10 +66,20 @@ class ScriptedProvider:
         self._responses = list(responses)
         self.requests: list[ModelRequest] = []
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    async def complete(
+        self,
+        request: ModelRequest,
+        *,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> ModelResponse:
         """返回下一条录制响应。"""
         self.requests.append(request)
-        return self._responses.pop(0)
+        response = self._responses.pop(0)
+        if on_text_delta is not None and response.message.content:
+            midpoint = max(1, len(response.message.content) // 2)
+            await on_text_delta(response.message.content[:midpoint])
+            await on_text_delta(response.message.content[midpoint:])
+        return response
 
 
 def _response(
@@ -187,6 +197,23 @@ async def test_final_answer_completes_without_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_loop_forwards_provider_text_deltas_before_final_answer() -> None:
+    deltas: list[str] = []
+
+    async def collect_delta(delta: str) -> None:
+        deltas.append(delta)
+
+    result = await AgentLoop(
+        ScriptedProvider((_response(content="逐步生成回答"),)),
+        tools=(),
+        text_delta_callback=collect_delta,
+    ).run(_task())
+
+    assert deltas == ["逐步生", "成回答"]
+    assert result.answer == "逐步生成回答"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mode", "expected"),
     (
@@ -277,6 +304,73 @@ async def test_transaction_write_refreshes_context_before_next_model_call() -> N
     assert any(
         message.content == "new content" for message in provider.requests[1].messages
     )
+
+
+@pytest.mark.asyncio
+async def test_parallel_writes_keep_tool_responses_contiguous_and_refresh_once() -> (
+    None
+):
+    current = {"content": "old content"}
+    gather_count = 0
+
+    async def write(arguments: BaseModel) -> str:
+        values = WriteArguments.model_validate(arguments.model_dump())
+        current["content"] = values.content
+        return f"written:{values.content}"
+
+    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
+        nonlocal gather_count
+        gather_count += 1
+        return (SystemMessage(content=current["content"], created_at=NOW),)
+
+    provider = ScriptedProvider(
+        (
+            _response(
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_write_first",
+                        tool_name="file.write_transaction",
+                        arguments={"content": "first content"},
+                    ),
+                    ToolCall(
+                        tool_call_id="call_write_second",
+                        tool_name="file.write_transaction",
+                        arguments={"content": "final content"},
+                    ),
+                ),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            ),
+            _response(content="done"),
+        )
+    )
+    tool = AgentTool.from_model(
+        name="file.write_transaction",
+        description="事务写入",
+        input_model=WriteArguments,
+        executor=write,
+    )
+
+    result = await AgentLoop(
+        provider,
+        tools=(tool,),
+        context_gatherer=gather_context,
+        clock=lambda: NOW,
+    ).run(_task(AgentTaskMode.FIX))
+
+    assert result.state is AgentLoopState.COMPLETE
+    assert gather_count == 2
+    follow_up = provider.requests[1].messages
+    assert [message.role for message in follow_up[-4:]] == [
+        "assistant",
+        "tool",
+        "tool",
+        "system",
+    ]
+    assert [message.content for message in follow_up[-3:]] == [
+        "written:first content",
+        "written:final content",
+        "final content",
+    ]
 
 
 @pytest.mark.asyncio

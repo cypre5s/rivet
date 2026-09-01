@@ -8,30 +8,23 @@ import os
 import subprocess
 import sys
 from argparse import Namespace
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
-from rivet.cli.errors import CliConfigurationError, CliError, CliSecurityError
+from rivet.cli.errors import (
+    CliConfigurationError,
+    CliError,
+    CliSecurityError,
+    CliVerificationError,
+)
 from rivet.cli.exit_codes import ExitCode
 from rivet.cli.parser import build_internal_parser, build_parser
 
 if TYPE_CHECKING:
     from rivet.cli.config import ConfigOverrides, ResolvedConfig
     from rivet.storage.sessions import SessionCheckpoint, SessionStatus
-
-PROJECT_CONFIG = """schema_version = 1
-
-[rivet]
-safe_mode = false
-
-[verification]
-acceptance = []
-targeted = []
-related = []
-regression = []
-static = []
-"""
+    from rivet.verify.detector import EvidenceReadiness, ProjectDetection
 
 
 def run_cli(
@@ -192,6 +185,11 @@ def _dispatch(
     if command == "benchmark":
         return _benchmark(arguments, repository)
     if command in {"ask", "plan", "fix"}:
+        preflight_detection = None
+        if command == "fix" and not cast(
+            bool, getattr(arguments, "candidate_only", False)
+        ):
+            preflight_detection = _require_evidence_readiness(repository)
         _require_credential(config)
         from rivet.cli.model_commands import run_model_command
 
@@ -202,6 +200,7 @@ def _dispatch(
                 config=config,
                 environment=environment,
                 json_output=json_output,
+                preflight_detection=preflight_detection,
             )
         )
     if command in {"verify", "diff", "apply", "abort"}:
@@ -223,8 +222,10 @@ def _dispatch(
 
 
 def _initialize(arguments: Namespace) -> int:
-    """在明确目录中创建最小、无凭据且可跟踪的项目配置。"""
+    """只读检测项目，并只在显式确认后写入无凭据配置。"""
     from rivet.storage.git_exclude import configure_runtime_excludes
+    from rivet.verify.detector import ProjectDetector, evidence_readiness
+    from rivet.verify.errors import VerificationError
 
     path_argument = cast(Path | None, arguments.path)
     repository_argument = cast(Path, arguments.repository)
@@ -236,6 +237,15 @@ def _initialize(arguments: Namespace) -> int:
             "创建目录后重试 rivet init",
         )
     target = candidate.resolve(strict=True)
+    try:
+        detection = ProjectDetector().detect(target)
+    except VerificationError as error:
+        raise CliConfigurationError(
+            error.code,
+            error.summary,
+            "修复现有 .rivet/project.toml 后重试",
+        ) from error
+    readiness = evidence_readiness(detection)
     runtime_root = target / ".rivet"
     if runtime_root.is_symlink():
         raise CliConfigurationError(
@@ -244,14 +254,6 @@ def _initialize(arguments: Namespace) -> int:
             "移除不受信任链接后重试",
         )
     config_path = runtime_root / "project.toml"
-    try:
-        configure_runtime_excludes(target)
-    except ValueError as error:
-        raise CliConfigurationError(
-            "init.git_exclude_invalid",
-            "Git 本地 exclude 无法安全配置",
-            "检查 .git/info/exclude 后重试",
-        ) from error
     if config_path.exists():
         if config_path.is_symlink() or not config_path.is_file():
             raise CliConfigurationError(
@@ -259,13 +261,141 @@ def _initialize(arguments: Namespace) -> int:
                 "项目配置路径不是受控普通文件",
                 "修复路径后重试",
             )
-        print(f"项目已初始化：{config_path}")
+        if cast(bool, arguments.yes):
+            _configure_project_excludes(target, configure_runtime_excludes)
+        _print_payload(
+            _init_payload(
+                config_path=config_path,
+                created=False,
+                confirmed=True,
+                readiness=readiness,
+            ),
+            json_output=_json_output(arguments),
+        )
         return int(ExitCode.SUCCESS)
+    if not cast(bool, arguments.yes):
+        _print_payload(
+            _init_payload(
+                config_path=config_path,
+                created=False,
+                confirmed=False,
+                readiness=readiness,
+            ),
+            json_output=_json_output(arguments),
+        )
+        return int(ExitCode.SUCCESS)
+    _configure_project_excludes(target, configure_runtime_excludes)
     runtime_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    config_path.write_text(PROJECT_CONFIG, encoding="utf-8")
+    config_path.write_text(_project_config_text(detection), encoding="utf-8")
     config_path.chmod(0o600)
-    print(f"已创建项目配置：{config_path}")
+    created_readiness = evidence_readiness(ProjectDetector().detect(target))
+    _print_payload(
+        _init_payload(
+            config_path=config_path,
+            created=True,
+            confirmed=True,
+            readiness=created_readiness,
+        ),
+        json_output=_json_output(arguments),
+    )
     return int(ExitCode.SUCCESS)
+
+
+def _configure_project_excludes(
+    target: Path,
+    configure: Callable[[Path], bool],
+) -> None:
+    """只在确认写配置的路径更新 Git 私有 exclude。"""
+    try:
+        configure(target)
+    except ValueError as error:
+        raise CliConfigurationError(
+            "init.git_exclude_invalid",
+            "Git 本地 exclude 无法安全配置",
+            "检查 .git/info/exclude 后重试",
+        ) from error
+
+
+def _require_evidence_readiness(repository: Path) -> ProjectDetection:
+    """在凭据检查和模型费用之前拒绝没有独立验收的 FIX。"""
+    from rivet.verify.detector import ProjectDetector, evidence_readiness
+    from rivet.verify.errors import VerificationError
+
+    try:
+        detection = ProjectDetector().detect(repository)
+    except VerificationError as error:
+        raise CliConfigurationError(
+            error.code,
+            error.summary,
+            "修复 .rivet/project.toml 后重新运行 FIX",
+        ) from error
+    readiness = evidence_readiness(detection)
+    if not readiness.ready:
+        raise CliVerificationError(
+            "verification.acceptance_not_ready",
+            f"FIX 尚无独立验收门禁：{readiness.reason}",
+            f"{readiness.next_action}；或显式使用 --candidate-only 只生成不可 Apply 的候选",
+        )
+    return detection
+
+
+def _project_config_text(detection: ProjectDetection) -> str:
+    """把未执行候选写成严格 argv；独立 acceptance 永远不自动推断。"""
+    grouped: dict[str, list[list[str]]] = {
+        "targeted": [],
+        "related": [],
+        "regression": [],
+        "static": [],
+    }
+    for candidate in detection.candidates:
+        if candidate.category in grouped:
+            grouped[candidate.category].append(list(candidate.argv))
+    lines = [
+        "schema_version = 1",
+        "",
+        "[rivet]",
+        "safe_mode = false",
+        "",
+        "[verification]",
+        "# 必须由用户提供独立于模型输出的行为验收 argv。",
+        "acceptance = []",
+    ]
+    for name in ("targeted", "related", "regression", "static"):
+        encoded = json.dumps(grouped[name], ensure_ascii=False, separators=(",", ":"))
+        lines.append(f"{name} = {encoded}")
+    return "\n".join(lines) + "\n"
+
+
+def _init_payload(
+    *,
+    config_path: Path,
+    created: bool,
+    confirmed: bool,
+    readiness: EvidenceReadiness,
+) -> dict[str, object]:
+    """返回 TUI/headless 共用的无秘密初始化检测结果。"""
+    return {
+        "acceptance_ready": readiness.ready,
+        "config_path": str(config_path),
+        "confirmed": confirmed,
+        "created": created,
+        "detected_kinds": [kind.value for kind in readiness.kinds],
+        "next_action": (
+            readiness.next_action
+            if confirmed
+            else "检测结果尚未写入；审查候选后运行 rivet init --yes"
+        ),
+        "reason": readiness.reason,
+        "suggestions": [
+            {
+                "argv": list(candidate.argv),
+                "category": candidate.category,
+                "kind": candidate.kind.value,
+                "reason": candidate.reason,
+            }
+            for candidate in readiness.suggestions
+        ],
+    }
 
 
 async def _read_file(
@@ -276,10 +406,15 @@ async def _read_file(
     json_output: bool,
 ) -> int:
     """调用统一 ReaderService 并保证资源域归零。"""
-    from rivet.cli.runtime import create_cli_kernel, module_scope, shutdown_cli_kernel
+    from rivet.cli.runtime import create_cli_kernel, shutdown_cli_kernel
     from rivet.contracts.readers import ReaderRequest, ReaderStatus
-    from rivet.kernel.errors import KernelError, SafeModeViolationError
-    from rivet.kernel.module_runtime import ModuleLease
+    from rivet.kernel.errors import (
+        KernelError,
+        ModuleUnavailableError,
+        SafeModeViolationError,
+    )
+    from rivet.kernel.module_runtime import CapabilityLease
+    from rivet.modules.capabilities import ReaderCapability
     from rivet.tools.paths import WorkspaceBoundary
 
     source_argument = cast(Path, arguments.file)
@@ -298,25 +433,26 @@ async def _read_file(
         ) from error
     boundary = WorkspaceBoundary(repository)
     kernel = create_cli_kernel(repository, safe_mode=safe_mode)
-    leases: list[ModuleLease] = []
+    leases: list[CapabilityLease[object]] = []
     try:
         await kernel.start()
-        detection_lease = await kernel.acquire_lease("reader.detect")
+        detection_lease = await kernel.acquire("reader.detect")
         leases.append(detection_lease)
-        from rivet.readers.detection import detect_file
-
-        inspection = detect_file(
+        detector = cast(ReaderCapability, detection_lease.capability)
+        inspection = detector.detect(
             boundary.resolve_repository(source_path, require_file=True),
             source_path=source_path,
         )
-        lease = await kernel.acquire_lease(inspection.capability_id)
+        requested_capability = (
+            "reader.transcription"
+            if cast(bool, arguments.transcribe)
+            and inspection.capability_id == "reader.media"
+            else inspection.capability_id
+        )
+        lease = await kernel.acquire(requested_capability)
         leases.append(lease)
-        from rivet.readers.service import ReaderService
-
-        result = await ReaderService(
-            repository,
-            scope=module_scope(lease.instance),
-        ).read(
+        reader = cast(ReaderCapability, lease.capability)
+        result = await reader.read(
             ReaderRequest(
                 source_path=source_path,
                 timeout_seconds=cast(int, arguments.timeout),
@@ -334,6 +470,13 @@ async def _read_file(
             "module.safe_mode_denied",
             "Safe Mode 不允许激活该 Reader 模块",
             "改用受支持的基础格式，或审查配置后关闭 Safe Mode",
+        ) from error
+    except ModuleUnavailableError as error:
+        missing = ", ".join(error.missing_components) or error.availability
+        raise CliConfigurationError(
+            "module.reader_unavailable",
+            f"Reader 模块缺少激活前提：{missing}",
+            error.suggested_action or "运行 rivet modules 和 rivet doctor 检查能力",
         ) from error
     except KernelError as error:
         raise CliConfigurationError(
@@ -492,16 +635,21 @@ async def _resume(
     verification_status: str | None = None
     if checkpoint.transaction_id is not None:
         from rivet.cli.errors import CliVerificationError
+        from rivet.cli.runtime import create_cli_kernel, shutdown_cli_kernel
         from rivet.contracts.transactions import TransactionState
-        from rivet.kernel.resources import ResourceScope
+        from rivet.kernel.errors import KernelError
+        from rivet.kernel.module_runtime import CapabilityLease
         from rivet.transaction.errors import TransactionError
         from rivet.transaction.manager import TransactionManager
         from rivet.transaction.store import TransactionStore
 
-        scope = ResourceScope("cli.resume")
-        manager = TransactionManager(repository, scope=scope)
+        kernel = create_cli_kernel(repository, safe_mode=config.safe_mode)
+        leases: list[CapabilityLease[object]] = []
         try:
-            await manager.inspect_repository()
+            await kernel.start()
+            transaction_lease = await kernel.acquire("transaction.worktree")
+            leases.append(transaction_lease)
+            manager = cast(TransactionManager, transaction_lease.capability)
             store = TransactionStore(
                 RuntimePaths.for_repository(repository).runtime_root / "transactions"
             )
@@ -533,8 +681,14 @@ async def _resume(
                 error.summary,
                 "检查事务 Worktree 与记录后使用 diff 或 abort",
             ) from error
+        except KernelError as error:
+            raise CliVerificationError(
+                "module.transaction_unavailable",
+                "事务恢复能力无法安全激活",
+                "运行 rivet modules 和 rivet doctor 检查能力策略",
+            ) from error
         finally:
-            await scope.close()
+            await shutdown_cli_kernel(kernel, leases)
     payload: dict[str, object] = {
         "command": checkpoint.command,
         "evidence_id": evidence_id,

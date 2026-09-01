@@ -2,19 +2,24 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import AsyncGenerator, Iterable
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from rivet.contracts.common import CapabilityId
 from rivet.contracts.modules import ModuleManifest
 from rivet.kernel.manifests import ManifestLoader
-from rivet.kernel.module_api import ModuleInstance
+from rivet.kernel.module_api import ModuleActivationContext
 from rivet.kernel.module_lifecycle import (
     InMemoryModuleOverrideRepository,
     ModuleLifecycleService,
     ModuleOverrideRepository,
 )
-from rivet.kernel.module_runtime import ActivationJournal, ModuleLease, ModuleRuntime
+from rivet.kernel.module_runtime import (
+    ActivationJournal,
+    CapabilityLease,
+    ModuleRuntime,
+)
 
 
 class RivetKernel:
@@ -38,6 +43,7 @@ class RivetKernel:
         enabled_overrides: dict[str, bool] | None = None,
         persisted_overrides: dict[str, bool | None] | None = None,
         override_repository: ModuleOverrideRepository | None = None,
+        activation_context: ModuleActivationContext | None = None,
     ) -> RivetKernel:
         """从已验证 Manifest 构造无副作用 Kernel。"""
         runtime = ModuleRuntime(
@@ -45,6 +51,7 @@ class RivetKernel:
             journal=ActivationJournal(journal_path),
             safe_mode=safe_mode,
             enabled_overrides=enabled_overrides,
+            activation_context=activation_context,
         )
         return cls(
             runtime,
@@ -73,13 +80,22 @@ class RivetKernel:
         """启动 required 模块。"""
         await self.runtime.start()
 
-    async def resolve(self, capability_id: CapabilityId) -> ModuleInstance:
+    async def resolve(self, capability_id: CapabilityId) -> object:
         """委托运行时按需解析能力。"""
         return await self.runtime.resolve(capability_id)
 
-    async def acquire_lease(self, capability_id: CapabilityId) -> ModuleLease:
-        """委托运行时租用能力。"""
-        return await self.runtime.acquire_lease(capability_id)
+    async def acquire(self, capability_id: CapabilityId) -> CapabilityLease[object]:
+        """委托运行时租用并返回真实 capability。"""
+        return await self.runtime.acquire(capability_id)
+
+    @asynccontextmanager
+    async def capability(self, capability_id: CapabilityId) -> AsyncGenerator[object]:
+        """以结构化上下文保证 capability Lease 必定归还。"""
+        lease = await self.acquire(capability_id)
+        try:
+            yield lease.capability
+        finally:
+            await lease.release()
 
     async def shutdown(self) -> None:
         """关闭运行时并执行资源归零门禁。"""

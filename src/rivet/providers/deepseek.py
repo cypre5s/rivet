@@ -25,6 +25,7 @@ from rivet.contracts.provider import (
     ReasoningEffort,
 )
 from rivet.contracts.tools import ToolCall, ToolDefinition
+from rivet.kernel.model_provider import ModelTextDeltaCallback
 from rivet.kernel.resources import ResourceScope
 from rivet.providers.errors import (
     ConfigurationError,
@@ -180,13 +181,32 @@ class DeepSeekProvider:
             body["stream_options"] = {"include_usage": True}
         return body
 
-    async def complete(self, request: ModelRequest) -> ModelResponse:
+    async def complete(
+        self,
+        request: ModelRequest,
+        *,
+        on_text_delta: ModelTextDeltaCallback | None = None,
+    ) -> ModelResponse:
         """执行一次补全，并只重试明确可恢复的失败。"""
         client = self._get_client()
         for attempt_index in range(self._config.max_attempts):
             retry_after: float | None = None
+            emitted_text = False
+
+            async def publish_text_delta(delta: str) -> None:
+                nonlocal emitted_text
+                emitted_text = True
+                if on_text_delta is not None:
+                    await on_text_delta(delta)
+
             try:
-                response = await self._complete_once(client, request)
+                response = await self._complete_once(
+                    client,
+                    request,
+                    on_text_delta=(
+                        publish_text_delta if on_text_delta is not None else None
+                    ),
+                )
                 self._ensure_usable(response)
                 return response
             except ProviderRateLimitError as error:
@@ -200,7 +220,7 @@ class DeepSeekProvider:
                     "模型服务网络连接失败",
                     retryable=True,
                 )
-            if (
+            if emitted_text or (
                 not provider_error.retryable
                 or attempt_index + 1 >= self._config.max_attempts
             ):
@@ -238,6 +258,8 @@ class DeepSeekProvider:
         self,
         client: httpx.AsyncClient,
         request: ModelRequest,
+        *,
+        on_text_delta: ModelTextDeltaCallback | None,
     ) -> ModelResponse:
         """执行单次 HTTP 请求并解析流式或非流式响应。"""
         aliases = _ToolNameAliases.from_definitions(request.tools)
@@ -247,6 +269,7 @@ class DeepSeekProvider:
                 client,
                 body,
                 wire_to_local=aliases.wire_to_local,
+                on_text_delta=on_text_delta,
             )
         response = await client.post("chat/completions", json=body)
         self._raise_for_status(response)
@@ -270,6 +293,7 @@ class DeepSeekProvider:
         body: dict[str, object],
         *,
         wire_to_local: Mapping[str, str],
+        on_text_delta: ModelTextDeltaCallback | None,
     ) -> ModelResponse:
         """在响应上下文中增量解码 SSE，并确保取消时释放连接。"""
         decoder = SSEDecoder()
@@ -278,9 +302,13 @@ class DeepSeekProvider:
             self._raise_for_status(response)
             async for chunk in response.aiter_bytes():
                 for event_data in decoder.feed(chunk):
-                    accumulator.consume(event_data)
+                    delta = accumulator.consume(event_data)
+                    if delta and on_text_delta is not None:
+                        await on_text_delta(delta)
             for event_data in decoder.finalize():
-                accumulator.consume(event_data)
+                delta = accumulator.consume(event_data)
+                if delta and on_text_delta is not None:
+                    await on_text_delta(delta)
         return accumulator.response(created_at=self._clock())
 
     @staticmethod

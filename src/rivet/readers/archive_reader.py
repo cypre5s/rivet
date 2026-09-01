@@ -186,39 +186,7 @@ class ArchiveReader:
     reader_version = "1.0.0"
 
     async def read(self, context: ReaderContext) -> ReaderPayload:
-        """对 7z 使用隔离 worker，对标准归档执行内存预检。"""
-        if context.inspection.detected_format == "7z":
-            output = parse_worker_output(
-                await run_reader_worker(
-                    context,
-                    mode="sevenzip",
-                    arguments=(
-                        "--max-entries",
-                        str(context.request.max_archive_entries),
-                        "--max-expanded-bytes",
-                        str(context.request.max_expanded_bytes),
-                        "--max-ratio",
-                        str(context.request.max_compression_ratio),
-                    ),
-                )
-            )
-            return ReaderPayload(
-                status=ReaderStatus.TRUNCATED
-                if output.truncated
-                else ReaderStatus.SUCCESS,
-                support_level=SupportLevel.NATIVE,
-                content=output.content,
-                metadata=output.metadata,
-                warnings=output.warnings,
-                source_spans=(
-                    SourceSpan(
-                        repository_path=context.inspection.source_path,
-                        start_line=1,
-                        end_line=1,
-                    ),
-                ),
-                truncated=output.truncated,
-            )
+        """对标准 ZIP/TAR 执行内存预检，不依赖任何可选包。"""
         state = _ArchiveState()
         source_bytes = context.inspection.absolute_path.read_bytes()
         if context.inspection.detected_format == "zip":
@@ -253,4 +221,45 @@ class ArchiveReader:
                     end_line=1,
                 ),
             ),
+        )
+
+
+class SevenZipReader:
+    """只在 archive extra 可用时通过隔离 worker 读取 7z。"""
+
+    reader_id = "reader.archive.sevenzip"
+    reader_version = "1.0.0"
+
+    async def read(self, context: ReaderContext) -> ReaderPayload:
+        """把不可信 7z 解析限制在短生命周期子进程。"""
+        output = parse_worker_output(
+            await run_reader_worker(
+                context,
+                mode="sevenzip",
+                arguments=(
+                    "--max-entries",
+                    str(context.request.max_archive_entries),
+                    "--max-expanded-bytes",
+                    str(context.request.max_expanded_bytes),
+                    "--max-ratio",
+                    str(context.request.max_compression_ratio),
+                ),
+            )
+        )
+        return ReaderPayload(
+            status=(
+                ReaderStatus.TRUNCATED if output.truncated else ReaderStatus.SUCCESS
+            ),
+            support_level=SupportLevel.NATIVE,
+            content=output.content,
+            metadata=output.metadata,
+            warnings=output.warnings,
+            source_spans=(
+                SourceSpan(
+                    repository_path=context.inspection.source_path,
+                    start_line=1,
+                    end_line=1,
+                ),
+            ),
+            truncated=output.truncated,
         )

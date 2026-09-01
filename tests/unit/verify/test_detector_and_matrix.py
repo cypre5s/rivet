@@ -13,7 +13,7 @@ from rivet.contracts.verification import (
     VerificationResult,
     VerificationStatus,
 )
-from rivet.verify.detector import ProjectDetector, ProjectKind
+from rivet.verify.detector import ProjectDetector, ProjectKind, evidence_readiness
 from rivet.verify.errors import VerificationError
 from rivet.verify.matrix import build_verification_matrix, compute_verdict
 from tests.transaction_helpers import acceptance_spec
@@ -90,6 +90,24 @@ static = [["python", "-m", "compileall", "src"]]
     assert any(step.command[-1] == "regression.py" for step in confirmed.steps)
     assert any(step.command[-1] == "acceptance.py" for step in confirmed.steps)
     assert {step.kind for step in confirmed.steps} == set(VerificationKind)
+    readiness = evidence_readiness(detection)
+    assert readiness.ready is True
+    assert readiness.acceptance_commands == (("python", "acceptance.py"),)
+
+
+def test_empty_acceptance_is_not_evidence_ready(tmp_path: Path) -> None:
+    configuration_directory = tmp_path / ".rivet"
+    configuration_directory.mkdir()
+    (configuration_directory / "project.toml").write_text(
+        "schema_version = 1\n[verification]\nacceptance = []\n",
+        encoding="utf-8",
+    )
+
+    readiness = evidence_readiness(ProjectDetector().detect(tmp_path))
+
+    assert readiness.ready is False
+    assert readiness.reason == "verification.acceptance 为空"
+    assert "candidate-only" not in readiness.next_action
 
 
 def test_broken_project_configuration_symlink_is_rejected(tmp_path: Path) -> None:

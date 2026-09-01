@@ -56,6 +56,52 @@ class ProjectDetection:
     configuration: ProjectConfiguration | None
 
 
+@dataclass(frozen=True, slots=True)
+class EvidenceReadiness:
+    """描述 FIX 是否具备独立行为验收，而不执行任何候选命令。"""
+
+    ready: bool
+    kinds: tuple[ProjectKind, ...]
+    acceptance_commands: tuple[tuple[str, ...], ...]
+    suggestions: tuple[ProjectCommandCandidate, ...]
+    reason: str
+    next_action: str
+
+
+def evidence_readiness(detection: ProjectDetection) -> EvidenceReadiness:
+    """把只读项目检测结果收敛成统一的 Evidence 预检事实。"""
+    commands = (
+        detection.configuration.acceptance
+        if detection.configuration is not None
+        else ()
+    )
+    if commands:
+        return EvidenceReadiness(
+            ready=True,
+            kinds=detection.kinds,
+            acceptance_commands=commands,
+            suggestions=detection.candidates,
+            reason="已配置独立行为验收命令",
+            next_action="可以运行 rivet fix --yes；补丁仍需独立 Verify 后才能 Apply",
+        )
+    reason = (
+        "项目尚未创建验证配置"
+        if detection.configuration is None
+        else "verification.acceptance 为空"
+    )
+    return EvidenceReadiness(
+        ready=False,
+        kinds=detection.kinds,
+        acceptance_commands=(),
+        suggestions=detection.candidates,
+        reason=reason,
+        next_action=(
+            "运行 rivet init 查看只读检测建议，确认后使用 rivet init --yes，"
+            "再在 .rivet/project.toml 中配置独立 verification.acceptance argv"
+        ),
+    )
+
+
 class ProjectDetector:
     """根据根目录标记文件生成建议，不启动任何子进程。"""
 

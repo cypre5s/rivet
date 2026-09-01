@@ -136,6 +136,7 @@ class SessionCheckpoint(ContractModel):
     query: NonEmptyText
     status: SessionStatus
     stage: SessionStage = SessionStage.AGENT_LOOP
+    candidate_only: bool = False
     model: str | None = Field(default=None, min_length=1, max_length=256)
     messages: tuple[Message, ...] = Field(default=(), max_length=1_024)
     termination_reason: str | None = Field(default=None, max_length=128)

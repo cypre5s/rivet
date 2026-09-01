@@ -164,7 +164,7 @@ async def test_wake_sleep_disable_and_idempotency_are_distinct(
     assert first_wake.changed
     assert not second_wake.changed
     assert slept.changed
-    assert slept.current_state is ModuleState.SLEEPING
+    assert slept.current_state is ModuleState.INACTIVE
     assert not slept_again.changed
     assert disabled.changed
     assert not disabled.effective_enabled
@@ -336,7 +336,7 @@ async def test_lease_blocks_and_wait_succeeds_after_release(tmp_path: Path) -> N
         tmp_path,
         (_manifest("test.lease", "test.lease.use"),),
     )
-    lease = await runtime.acquire_lease("test.lease.use")
+    lease = await runtime.acquire("test.lease.use")
 
     with pytest.raises(ModuleLifecycleError) as blocked:
         await service.sleep(
@@ -360,7 +360,7 @@ async def test_lease_blocks_and_wait_succeeds_after_release(tmp_path: Path) -> N
     result = await pending_sleep
 
     assert result.changed
-    assert runtime.state("test.lease") is ModuleState.SLEEPING
+    assert runtime.state("test.lease") is ModuleState.INACTIVE
     assert runtime.resource_counts().resource_count == 0
     await runtime.shutdown()
 
@@ -440,7 +440,7 @@ async def test_concurrent_wake_sleep_stays_legal_and_trace_is_complete(
 
     assert runtime.state("test.concurrent") in {
         ModuleState.ACTIVE,
-        ModuleState.SLEEPING,
+        ModuleState.INACTIVE,
     }
     assert all(result.trace_event_id is not None for result in results)
     event_types = [event_type for event_type, _ in sink.events]

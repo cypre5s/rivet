@@ -5,7 +5,11 @@ from __future__ import annotations
 from typing import cast
 
 from rivet.trace.builder import TraceEventBuilder
-from rivet.trace.redaction import REDACTED_TEXT, SecretRedactor
+from rivet.trace.redaction import (
+    REDACTED_TEXT,
+    SecretRedactor,
+    StreamingSecretRedactor,
+)
 from tests.fixtures.trace.events import make_event
 
 
@@ -65,3 +69,26 @@ def test_builder_preserves_correlation_and_redacts_before_validation() -> None:
     assert event.transaction_id == "tx_trace_test"
     assert event.parent_event_id == "event_trace_1"
     assert secret not in event.model_dump_json()
+
+
+def test_streaming_redactor_emits_safe_snapshots_without_partial_secret() -> None:
+    secret = "sk-" + ("z" * 40)
+    streamer = StreamingSecretRedactor(
+        SecretRedactor(environment={"DEEPSEEK_API_KEY": secret}),
+        min_increment=1,
+    )
+    snapshots = [
+        snapshot
+        for snapshot in (
+            streamer.feed("这是第一段安全说明。" * 8),
+            streamer.feed(f"密钥是 {secret[:18]}"),
+            streamer.feed(f"{secret[18:]}。后续结论已经生成。" * 4),
+            streamer.finalize(),
+        )
+        if snapshot is not None
+    ]
+
+    assert len(snapshots) >= 2
+    assert snapshots[-1].count(REDACTED_TEXT) >= 1
+    assert all(secret not in snapshot for snapshot in snapshots)
+    assert all(secret[:18] not in snapshot for snapshot in snapshots)

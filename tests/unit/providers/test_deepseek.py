@@ -82,10 +82,19 @@ async def test_streaming_and_non_streaming_fixtures_are_equivalent() -> None:
         clock=lambda: FIXED_NOW,
     )
 
+    streamed_deltas: list[str] = []
+
+    async def collect_delta(delta: str) -> None:
+        streamed_deltas.append(delta)
+
     non_stream = await non_stream_provider.complete(model_request(stream=False))
-    streamed = await stream_provider.complete(model_request(stream=True))
+    streamed = await stream_provider.complete(
+        model_request(stream=True), on_text_delta=collect_delta
+    )
 
     assert streamed.message == non_stream.message
+    assert len(streamed_deltas) > 1
+    assert "".join(streamed_deltas) == streamed.message.content
     assert streamed.finish_reason is ModelFinishReason.STOP
     assert streamed.usage == non_stream.usage
     assert byte_stream.closed

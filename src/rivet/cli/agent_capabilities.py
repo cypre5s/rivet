@@ -4,16 +4,23 @@ from __future__ import annotations
 
 import json
 from collections.abc import Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
 
-from rivet.cli.runtime import module_scope
 from rivet.contracts.messages import Message, UserMessage
 from rivet.kernel.agent_models import AgentTask
 from rivet.kernel.agent_tools import AgentTool
+from rivet.kernel.errors import ModuleActivationError, ModuleUnavailableError
+from rivet.kernel.module_runtime import CapabilityLease
+from rivet.modules.capabilities import (
+    ProgressiveContextCapability,
+    ReaderCapability,
+    SemanticContextCapability,
+)
 from rivet.tools.paths import WorkspaceBoundary
 
 if TYPE_CHECKING:
@@ -71,16 +78,24 @@ def create_context_gatherer(
     async def gather(task: AgentTask) -> tuple[Message, ...]:
         """选择 Level 0-2 证据，并将内容明确标记为不可信数据。"""
         capability = "context.search.lexical"
-        module_id = kernel.runtime.provider_module_id(capability)
-        prior_state = kernel.runtime.state(module_id)
-        lease = await kernel.acquire_lease(capability)
+        lease, module_id, prior_state = await _acquire_capability(
+            kernel,
+            trace,
+            builder,
+            capability_id=capability,
+            run_id=run_id,
+            session_id=session_id,
+            transaction_id=transaction_id,
+        )
         try:
             from rivet.context.budget import consume_selection
-            from rivet.context.engine import ProgressiveContext
 
-            scope = module_scope(lease.instance)
             budget = _context_budget(max_total_tokens)
-            result = await ProgressiveContext(repository_root, scope=scope).retrieve(
+            retriever = cast(
+                ProgressiveContextCapability,
+                lease.capability,
+            )
+            result = await retriever.retrieve(
                 _task_query(task),
                 budget=budget,
                 include_syntax=False,
@@ -91,33 +106,69 @@ def create_context_gatherer(
                 run_id=run_id,
                 session_id=session_id,
                 transaction_id=transaction_id,
+                capability_id=capability,
                 module_id=module_id,
-                prior_state=prior_state.value,
+                prior_state=prior_state,
             )
             if not safe_mode and _selection_requires_syntax(result.selection):
-                await lease.release()
-                capability = "context.search.syntax"
-                module_id = kernel.runtime.provider_module_id(capability)
-                prior_state = kernel.runtime.state(module_id)
-                lease = await kernel.acquire_lease(capability)
-                scope = module_scope(lease.instance)
-                result = await ProgressiveContext(
-                    repository_root,
-                    scope=scope,
-                ).retrieve(
-                    _task_query(task),
-                    budget=budget,
-                    include_syntax=True,
-                )
-                await _emit_module_activation(
+                lexical_result = result
+                await _release_capability(
+                    kernel,
                     trace,
                     builder,
+                    lease=lease,
+                    capability_id=capability,
+                    module_id=module_id,
                     run_id=run_id,
                     session_id=session_id,
                     transaction_id=transaction_id,
-                    module_id=module_id,
-                    prior_state=prior_state.value,
+                    reason="context_escalation",
                 )
+                lease = None
+                capability = "context.search.syntax"
+                module_id = kernel.runtime.provider_module_id(capability)
+                try:
+                    lease, module_id, prior_state = await _acquire_capability(
+                        kernel,
+                        trace,
+                        builder,
+                        capability_id=capability,
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                    )
+                except ModuleActivationError as error:
+                    result = lexical_result
+                    await _emit_module_activation_failure(
+                        trace,
+                        builder,
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                        capability_id=capability,
+                        module_id=module_id,
+                        error=error,
+                    )
+                else:
+                    retriever = cast(
+                        ProgressiveContextCapability,
+                        lease.capability,
+                    )
+                    result = await retriever.retrieve(
+                        _task_query(task),
+                        budget=budget,
+                        include_syntax=True,
+                    )
+                    await _emit_module_activation(
+                        trace,
+                        builder,
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                        capability_id=capability,
+                        module_id=module_id,
+                        prior_state=prior_state,
+                    )
             selection = consume_selection(result.selection)
             await _emit_context_selection(
                 trace,
@@ -161,7 +212,19 @@ def create_context_gatherer(
                 ),
             )
         finally:
-            await lease.release()
+            if lease is not None:
+                await _release_capability(
+                    kernel,
+                    trace,
+                    builder,
+                    lease=lease,
+                    capability_id=capability,
+                    module_id=module_id,
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    reason="context_complete",
+                )
 
     return gather
 
@@ -187,32 +250,48 @@ def build_agent_capability_tools(
         values = ReaderReadArguments.model_validate(arguments.model_dump())
         source = boundary.resolve_repository(values.path, require_file=True)
         detection_capability = "reader.detect"
-        detection_module_id = kernel.runtime.provider_module_id(detection_capability)
-        detection_prior_state = kernel.runtime.state(detection_module_id)
-        detection_lease = await kernel.acquire_lease(detection_capability)
+        (
+            detection_lease,
+            detection_module_id,
+            detection_prior_state,
+        ) = await _acquire_capability(
+            kernel,
+            trace,
+            builder,
+            capability_id=detection_capability,
+            run_id=run_id,
+            session_id=session_id,
+            transaction_id=transaction_id,
+        )
         lease = None
+        capability = detection_capability
+        module_id = detection_module_id
         try:
-            from rivet.readers.detection import detect_file
-
             await _emit_module_activation(
                 trace,
                 builder,
                 run_id=run_id,
                 session_id=session_id,
                 transaction_id=transaction_id,
+                capability_id=detection_capability,
                 module_id=detection_module_id,
-                prior_state=detection_prior_state.value,
+                prior_state=detection_prior_state,
             )
-            inspection = detect_file(source, source_path=values.path)
+            detector = cast(ReaderCapability, detection_lease.capability)
+            inspection = detector.detect(source, source_path=values.path)
+            capability = inspection.capability_id
             module_id = kernel.runtime.provider_module_id(inspection.capability_id)
-            prior_state = kernel.runtime.state(module_id)
-            lease = await kernel.acquire_lease(inspection.capability_id)
-            from rivet.readers.service import ReaderService
-
-            result = await ReaderService(
-                repository_root,
-                scope=module_scope(lease.instance),
-            ).read(
+            lease, module_id, prior_state = await _acquire_capability(
+                kernel,
+                trace,
+                builder,
+                capability_id=capability,
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+            )
+            reader = cast(ReaderCapability, lease.capability)
+            result = await reader.read(
                 ReaderRequest(
                     source_path=values.path,
                     max_output_chars=values.max_output_chars,
@@ -224,8 +303,9 @@ def build_agent_capability_tools(
                 run_id=run_id,
                 session_id=session_id,
                 transaction_id=transaction_id,
+                capability_id=capability,
                 module_id=module_id,
-                prior_state=prior_state.value,
+                prior_state=prior_state,
             )
             await trace.emit(
                 builder.build(
@@ -246,9 +326,33 @@ def build_agent_capability_tools(
             )
             return result.model_dump_json()
         finally:
-            if lease is not None:
-                await lease.release()
-            await detection_lease.release()
+            try:
+                if lease is not None:
+                    await _release_capability(
+                        kernel,
+                        trace,
+                        builder,
+                        lease=lease,
+                        capability_id=capability,
+                        module_id=module_id,
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                        reason="reader_complete",
+                    )
+            finally:
+                await _release_capability(
+                    kernel,
+                    trace,
+                    builder,
+                    lease=detection_lease,
+                    capability_id=detection_capability,
+                    module_id=detection_module_id,
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    reason="reader_detection_complete",
+                )
 
     tools = [
         AgentTool.from_model(
@@ -265,25 +369,25 @@ def build_agent_capability_tools(
             values = SemanticSearchArguments.model_validate(arguments.model_dump())
             boundary.resolve_repository(values.path, require_file=True)
             capability = "context.search.lsp"
-            module_id = kernel.runtime.provider_module_id(capability)
-            prior_state = kernel.runtime.state(module_id)
-            lease = await kernel.acquire_lease(capability)
-            retriever = None
+            lease, module_id, prior_state = await _acquire_capability(
+                kernel,
+                trace,
+                builder,
+                capability_id=capability,
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+            )
             try:
-                from rivet.context.lsp_manifest import LspManifestRegistry
                 from rivet.context.lsp_models import LspPosition
                 from rivet.context.semantic import (
-                    SemanticContextRetriever,
                     SemanticOperation,
                     SemanticRequest,
                 )
 
-                retriever = SemanticContextRetriever(
-                    repository_root,
-                    scope=module_scope(lease.instance),
-                    registry=LspManifestRegistry.load_builtin(
-                        repository_root=repository_root
-                    ),
+                retriever = cast(
+                    SemanticContextCapability,
+                    lease.capability,
                 )
                 result = await retriever.retrieve(
                     values.query,
@@ -303,8 +407,9 @@ def build_agent_capability_tools(
                     run_id=run_id,
                     session_id=session_id,
                     transaction_id=transaction_id,
+                    capability_id=capability,
                     module_id=module_id,
-                    prior_state=prior_state.value,
+                    prior_state=prior_state,
                 )
                 await _emit_context_selection(
                     trace,
@@ -329,9 +434,18 @@ def build_agent_capability_tools(
                     separators=(",", ":"),
                 )
             finally:
-                if retriever is not None:
-                    await retriever.close()
-                await lease.release()
+                await _release_capability(
+                    kernel,
+                    trace,
+                    builder,
+                    lease=lease,
+                    capability_id=capability,
+                    module_id=module_id,
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    reason="semantic_query_complete",
+                )
 
         tools.append(
             AgentTool.from_model(
@@ -385,6 +499,7 @@ async def _emit_module_activation(
     run_id: str,
     session_id: str,
     transaction_id: str | None,
+    capability_id: str,
     module_id: str,
     prior_state: str,
 ) -> None:
@@ -398,7 +513,157 @@ async def _emit_module_activation(
             session_id=session_id,
             transaction_id=transaction_id,
             result_summary=f"按需模块已激活：{module_id}",
-            payload={"module_id": module_id, "state": "ACTIVE"},
+            payload={
+                "capability_id": capability_id,
+                "module_id": module_id,
+                "state": "ACTIVE",
+            },
+        )
+    )
+
+
+async def _emit_module_activation_failure(
+    trace: TraceStore,
+    builder: TraceEventBuilder,
+    *,
+    run_id: str,
+    session_id: str,
+    transaction_id: str | None,
+    capability_id: str,
+    module_id: str,
+    error: ModuleActivationError,
+) -> None:
+    """记录可选能力失败并继续使用较低层级，不暴露原始异常文本。"""
+    if isinstance(error, ModuleUnavailableError):
+        error_code = "module.unavailable"
+        availability = error.availability
+        missing_components = list(error.missing_components)
+        next_action = error.suggested_action
+    else:
+        error_code = "module.activation_failed"
+        availability = "UNKNOWN"
+        missing_components = []
+        next_action = "检查脱敏 Trace 与 rivet doctor"
+    await trace.emit(
+        builder.build(
+            event_type="module.activation_failed",
+            run_id=run_id,
+            session_id=session_id,
+            transaction_id=transaction_id,
+            result_summary=f"可选模块不可用，已降级：{module_id}",
+            payload={
+                "availability": availability,
+                "capability_id": capability_id,
+                "error_code": error_code,
+                "missing_components": cast(JsonValue, missing_components),
+                "module_id": module_id,
+                "next_action": next_action,
+            },
+        )
+    )
+
+
+async def _acquire_capability(
+    kernel: RivetKernel,
+    trace: TraceStore,
+    builder: TraceEventBuilder,
+    *,
+    capability_id: str,
+    run_id: str,
+    session_id: str,
+    transaction_id: str | None,
+) -> tuple[CapabilityLease[object], str, str]:
+    """记录真实请求，并把激活失败与单次业务失败分开。"""
+    module_id = kernel.runtime.provider_module_id(capability_id)
+    prior_state = kernel.runtime.state(module_id).value
+    await trace.emit(
+        builder.build(
+            event_type="module.requested",
+            run_id=run_id,
+            session_id=session_id,
+            transaction_id=transaction_id,
+            result_summary=f"任务请求按需能力：{module_id}",
+            payload={
+                "capability_id": capability_id,
+                "module_id": module_id,
+                "prior_state": prior_state,
+            },
+        )
+    )
+    try:
+        lease = await kernel.acquire(capability_id)
+    except BaseException as error:
+        with suppress(Exception):
+            await trace.emit(
+                builder.build(
+                    event_type="module.activation_failed",
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    result_summary=f"按需能力激活失败：{module_id}",
+                    payload={
+                        "capability_id": capability_id,
+                        "error_type": type(error).__name__,
+                        "module_id": module_id,
+                    },
+                )
+            )
+        raise
+    return lease, module_id, prior_state
+
+
+async def _release_capability(
+    kernel: RivetKernel,
+    trace: TraceStore,
+    builder: TraceEventBuilder,
+    *,
+    lease: CapabilityLease[object],
+    capability_id: str,
+    module_id: str,
+    run_id: str,
+    session_id: str,
+    transaction_id: str | None,
+    reason: str,
+) -> None:
+    """归还真实 Lease，并记录归还后的有界资源事实。"""
+    try:
+        await lease.release()
+    except BaseException as error:
+        with suppress(Exception):
+            await trace.emit(
+                builder.build(
+                    event_type="module.release_failed",
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    result_summary=f"按需能力释放失败：{module_id}",
+                    payload={
+                        "capability_id": capability_id,
+                        "error_type": type(error).__name__,
+                        "module_id": module_id,
+                        "reason": reason,
+                    },
+                )
+            )
+        raise
+    snapshot = next(
+        item for item in kernel.runtime.snapshots() if item.module_id == module_id
+    )
+    await trace.emit(
+        builder.build(
+            event_type="module.released",
+            run_id=run_id,
+            session_id=session_id,
+            transaction_id=transaction_id,
+            result_summary=f"任务已释放按需能力：{module_id}",
+            payload={
+                "capability_id": capability_id,
+                "lease_count": snapshot.lease_count,
+                "module_id": module_id,
+                "reason": reason,
+                "resource_count": snapshot.resource_counts.resource_count,
+                "state": snapshot.state.value,
+            },
         )
     )
 

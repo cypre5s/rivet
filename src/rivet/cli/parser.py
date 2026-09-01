@@ -54,6 +54,11 @@ def build_parser() -> ArgumentParser:
 
     init_parser = subparsers.add_parser("init", help="初始化项目配置")
     init_parser.add_argument("path", nargs="?", type=Path)
+    init_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="确认把只读检测建议写入 .rivet/project.toml",
+    )
     _add_runtime_aliases(init_parser)
 
     ask_parser = subparsers.add_parser("ask", help="只读询问仓库")
@@ -79,6 +84,11 @@ def build_parser() -> ArgumentParser:
     fix_parser = subparsers.add_parser("fix", help="在隔离事务中修复代码")
     fix_parser.add_argument("task")
     fix_parser.add_argument("--yes", action="store_true")
+    fix_parser.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="仅生成不可 Apply 的候选补丁，跳过独立 Verify 与 Evidence",
+    )
     fix_parser.add_argument(
         "--allow-write",
         action="append",
@@ -129,7 +139,7 @@ def build_parser() -> ArgumentParser:
     )
     _add_runtime_aliases(resume_parser)
 
-    modules_parser = subparsers.add_parser("modules", help="查看或控制按需模块")
+    modules_parser = subparsers.add_parser("modules", help="查看或配置能力策略")
     _add_runtime_aliases(modules_parser)
     module_subparsers = modules_parser.add_subparsers(dest="module_command")
     module_list_parser = module_subparsers.add_parser("list", help="列出模块状态")
@@ -141,21 +151,16 @@ def build_parser() -> ArgumentParser:
     module_enable_parser.add_argument("module_id")
     module_enable_parser.add_argument("--with-dependencies", action="store_true")
     _add_runtime_aliases(module_enable_parser)
-    module_wake_parser = module_subparsers.add_parser("wake", help="唤醒模块")
-    module_wake_parser.add_argument("module_id")
-    module_wake_parser.add_argument("--with-dependencies", action="store_true")
-    _add_runtime_aliases(module_wake_parser)
-    for operation, description in (
-        ("sleep", "安全休眠模块"),
-        ("disable", "安全休眠并持久化禁用模块"),
-    ):
-        lifecycle_parser = module_subparsers.add_parser(operation, help=description)
-        lifecycle_parser.add_argument("module_id")
-        lifecycle_parser.add_argument("--cascade", action="store_true")
-        lifecycle_parser.add_argument("--wait", action="store_true")
-        lifecycle_parser.add_argument("--timeout", type=float, default=30.0)
-        lifecycle_parser.add_argument("--yes", action="store_true")
-        _add_runtime_aliases(lifecycle_parser)
+    module_disable_parser = module_subparsers.add_parser(
+        "disable",
+        help="安全释放并持久化禁用能力",
+    )
+    module_disable_parser.add_argument("module_id")
+    module_disable_parser.add_argument("--cascade", action="store_true")
+    module_disable_parser.add_argument("--wait", action="store_true")
+    module_disable_parser.add_argument("--timeout", type=float, default=30.0)
+    module_disable_parser.add_argument("--yes", action="store_true")
+    _add_runtime_aliases(module_disable_parser)
 
     doctor_parser = subparsers.add_parser("doctor", help="检测本地运行依赖")
     doctor_parser.add_argument(

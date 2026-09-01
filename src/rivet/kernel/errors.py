@@ -27,6 +27,23 @@ class ModuleActivationError(KernelError):
     """表示模块 factory 或显式激活阶段失败。"""
 
 
+class ModuleUnavailableError(ModuleActivationError):
+    """表示模块尚未运行，但本机缺少声明的激活前提。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        availability: str,
+        missing_components: tuple[str, ...],
+        suggested_action: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.availability = availability
+        self.missing_components = missing_components
+        self.suggested_action = suggested_action
+
+
 class ModuleQuarantinedError(ModuleActivationError):
     """表示模块因上次未完成激活而被隔离。"""
 

@@ -38,29 +38,25 @@ class ReaderDoctor:
     def inspect(self) -> ReaderDoctorReport:
         """区分影响基础支持的必需项和按需增强项。"""
         package_components = (
-            ("reader.document.markitdown", "markitdown", True),
-            ("reader.image.pillow", "PIL", True),
-            ("reader.archive.py7zr", "py7zr", True),
-            ("reader.media.ffmpeg", "imageio_ffmpeg", True),
-            ("reader.transcription.whisper", "faster_whisper", False),
+            ("reader.document.markitdown", "markitdown", "documents"),
+            ("reader.image.pillow", "PIL", "image"),
+            ("reader.archive.py7zr", "py7zr", "archive"),
+            ("reader.media.ffmpeg", "imageio_ffmpeg", "media"),
+            ("reader.transcription.whisper", "faster_whisper", "transcription"),
         )
         items: list[ReaderDoctorItem] = []
-        for component_id, package_name, required in package_components:
+        for component_id, package_name, extra in package_components:
             available = importlib.util.find_spec(package_name) is not None
             items.append(
                 ReaderDoctorItem(
                     component_id=component_id,
                     available=available,
-                    required=required,
+                    required=False,
                     source="python-package" if available else None,
                     next_action=(
                         None
                         if available
-                        else (
-                            "安装项目锁定依赖"
-                            if required
-                            else "按需安装 rivet[transcription] 并配置本地模型"
-                        )
+                        else f"运行 uv sync --extra {extra} 安装该可选能力"
                     ),
                 )
             )

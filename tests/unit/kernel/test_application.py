@@ -51,7 +51,7 @@ async def test_kernel_loads_paths_resolves_and_leases(tmp_path: Path) -> None:
 
     await kernel.start()
     assert await kernel.resolve("test.application.resolve")
-    lease = await kernel.acquire_lease("test.application.resolve")
+    lease = await kernel.acquire("test.application.resolve")
     await lease.release()
     await kernel.shutdown()
 

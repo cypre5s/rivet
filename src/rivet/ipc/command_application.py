@@ -111,6 +111,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
     def ready_payload(self) -> dict[str, JsonValue]:
         """返回首屏需要的真实模型状态，凭据只提供布尔值。"""
         payload = super().ready_payload()
+        payload.update(self._evidence_readiness_payload())
         try:
             config = load_config(
                 self._repository,
@@ -155,6 +156,10 @@ class CommandWorkerApplication(BaseWorkerApplication):
             return await self._list_sessions(request, emit=emit)
         if request.method == "transactions.list":
             return await self._list_transactions(request, emit=emit)
+        if request.method == "evidence.get":
+            return await self._get_evidence(request, emit=emit)
+        if request.method == "evidence.log":
+            return await self._get_evidence_log(request, emit=emit)
         if request.method in {"module.list", "module.show", "module.operation"}:
             async with self._command_lock:
                 return await self._handle_module_request(request, emit=emit)
@@ -188,6 +193,9 @@ class CommandWorkerApplication(BaseWorkerApplication):
             fix_write_scope = (
                 self._preview_fix_write_scope(request) if command == "fix" else ()
             )
+            candidate_only = (
+                self._candidate_only(request) if command == "fix" else False
+            )
             arguments = self._arguments(
                 request,
                 command,
@@ -199,6 +207,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 await self._request_fix_permission(
                     command=command,
                     write_scope=fix_write_scope,
+                    candidate_only=candidate_only,
                     emit=emit,
                     cancel_event=cancel_event,
                 )
@@ -320,6 +329,36 @@ class CommandWorkerApplication(BaseWorkerApplication):
         payload["sources"] = cast(JsonValue, config.sources)
         return payload
 
+    def _evidence_readiness_payload(self) -> dict[str, JsonValue]:
+        """只读投影项目验收就绪度，绝不执行检测到的命令。"""
+        from rivet.verify.detector import ProjectDetector, evidence_readiness
+        from rivet.verify.errors import VerificationError
+
+        try:
+            readiness = evidence_readiness(ProjectDetector().detect(self._repository))
+        except VerificationError as error:
+            return {
+                "acceptance_action": "修复 .rivet/project.toml 后刷新 Worker",
+                "acceptance_ready": False,
+                "acceptance_reason": error.summary,
+                "project_kinds": [],
+                "verification_suggestions": [],
+            }
+        return {
+            "acceptance_action": readiness.next_action,
+            "acceptance_ready": readiness.ready,
+            "acceptance_reason": readiness.reason,
+            "project_kinds": [kind.value for kind in readiness.kinds],
+            "verification_suggestions": [
+                {
+                    "argv": list(candidate.argv),
+                    "category": candidate.category,
+                    "kind": candidate.kind.value,
+                }
+                for candidate in readiness.suggestions
+            ],
+        }
+
     async def _update_configuration(
         self,
         request: IpcRequest,
@@ -406,19 +445,19 @@ class CommandWorkerApplication(BaseWorkerApplication):
 
     @staticmethod
     def _module_operation(request: IpcRequest) -> str:
-        """兼容 command.modules 与显式 module.* 方法并拒绝未知操作。"""
+        """兼容 command.modules 与显式 module.* 方法并拒绝未知策略操作。"""
         if request.method == "module.list":
             operation: object = "list"
         elif request.method == "module.show":
             operation = "show"
         else:
             operation = request.params.get("operation", "list")
-        allowed = {"list", "show", "enable", "disable", "wake", "sleep"}
+        allowed = {"list", "show", "enable", "disable"}
         if not isinstance(operation, str) or operation not in allowed:
             raise WorkerMethodError(
                 "module.operation_invalid",
                 "模块操作无效",
-                "使用 list/show/enable/disable/wake/sleep",
+                "使用 list/show/enable/disable；运行态由 Kernel 按需管理",
             )
         return operation
 
@@ -462,7 +501,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
     def _module_options(request: IpcRequest, operation: str) -> _ModuleOptions:
         """严格读取布尔选项与有界等待时间。"""
         allowed_keys = {"module_id", "operation"}
-        if operation in {"enable", "wake"}:
+        if operation == "enable":
             allowed_keys.add("with_dependencies")
         else:
             allowed_keys.update({"cascade", "confirmed", "timeout_seconds", "wait"})
@@ -695,14 +734,33 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 "近期事务目录无法安全读取",
                 "运行 rivet doctor 并检查本地事务状态",
             ) from error
-        transactions: list[JsonValue] = [
-            {
-                "evidence_id": record.evidence_id,
-                "state": record.state.value,
-                "transaction_id": record.transaction_id,
-            }
-            for record in records
-        ]
+        transactions: list[JsonValue] = []
+        try:
+            for record in records:
+                patch = (
+                    store.load_patch(record.transaction_id, record.current_patch_id)[0]
+                    if record.current_patch_id is not None
+                    else None
+                )
+                transactions.append(
+                    {
+                        "apply_eligible": record.state.value == "VERIFIED",
+                        "evidence_id": record.evidence_id,
+                        "patch_id": record.current_patch_id,
+                        "patch_sha256": (
+                            patch.patch_sha256 if patch is not None else None
+                        ),
+                        "state": record.state.value,
+                        "transaction_id": record.transaction_id,
+                        "updated_at": record.updated_at.isoformat(),
+                    }
+                )
+        except TransactionError as error:
+            raise WorkerMethodError(
+                "transaction.list_invalid",
+                "近期事务补丁索引无法通过完整性校验",
+                "保留现场并使用 headless diff/trace 诊断",
+            ) from error
         await emit(
             "transactions.snapshot",
             {
@@ -712,11 +770,87 @@ class CommandWorkerApplication(BaseWorkerApplication):
         )
         return {"transactions": transactions}
 
+    async def _get_evidence(
+        self,
+        request: IpcRequest,
+        *,
+        emit: EmitEvent,
+    ) -> JsonValue:
+        """查询一个历史事务，并只投影完整性复核后的 Evidence。"""
+        transaction_id = self._transaction_id(request)
+        from rivet.transaction.errors import TransactionError
+        from rivet.transaction.store import TransactionStore
+        from rivet.verify.evidence_query import EvidenceQueryService
+
+        try:
+            payload = EvidenceQueryService(
+                TransactionStore(self._repository / ".rivet" / "transactions")
+            ).detail(transaction_id)
+        except TransactionError as error:
+            raise WorkerMethodError(
+                error.code,
+                error.summary,
+                "使用 rivet diff/verify 检查事务与 Evidence 完整性",
+            ) from error
+        await emit("evidence.snapshot", payload)
+        return payload
+
+    async def _get_evidence_log(
+        self,
+        request: IpcRequest,
+        *,
+        emit: EmitEvent,
+    ) -> JsonValue:
+        """仅在显式请求时读取一个经过 manifest 绑定的步骤日志。"""
+        transaction_id = self._transaction_id(request)
+        step_id = request.params.get("step_id")
+        if step_id is not None and (
+            not isinstance(step_id, str) or not step_id or len(step_id) > 256
+        ):
+            raise WorkerMethodError(
+                "evidence.step_id_invalid",
+                "Evidence 步骤 ID 无效",
+                "刷新 Evidence 详情后重试",
+            )
+        from rivet.transaction.errors import TransactionError
+        from rivet.transaction.store import TransactionStore
+        from rivet.verify.evidence_query import EvidenceQueryService
+
+        try:
+            payload = EvidenceQueryService(
+                TransactionStore(self._repository / ".rivet" / "transactions")
+            ).log(transaction_id, step_id=step_id)
+        except TransactionError as error:
+            raise WorkerMethodError(
+                error.code,
+                error.summary,
+                "选择具有 log_path 的 V0–V10 步骤后重试",
+            ) from error
+        await emit("evidence.log", payload)
+        return payload
+
+    @staticmethod
+    def _transaction_id(request: IpcRequest) -> str:
+        """校验 Evidence 查询所需的事务 ID 基本边界。"""
+        transaction_id = request.params.get("transaction_id")
+        if (
+            not isinstance(transaction_id, str)
+            or not transaction_id
+            or len(transaction_id) > 128
+        ):
+            raise WorkerMethodError(
+                "transaction.id_invalid",
+                "事务 ID 无效",
+                "从近期事务列表重新选择",
+            )
+        return transaction_id
+
     async def _request_fix_permission(
         self,
         *,
         command: str,
         write_scope: tuple[str, ...],
+        candidate_only: bool,
         emit: EmitEvent,
         cancel_event: asyncio.Event,
     ) -> None:
@@ -728,7 +862,11 @@ class CommandWorkerApplication(BaseWorkerApplication):
             "permission.requested",
             {
                 "argv": (
-                    "rivet fix --yes"
+                    (
+                        "rivet fix --yes --candidate-only"
+                        if candidate_only
+                        else "rivet fix --yes"
+                    )
                     if command == "fix"
                     else "rivet resume SESSION_ID --yes"
                 ),
@@ -740,7 +878,11 @@ class CommandWorkerApplication(BaseWorkerApplication):
                     else "由冻结 AcceptanceSpec 限定；禁止修改范围外文件"
                 ),
                 "permission": "WRITE+EXECUTE+NETWORK",
-                "reason": "修改隔离副本并运行冻结验证命令",
+                "reason": (
+                    "只修改隔离副本并保存不可 Apply 的候选补丁"
+                    if candidate_only
+                    else "修改隔离副本并运行冻结验证命令"
+                ),
                 "request_id": permission_id,
                 "timeout_seconds": 900,
             },
@@ -864,6 +1006,8 @@ class CommandWorkerApplication(BaseWorkerApplication):
             if command == "fix":
                 for path in fix_write_scope:
                     arguments = (*arguments, "--allow-write", path)
+                if self._candidate_only(request):
+                    arguments = (*arguments, "--candidate-only")
             return arguments
         if command == "read":
             path = request.params.get("file")
@@ -926,16 +1070,22 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 arguments = (*arguments, option, str(value))
             return arguments
         if command == "init":
+            if request.params.get("confirmed") is not True:
+                raise WorkerMethodError(
+                    "init.confirmation_required",
+                    "写入项目验证配置需要显式确认",
+                    "审查只读检测建议后确认初始化",
+                )
             path = request.params.get("file")
             if path is None:
-                return prefix
+                return (*prefix, "--yes")
             if not isinstance(path, str) or not path or len(path) > 4_096:
                 raise WorkerMethodError(
                     "workspace.path_invalid",
                     "仓库路径无效",
                     "从 /files 选择仓库内路径",
                 )
-            return (*prefix, path)
+            return (*prefix, path, "--yes")
         if command == "resume":
             session_id = request.params.get("session_id")
             if not isinstance(session_id, str) or not session_id:
@@ -1015,6 +1165,18 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 error.summary,
                 error.next_action,
             ) from error
+
+    @staticmethod
+    def _candidate_only(request: IpcRequest) -> bool:
+        """只接受 FIX 的显式布尔候选模式，不允许字符串真值。"""
+        value = request.params.get("candidate_only", False)
+        if not isinstance(value, bool):
+            raise WorkerMethodError(
+                "verification.candidate_only_invalid",
+                "candidate-only 参数无效",
+                "只能由 Evidence 预检确认框显式启用",
+            )
+        return value
 
     def _selected_context_paths(self, request: IpcRequest) -> tuple[str, ...]:
         """校验用户显式选择的仓库文件，且不读取文件正文。"""
@@ -1414,6 +1576,7 @@ class CommandWorkerApplication(BaseWorkerApplication):
         answer = payload.get("answer")
         if isinstance(answer, str) and answer:
             model_status = payload.get("model_status", payload.get("status"))
+            run_id = payload.get("run_id")
             if model_status == "ANSWERED":
                 event_type = "agent.answered"
             elif model_status == "PLANNED":
@@ -1422,14 +1585,15 @@ class CommandWorkerApplication(BaseWorkerApplication):
                 event_type = "agent.patch_ready"
             else:
                 event_type = "agent.completed"
+            answer_payload: dict[str, JsonValue] = {
+                "status": model_status if isinstance(model_status, str) else "UNKNOWN",
+                "summary": answer,
+            }
+            if isinstance(run_id, str):
+                answer_payload["response_id"] = f"response_{run_id}"
             await emit(
                 event_type,
-                {
-                    "status": model_status
-                    if isinstance(model_status, str)
-                    else "UNKNOWN",
-                    "summary": answer,
-                },
+                answer_payload,
             )
         session_id = payload.get("session_id")
         if isinstance(session_id, str):
@@ -1455,16 +1619,32 @@ class CommandWorkerApplication(BaseWorkerApplication):
             if command in {"fix", "verify"}
             else None
         )
-        if isinstance(projected_verification_status, str) and command in {
-            "fix",
-            "resume",
-            "verify",
-        }:
+        if (
+            isinstance(projected_verification_status, str)
+            and projected_verification_status != "CANDIDATE_ONLY"
+            and command
+            in {
+                "fix",
+                "resume",
+                "verify",
+            }
+        ):
             await emit(
                 "verification.completed",
                 {
                     "status": projected_verification_status,
                     "summary": "验证已完成",
+                },
+            )
+        if command in {"fix", "resume"} and status == "CANDIDATE_ONLY":
+            await emit(
+                "candidate.ready",
+                {
+                    "patch_id": payload.get("patch_id"),
+                    "patch_sha256": payload.get("patch_sha256"),
+                    "status": "CANDIDATE_ONLY",
+                    "summary": "候选补丁已保存；没有 Evidence，不能 Apply",
+                    "transaction_id": payload.get("transaction_id"),
                 },
             )
         evidence_id = payload.get("evidence_id")

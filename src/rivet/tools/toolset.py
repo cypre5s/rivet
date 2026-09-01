@@ -140,7 +140,10 @@ class ProcessRunArguments(_Arguments):
     """指定无 shell argv、cwd、超时和白名单环境覆盖。"""
 
     argv: list[str] = Field(min_length=1, max_length=1_024)
-    cwd: str = "."
+    cwd: str = Field(
+        default=".",
+        description="工作区相对目录；使用 . 表示根目录，禁止任意绝对路径和 ..",
+    )
     timeout_seconds: float = Field(gt=0, le=3_600)
     environment: dict[str, str] | None = None
 
@@ -191,7 +194,15 @@ def build_workspace_tool_registry(
 
     async def workspace_list(arguments: BaseModel) -> RawToolOutput:
         values = WorkspaceListArguments.model_validate(arguments.model_dump())
-        return _json_output(asdict(inspector.list(**values.model_dump())))
+        return _json_output(
+            asdict(
+                inspector.list(
+                    values.path,
+                    max_depth=values.max_depth,
+                    max_entries=values.max_entries,
+                )
+            )
+        )
 
     async def file_read_text(arguments: BaseModel) -> RawToolOutput:
         values = FileReadTextArguments.model_validate(arguments.model_dump())
@@ -270,9 +281,10 @@ def build_workspace_tool_registry(
 
     async def process_run(arguments: BaseModel) -> RawToolOutput:
         values = ProcessRunArguments.model_validate(arguments.model_dump())
+        cwd = "." if values.cwd == str(boundary.effective_root) else values.cwd
         result = await process_runner.run(
             tuple(values.argv),
-            cwd=values.cwd,
+            cwd=cwd,
             timeout_seconds=values.timeout_seconds,
             environment=values.environment,
         )

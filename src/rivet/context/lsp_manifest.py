@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import sys
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -65,6 +66,10 @@ class LspServerManifest:
                 located = shutil.which(candidate)
                 if located is not None:
                     resolved = Path(located)
+                else:
+                    sibling = Path(sys.executable).parent / candidate
+                    if sibling.is_file():
+                        resolved = sibling
             if (
                 resolved is not None
                 and resolved.is_file()

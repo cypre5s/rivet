@@ -187,11 +187,12 @@ async def test_lease_blocks_sleep_and_resolve_rebuilds_after_sleep(
         journal=ActivationJournal(tmp_path / "journal.json"),
     )
     first_instance = await runtime.resolve("test.sleep.resolve")
-    lease = await runtime.acquire_lease("test.sleep.resolve")
+    lease = await runtime.acquire("test.sleep.resolve")
 
     assert not await runtime.sleep_module("test.sleep")
     await lease.release()
     assert await runtime.sleep_module("test.sleep")
+    assert runtime.state("test.sleep") is ModuleState.INACTIVE
 
     second_instance = await runtime.resolve("test.sleep.resolve")
     assert second_instance is not first_instance
@@ -218,11 +219,11 @@ async def test_zero_idle_timeout_sleeps_and_next_resolve_rebuilds(
 
     first_instance = await runtime.resolve("test.idle.resolve")
     for _ in range(10):
-        if runtime.state("test.idle") is ModuleState.SLEEPING:
+        if runtime.state("test.idle") is ModuleState.INACTIVE:
             break
         await asyncio.sleep(0)
 
-    assert runtime.state("test.idle") is ModuleState.SLEEPING
+    assert runtime.state("test.idle") is ModuleState.INACTIVE
     second_instance = await runtime.resolve("test.idle.resolve")
     assert second_instance is not first_instance
     assert observations.factory_calls["recording"] == 2

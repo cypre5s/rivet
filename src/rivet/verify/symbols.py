@@ -36,7 +36,7 @@ def _symbols(path: str, content: str | None) -> dict[tuple[str, str], str]:
         return {}
     try:
         document = extract_syntax_document(path, content)
-    except (ContextSyntaxError, UnicodeError):
+    except (ContextSyntaxError, ImportError, UnicodeError):
         return {}
     lines = content.splitlines(keepends=True)
     return {

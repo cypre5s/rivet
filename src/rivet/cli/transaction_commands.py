@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from argparse import Namespace
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 from rivet.cli.errors import (
     CliConfigurationError,
@@ -13,14 +13,19 @@ from rivet.cli.errors import (
     CliVerificationError,
 )
 from rivet.cli.exit_codes import ExitCode
-from rivet.cli.runtime import create_cli_kernel, module_scope, shutdown_cli_kernel
+from rivet.cli.runtime import create_cli_kernel, shutdown_cli_kernel
 from rivet.contracts.transactions import TransactionRecord, TransactionState
 from rivet.kernel.errors import KernelError, SafeModeViolationError
-from rivet.kernel.module_runtime import ModuleLease
+from rivet.kernel.module_runtime import CapabilityLease
+from rivet.modules.capabilities import VerificationCapability
 from rivet.trace.paths import RuntimePaths
 from rivet.transaction.errors import TransactionError
 from rivet.transaction.store import TransactionStore
 from rivet.verify.errors import VerificationError
+from rivet.verify.evidence_query import EvidenceQueryService
+
+if TYPE_CHECKING:
+    from rivet.verify.detector import ProjectDetection
 
 
 async def run_transaction_command(
@@ -31,26 +36,43 @@ async def run_transaction_command(
     safe_mode: bool = False,
 ) -> int:
     """执行一个事务命令并保证临时资源按状态清理或移交。"""
+    command = cast(str, arguments.command)
+    detection = None
+    if command == "verify":
+        from rivet.verify.detector import ProjectDetector, evidence_readiness
+
+        try:
+            detection = ProjectDetector().detect(repository)
+        except VerificationError as error:
+            raise CliVerificationError(
+                error.code,
+                error.summary,
+                "修复 .rivet/project.toml 后重试 Verify",
+            ) from error
+        readiness = evidence_readiness(detection)
+        if not readiness.ready:
+            raise CliVerificationError(
+                "verification.acceptance_not_ready",
+                f"独立 Verify 尚未就绪：{readiness.reason}",
+                readiness.next_action,
+            )
     kernel = create_cli_kernel(repository, safe_mode=safe_mode)
-    leases: list[ModuleLease] = []
+    leases: list[CapabilityLease[object]] = []
     manager = None
     suspended = False
     registered_transaction_id: str | None = None
     try:
         await kernel.start()
-        transaction_lease = await kernel.acquire_lease("transaction.worktree")
+        transaction_lease = await kernel.acquire("transaction.worktree")
         leases.append(transaction_lease)
-        scope = module_scope(transaction_lease.instance)
         from rivet.transaction.manager import TransactionManager
 
-        manager = TransactionManager(repository, scope=scope)
-        await manager.inspect_repository()
+        manager = cast(TransactionManager, transaction_lease.capability)
         store = _store(repository)
         transaction_id = _resolve_transaction_id(
             store,
             cast(str | None, getattr(arguments, "transaction_id", None)),
         )
-        command = cast(str, arguments.command)
         if command == "diff":
             record, content = _load_patch(store, transaction_id)
             if json_output:
@@ -65,15 +87,18 @@ async def run_transaction_command(
                 print(content.decode("utf-8", errors="replace"), end="")
             return int(ExitCode.SUCCESS)
         if command == "verify":
-            verify_lease = await kernel.acquire_lease("verify.deterministic")
+            verify_lease = await kernel.acquire("verify.deterministic")
             leases.append(verify_lease)
-            from rivet.verify.detector import ProjectDetector
-            from rivet.verify.service import VerificationService
-
             record = store.load_record(transaction_id)
             if record.state is TransactionState.VERIFIED:
                 _verify_record_evidence(store, record)
-                _print_record(record, json_output=json_output)
+                _print_mapping(
+                    cast(
+                        dict[str, object],
+                        EvidenceQueryService(store).detail(transaction_id),
+                    ),
+                    json_output=json_output,
+                )
                 return int(ExitCode.SUCCESS)
             if record.state in {
                 TransactionState.REJECTED,
@@ -82,7 +107,13 @@ async def run_transaction_command(
                 TransactionState.CANCELLED,
             }:
                 _verify_record_evidence(store, record)
-                _print_record(record, json_output=json_output)
+                _print_mapping(
+                    cast(
+                        dict[str, object],
+                        EvidenceQueryService(store).detail(transaction_id),
+                    ),
+                    json_output=json_output,
+                )
                 return int(ExitCode.VERIFICATION_FAILED)
             if record.state not in {
                 TransactionState.PATCHING,
@@ -96,23 +127,21 @@ async def run_transaction_command(
             await manager.recover(transaction_id)
             registered_transaction_id = transaction_id
             if record.state is TransactionState.PATCHING:
+                await manager.adopt_project_verification_configuration(transaction_id)
                 await manager.begin_verification(transaction_id)
-            detection = ProjectDetector().detect(repository)
-            outcome = await VerificationService(
-                manager,
-                scope=module_scope(verify_lease.instance),
+            detection = cast("ProjectDetection", detection)
+            verifier = cast(VerificationCapability, verify_lease.capability)
+            outcome = await verifier.verify(
+                transaction_id,
                 project_configuration=detection.configuration,
                 configuration_confirmed=detection.configuration is not None,
-            ).verify(transaction_id)
+            )
             manager.suspend(transaction_id)
             suspended = True
-            payload: dict[str, object] = {
-                "evidence_id": outcome.verdict.evidence_id,
-                "manifest_sha256": outcome.manifest_sha256,
-                "passed": outcome.verdict.passed,
-                "status": outcome.verdict.status.value,
-                "transaction_id": transaction_id,
-            }
+            payload = cast(
+                dict[str, object],
+                EvidenceQueryService(store).detail(transaction_id),
+            )
             _print_mapping(payload, json_output=json_output)
             return (
                 int(ExitCode.SUCCESS)

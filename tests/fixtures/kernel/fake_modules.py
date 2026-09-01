@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from rivet.kernel.module_api import ModuleActivationContext
     from rivet.kernel.resources import ResourceScope
 
 factory_calls: Counter[str] = Counter()
@@ -23,13 +24,18 @@ class RecordingModule:
         self.fail_activation = fail_activation
         self.activation_count = 0
 
-    async def activate(self, scope: ResourceScope) -> None:
+    async def activate(
+        self,
+        context: ModuleActivationContext,
+        scope: ResourceScope,
+    ) -> dict[str, object]:
         """记录显式激活并按配置制造可控失败。"""
         del scope
         self.activation_count += 1
         lifecycle_events.append(f"activate:{self.name}")
         if self.fail_activation:
             raise RuntimeError("可控激活失败")
+        return {capability_id: self for capability_id in context.declared_capabilities}
 
     async def sleep(self) -> None:
         """记录模块进入休眠。"""
@@ -48,9 +54,13 @@ class ResourceModule(RecordingModule):
         self.temporary_directory: Path | None = None
         self.process: asyncio.subprocess.Process | None = None
 
-    async def activate(self, scope: ResourceScope) -> None:
+    async def activate(
+        self,
+        context: ModuleActivationContext,
+        scope: ResourceScope,
+    ) -> dict[str, object]:
         """创建由所属 ResourceScope 统一回收的真实资源。"""
-        await super().activate(scope)
+        capabilities = await super().activate(context, scope)
         scope.create_task(asyncio.sleep(3_600), description="测试后台任务")
         self.process = await scope.create_process(
             sys.executable,
@@ -61,6 +71,7 @@ class ResourceModule(RecordingModule):
         self.temporary_directory = scope.create_temp_directory(
             description="测试临时目录"
         )
+        return capabilities
 
 
 def reset_observations() -> None:

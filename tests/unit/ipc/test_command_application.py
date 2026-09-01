@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import cast
 
 import pytest
 from pydantic import JsonValue
@@ -81,6 +82,7 @@ async def test_ask_routes_to_json_cli_and_emits_result(tmp_path: Path) -> None:
         payload for event_type, payload in events if event_type == "agent.answered"
     )
     assert answered["status"] == "ANSWERED"
+    assert answered["response_id"] == "response_run_one"
     assert any(event_type == "budget.updated" for event_type, _ in events)
 
 
@@ -174,6 +176,9 @@ def test_ready_payload_exposes_only_model_and_credential_presence(
     assert payload["base_url"] == "https://api.deepseek.com"
     assert payload["max_rounds"] == 24
     assert payload["max_total_tokens"] == 128_000
+    assert payload["acceptance_ready"] is False
+    assert payload["project_kinds"] == ["generic"]
+    assert "verification.acceptance" in cast(str, payload["acceptance_action"])
     assert isinstance(payload["sources"], dict)
     assert "configured-placeholder" not in serialized
     assert "api_key" not in serialized.casefold()
@@ -557,20 +562,15 @@ async def test_recent_transactions_are_loaded_only_on_explicit_request(
     )
 
     assert isinstance(result, dict)
-    assert result == {
-        "transactions": [
-            {
-                "evidence_id": None,
-                "state": "BASELINED",
-                "transaction_id": "tx_history_second",
-            },
-            {
-                "evidence_id": None,
-                "state": "BASELINED",
-                "transaction_id": "tx_history_first",
-            },
-        ]
-    }
+    transactions = cast(list[dict[str, JsonValue]], result["transactions"])
+    assert [item["transaction_id"] for item in transactions] == [
+        "tx_history_second",
+        "tx_history_first",
+    ]
+    assert all(item["state"] == "BASELINED" for item in transactions)
+    assert all(item["evidence_id"] is None for item in transactions)
+    assert all(item["apply_eligible"] is False for item in transactions)
+    assert all(item["patch_sha256"] is None for item in transactions)
     assert events == [
         (
             "transactions.snapshot",
@@ -680,7 +680,7 @@ async def test_resume_read_only_session_does_not_claim_verification(
     ("method", "params", "expected_tail"),
     [
         ("command.read", {"file": "README.md"}, ("read", "README.md")),
-        ("command.init", {}, ("init",)),
+        ("command.init", {"confirmed": True}, ("init", "--yes")),
         ("command.resume", {"session_id": "session_one"}, ("resume", "session_one")),
         ("command.trace", {"run_id": "run_one"}, ("trace", "run_one")),
         ("command.doctor", {}, ("doctor",)),
@@ -863,11 +863,20 @@ async def test_module_commands_use_long_lived_kernel_instead_of_subprocess(
         emit=emit,
         cancel_event=asyncio.Event(),
     )
-    woke = await application.handle(
+    disabled = await application.handle(
         _request(
-            "request_modules_wake",
+            "request_modules_disable",
             "module.operation",
-            {"module_id": "context.syntax", "operation": "wake"},
+            {"module_id": "context.lsp", "operation": "disable"},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+    enabled = await application.handle(
+        _request(
+            "request_modules_enable",
+            "module.operation",
+            {"module_id": "context.lsp", "operation": "enable"},
         ),
         emit=emit,
         cancel_event=asyncio.Event(),
@@ -884,8 +893,10 @@ async def test_module_commands_use_long_lived_kernel_instead_of_subprocess(
         )
 
     assert isinstance(listed, dict)
-    assert isinstance(woke, dict)
-    assert woke["current_state"] == "ACTIVE"
+    assert isinstance(disabled, dict)
+    assert isinstance(enabled, dict)
+    assert disabled["effective_enabled"] is False
+    assert enabled["current_state"] == "INACTIVE"
     assert blocked.value.code == "module.active_dependents"
     assert blocked.value.trace_event_id is not None
     assert arguments == []
@@ -909,7 +920,7 @@ async def test_module_commands_use_long_lived_kernel_instead_of_subprocess(
     )
     assert "module.operation.requested" in persisted_trace
     assert "module.operation.completed" in persisted_trace
-    assert "request_modules_wake" in persisted_trace
+    assert "request_modules_enable" in persisted_trace
 
 
 @pytest.mark.asyncio
@@ -923,17 +934,27 @@ async def test_module_commands_use_long_lived_kernel_instead_of_subprocess(
         ),
         (
             "module.operation",
-            {"operation": "wake", "module_id": "../escape"},
+            {"operation": "enable", "module_id": "../escape"},
             "module.id_invalid",
         ),
         (
             "module.operation",
             {
-                "operation": "sleep",
+                "operation": "disable",
                 "module_id": "context.syntax",
                 "timeout_seconds": -1,
             },
             "module.timeout_invalid",
+        ),
+        (
+            "module.operation",
+            {"operation": "wake", "module_id": "context.syntax"},
+            "module.operation_invalid",
+        ),
+        (
+            "module.operation",
+            {"operation": "sleep", "module_id": "context.syntax"},
+            "module.operation_invalid",
         ),
         (
             "module.operation",
@@ -1095,6 +1116,77 @@ async def test_fix_waits_for_explicit_permission_then_adds_yes(
     assert event_types.index("agent.patch_ready") < event_types.index(
         "verification.completed"
     )
+
+
+@pytest.mark.asyncio
+async def test_candidate_only_permission_is_explicit_and_skips_verification_event(
+    tmp_path: Path,
+) -> None:
+    arguments: list[tuple[str, ...]] = []
+    events: list[tuple[str, dict[str, JsonValue]]] = []
+    permission_ready = asyncio.Event()
+
+    async def runner(
+        argv: tuple[str, ...],
+        _emit: EmitEvent,
+    ) -> CommandExecution:
+        arguments.append(argv)
+        return CommandExecution(
+            0,
+            json.dumps(
+                {
+                    "answer": "候选已生成",
+                    "candidate_only": True,
+                    "evidence_id": None,
+                    "model_status": "READY_FOR_VERIFICATION",
+                    "patch_id": "patch_candidate",
+                    "patch_sha256": "p" * 64,
+                    "status": "CANDIDATE_ONLY",
+                    "transaction_id": "tx_candidate",
+                }
+            ).encode(),
+            b"",
+        )
+
+    async def emit(event_type: str, payload: dict[str, JsonValue]) -> None:
+        events.append((event_type, payload))
+        if event_type == "permission.requested":
+            permission_ready.set()
+
+    application = CommandWorkerApplication(tmp_path, runner=runner)
+    task = asyncio.create_task(
+        application.handle(
+            _request(
+                "request_candidate",
+                "command.fix",
+                {"candidate_only": True, "query": "修复 tracked.txt"},
+            ),
+            emit=emit,
+            cancel_event=asyncio.Event(),
+        )
+    )
+    await permission_ready.wait()
+    permission = next(
+        payload
+        for event_type, payload in events
+        if event_type == "permission.requested"
+    )
+    assert "--candidate-only" in cast(str, permission["argv"])
+    permission_id = cast(str, permission["request_id"])
+    await application.handle(
+        _request(
+            "request_resolve_candidate",
+            "permission.resolve",
+            {"approved": True, "request_id": permission_id},
+        ),
+        emit=emit,
+        cancel_event=asyncio.Event(),
+    )
+    await task
+
+    assert arguments[0][-2:] == ("--candidate-only", "--yes")
+    assert any(event_type == "candidate.ready" for event_type, _ in events)
+    assert not any(event_type == "verification.completed" for event_type, _ in events)
 
 
 @pytest.mark.asyncio
@@ -1378,23 +1470,24 @@ async def test_subprocess_trace_is_emitted_before_command_completion(
             return await self._run_subprocess(argv, emit)
 
     event_seen = asyncio.Event()
-    events: list[str] = []
+    events: list[tuple[str, dict[str, JsonValue]]] = []
 
     async def emit(
         event_type: str,
-        _payload: dict[str, JsonValue],
+        payload: dict[str, JsonValue],
     ) -> None:
         """记录命令仍在运行时到达的投影事件。"""
-        events.append(event_type)
+        events.append((event_type, payload))
         event_seen.set()
 
     script = (
         "import json,os,time; from pathlib import Path; "
         "p=Path('.rivet/trace/events.ndjson'); p.parent.mkdir(parents=True); "
         "e={'schema_version':1,'sequence':1,'event':"
-        "{'event_type':'context.selected','run_id':'run_stream_test',"
-        "'payload':{'path':'a.py','stream_id':os.environ['RIVET_STREAM_ID']},"
-        "'result_summary':'已选择上下文'}}; "
+        "{'event_type':'agent.output.delta','run_id':'run_stream_test',"
+        "'payload':{'content':'正在生成','response_id':'response_run_stream_test',"
+        "'stream_id':os.environ['RIVET_STREAM_ID']},"
+        "'result_summary':'模型回复正在生成'}}; "
         "p.write_text(json.dumps(e)+'\\n',encoding='utf-8'); "
         "time.sleep(0.3); print('{}')"
     )
@@ -1411,4 +1504,13 @@ async def test_subprocess_trace_is_emitted_before_command_completion(
     execution = await running
 
     assert execution.return_code == 0
-    assert events == ["context.selected"]
+    assert events == [
+        (
+            "agent.output.delta",
+            {
+                "content": "正在生成",
+                "response_id": "response_run_stream_test",
+                "summary": "模型回复正在生成",
+            },
+        )
+    ]

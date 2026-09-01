@@ -29,7 +29,7 @@ from rivet.cli.errors import (
     CliVerificationError,
 )
 from rivet.cli.exit_codes import ExitCode
-from rivet.cli.runtime import create_cli_kernel, module_scope, shutdown_cli_kernel
+from rivet.cli.runtime import create_cli_kernel, shutdown_cli_kernel
 from rivet.contracts.guard import (
     AuthorizationDecision,
     AuthorizationStatus,
@@ -58,8 +58,12 @@ from rivet.kernel.agent_models import (
     AgentTaskMode,
     AgentTerminationReason,
 )
-from rivet.kernel.errors import KernelError, SafeModeViolationError
-from rivet.kernel.module_runtime import ModuleLease
+from rivet.kernel.errors import KernelError, ModuleShutdownError, SafeModeViolationError
+from rivet.kernel.module_runtime import CapabilityLease
+from rivet.modules.capabilities import (
+    VerificationCapability,
+    WorkspaceToolCapability,
+)
 from rivet.storage.git_exclude import configure_runtime_excludes
 from rivet.storage.sessions import (
     PendingToolCall,
@@ -76,7 +80,7 @@ from rivet.tools.registry import (
 )
 from rivet.trace.builder import TraceEventBuilder
 from rivet.trace.paths import RuntimePaths
-from rivet.trace.redaction import SecretRedactor
+from rivet.trace.redaction import SecretRedactor, StreamingSecretRedactor
 from rivet.trace.store import TraceStore
 from rivet.transaction.errors import TransactionError
 from rivet.verify.errors import VerificationError
@@ -84,7 +88,6 @@ from rivet.verify.errors import VerificationError
 if TYPE_CHECKING:
     from rivet.guard.permissions import GuardPolicy
     from rivet.kernel.model_provider import ModelProvider
-    from rivet.kernel.resources import ResourceScope
     from rivet.transaction.manager import TransactionManager
     from rivet.verify.detector import ProjectDetection
 
@@ -106,6 +109,15 @@ class TaskAcceptanceScope:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CapabilityLeaseRecord:
+    """把业务 Lease 与可审计的 capability/module 标识绑定。"""
+
+    capability_id: str
+    module_id: str
+    lease: CapabilityLease[object]
+
+
 async def run_model_command(
     arguments: Namespace,
     *,
@@ -114,6 +126,7 @@ async def run_model_command(
     environment: Mapping[str, str],
     json_output: bool,
     resume_checkpoint: SessionCheckpoint | None = None,
+    preflight_detection: ProjectDetection | None = None,
 ) -> int:
     """运行 ask、plan 或 fix，并在所有出口关闭客户端与 Trace。"""
     resuming = resume_checkpoint is not None
@@ -133,12 +146,40 @@ async def run_model_command(
             "任务文本为空或超过长度上限",
             "提供不超过 65536 字符的明确任务",
         )
-    if command == "fix" and not cast(bool, getattr(arguments, "yes", False)):
+    if (
+        command == "fix"
+        and resume_checkpoint is None
+        and not cast(bool, getattr(arguments, "yes", False))
+    ):
         raise CliSecurityError(
             "guard.fix_confirmation_required",
             "headless fix 需要显式 --yes 批准事务写入与验证命令",
             "审查任务范围后追加 --yes；主工作区仍需单独 apply",
         )
+    candidate_only = (
+        resume_checkpoint.candidate_only
+        if resume_checkpoint is not None
+        else cast(bool, getattr(arguments, "candidate_only", False))
+    )
+    if command == "fix":
+        from rivet.verify.detector import ProjectDetector, evidence_readiness
+
+        if preflight_detection is None:
+            try:
+                preflight_detection = ProjectDetector().detect(repository)
+            except VerificationError as error:
+                raise CliVerificationError(
+                    error.code,
+                    error.summary,
+                    "修复 .rivet/project.toml 后重新运行 FIX",
+                ) from error
+        readiness = evidence_readiness(preflight_detection)
+        if not readiness.ready and not candidate_only:
+            raise CliVerificationError(
+                "verification.acceptance_not_ready",
+                f"FIX 尚无独立验收门禁：{readiness.reason}",
+                f"{readiness.next_action}；或显式使用 --candidate-only 只生成不可 Apply 的候选",
+            )
     run_id = (
         resume_checkpoint.run_id
         if resume_checkpoint is not None
@@ -172,16 +213,23 @@ async def run_model_command(
             command=command,
             query=safe_query,
             status=SessionStatus.RUNNING,
+            candidate_only=candidate_only,
             model=config.model,
         )
     )
     session_store.save(checkpoint)
-    kernel = create_cli_kernel(repository, safe_mode=config.safe_mode)
-    leases: list[ModuleLease] = []
+    kernel = create_cli_kernel(
+        repository,
+        safe_mode=config.safe_mode,
+        provider_base_url=config.base_url,
+        credential_accessor=lambda name: (
+            environment.get(name) if name == "DEEPSEEK_API_KEY" else None
+        ),
+    )
+    lease_records: list[_CapabilityLeaseRecord] = []
     trace = TraceStore(RuntimePaths.for_repository(repository), redactor=redactor)
     builder = TraceEventBuilder(redactor=redactor)
     manager: TransactionManager | None = None
-    transaction_lease: ModuleLease | None = None
     transaction_id: str | None = None
     allowed_write_paths: tuple[str, ...] = ()
     trace_started = False
@@ -219,13 +267,57 @@ async def run_model_command(
                 )
             )
 
-        async def acquire_capability(capability_id: str) -> ModuleLease:
-            """租用正式能力，并只为真实生命周期变化写 Trace。"""
+        async def acquire_capability(
+            capability_id: str,
+        ) -> CapabilityLease[object]:
+            """租用正式能力，并记录请求、真实激活或激活失败。"""
             module_id = kernel.runtime.provider_module_id(capability_id)
             prior_state = kernel.runtime.state(module_id).value
-            lease = await kernel.acquire_lease(capability_id)
-            leases.append(lease)
+            await trace.emit(
+                builder.build(
+                    event_type="module.requested",
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    result_summary=f"任务请求按需能力：{module_id}",
+                    payload={
+                        "capability_id": capability_id,
+                        "module_id": module_id,
+                        "prior_state": prior_state,
+                    },
+                )
+            )
+            try:
+                lease = await kernel.acquire(capability_id)
+            except BaseException as error:
+                await trace.emit(
+                    builder.build(
+                        event_type="module.activation_failed",
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                        result_summary=f"按需能力激活失败：{module_id}",
+                        payload={
+                            "capability_id": capability_id,
+                            "error_type": type(error).__name__,
+                            "module_id": module_id,
+                        },
+                    )
+                )
+                raise
+            lease_records.append(
+                _CapabilityLeaseRecord(
+                    capability_id=capability_id,
+                    module_id=module_id,
+                    lease=lease,
+                )
+            )
             if prior_state not in {"ACTIVE", "IDLE"}:
+                snapshot = next(
+                    item
+                    for item in kernel.runtime.snapshots()
+                    if item.module_id == module_id
+                )
                 await trace.emit(
                     builder.build(
                         event_type="module.activated",
@@ -233,26 +325,88 @@ async def run_model_command(
                         session_id=session_id,
                         transaction_id=transaction_id,
                         result_summary=f"按需模块已激活：{module_id}",
-                        payload={"module_id": module_id, "state": "ACTIVE"},
+                        payload={
+                            "capability_id": capability_id,
+                            "lease_count": snapshot.lease_count,
+                            "module_id": module_id,
+                            "resource_count": snapshot.resource_counts.resource_count,
+                            "state": snapshot.state.value,
+                        },
                     )
                 )
             return lease
+
+        async def release_capability(
+            lease: CapabilityLease[object],
+            *,
+            reason: str,
+            close_instance: bool = False,
+        ) -> None:
+            """归还一个任务 Lease，并可在阶段边界立即关闭真实实例。"""
+            record = next(item for item in lease_records if item.lease is lease)
+            try:
+                await lease.release()
+                lease_records.remove(record)
+                if close_instance:
+                    slept = await kernel.runtime.sleep_module(record.module_id)
+                    state = kernel.runtime.state(record.module_id).value
+                    if not slept and state in {"ACTIVE", "IDLE"}:
+                        raise ModuleShutdownError(
+                            f"阶段结束后无法关闭模块 {record.module_id}"
+                        )
+            except BaseException as error:
+                await trace.emit(
+                    builder.build(
+                        event_type="module.release_failed",
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                        result_summary=f"按需能力释放失败：{record.module_id}",
+                        payload={
+                            "capability_id": record.capability_id,
+                            "error_type": type(error).__name__,
+                            "module_id": record.module_id,
+                            "reason": reason,
+                        },
+                    )
+                )
+                raise
+            snapshot = next(
+                item
+                for item in kernel.runtime.snapshots()
+                if item.module_id == record.module_id
+            )
+            await trace.emit(
+                builder.build(
+                    event_type="module.released",
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    result_summary=f"任务已释放按需能力：{record.module_id}",
+                    payload={
+                        "capability_id": record.capability_id,
+                        "lease_count": snapshot.lease_count,
+                        "module_id": record.module_id,
+                        "reason": reason,
+                        "resource_count": snapshot.resource_counts.resource_count,
+                        "state": snapshot.state.value,
+                    },
+                )
+            )
 
         from rivet.tools.paths import WorkspaceBoundary
 
         boundary = WorkspaceBoundary(repository)
         detection: ProjectDetection | None = None
         if command == "fix":
-            from rivet.transaction.manager import TransactionManager
             from rivet.transaction.models import DirtyPolicy
-            from rivet.verify.detector import ProjectDetector
 
             transaction_lease = await acquire_capability("transaction.worktree")
-            manager = TransactionManager(
-                repository,
-                scope=module_scope(transaction_lease.instance),
+            manager = cast(
+                "TransactionManager",
+                transaction_lease.capability,
             )
-            detection = ProjectDetector().detect(repository)
+            detection = cast("ProjectDetection", preflight_detection)
             if resume_checkpoint is not None:
                 transaction_id = resume_checkpoint.transaction_id
                 if transaction_id is None:
@@ -354,7 +508,6 @@ async def run_model_command(
             provider_lease = await acquire_capability("provider.chat.completions")
             guard_lease = await acquire_capability("guard.local_execution")
             from rivet.guard.permissions import GuardPolicy
-            from rivet.tools.toolset import build_workspace_tool_registry
 
             policy = GuardPolicy(headless=True)
             authorizer = _authorizer(
@@ -362,9 +515,12 @@ async def run_model_command(
                 approved=command == "fix",
                 allowed_paths=allowed_write_paths,
             )
-            registry = build_workspace_tool_registry(
+            guard_capability = cast(
+                WorkspaceToolCapability,
+                guard_lease.capability,
+            )
+            registry = guard_capability.create_registry(
                 boundary,
-                scope=module_scope(guard_lease.instance),
                 authorizer=authorizer,
                 read_only=command != "fix",
             )
@@ -424,11 +580,7 @@ async def run_model_command(
                 ),
                 checkpoint=persist_tool_checkpoint,
             )
-            provider = _create_provider(
-                base_url=config.base_url,
-                scope=module_scope(provider_lease.instance),
-                environment=environment,
-            )
+            provider = cast("ModelProvider", provider_lease.capability)
             now = datetime.now(UTC)
             task_messages = (
                 resume_checkpoint.messages
@@ -516,6 +668,28 @@ async def run_model_command(
                 transaction_id=transaction_id,
                 safe_mode=config.safe_mode,
             )
+            response_id = f"response_{run_id}"
+            streaming_answer = StreamingSecretRedactor(redactor)
+
+            async def publish_text_delta(delta: str) -> None:
+                """持久化已脱敏累计快照，供 Worker 实时投影到 TUI。"""
+                snapshot = streaming_answer.feed(delta)
+                if snapshot is None:
+                    return
+                await trace.emit(
+                    builder.build(
+                        event_type="agent.output.delta",
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                        result_summary="模型回复正在生成",
+                        payload={
+                            "content": snapshot,
+                            "response_id": response_id,
+                        },
+                    )
+                )
+
             result = await AgentLoop(
                 provider,
                 tools=(*registry.agent_tools(context=context), *capability_tools),
@@ -536,7 +710,33 @@ async def run_model_command(
                     safe_mode=config.safe_mode,
                 ),
                 progress_callback=persist_agent_progress,
+                text_delta_callback=publish_text_delta,
             ).run(task)
+            final_snapshot = streaming_answer.finalize()
+            if final_snapshot is not None:
+                await trace.emit(
+                    builder.build(
+                        event_type="agent.output.delta",
+                        run_id=run_id,
+                        session_id=session_id,
+                        transaction_id=transaction_id,
+                        result_summary="模型回复正在生成",
+                        payload={
+                            "content": final_snapshot,
+                            "response_id": response_id,
+                        },
+                    )
+                )
+            await release_capability(
+                guard_lease,
+                reason="model_stage_complete",
+                close_instance=True,
+            )
+            await release_capability(
+                provider_lease,
+                reason="model_stage_complete",
+                close_instance=True,
+            )
         checkpoint = _checkpoint_from_result(
             checkpoint,
             result,
@@ -565,10 +765,9 @@ async def run_model_command(
                 resumed=resuming,
             )
             return int(ExitCode.SUCCESS)
-        if manager is None or transaction_id is None or detection is None:
-            raise RuntimeError("fix 事务不变量被破坏")
-        if transaction_lease is None:
-            raise RuntimeError("fix 事务模块不变量被破坏")
+        manager = cast("TransactionManager", manager)
+        transaction_id = cast(str, transaction_id)
+        detection = cast("ProjectDetection", detection)
         patch = await manager.record_patch_set(transaction_id)
         await trace.emit(
             builder.build(
@@ -590,10 +789,54 @@ async def run_model_command(
                 run_id=run_id,
                 session_id=session_id,
                 transaction_id=transaction_id,
-                result_summary="隔离补丁已生成，等待独立验证",
-                payload={"status": result.completion_status.value},
+                result_summary=(
+                    "隔离候选补丁已生成；未运行独立验证"
+                    if candidate_only
+                    else "隔离补丁已生成，等待独立验证"
+                ),
+                payload={
+                    "candidate_only": candidate_only,
+                    "status": result.completion_status.value,
+                },
             )
         )
+        if candidate_only:
+            checkpoint = checkpoint.model_copy(
+                update={
+                    "stage": SessionStage.TERMINAL,
+                    "status": SessionStatus.READY_FOR_VERIFICATION,
+                }
+            )
+            session_store.save(checkpoint)
+            await trace.emit(
+                builder.build(
+                    event_type="candidate.ready",
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    result_summary="候选补丁已保存，但没有独立 Evidence，不能 Apply",
+                    payload={
+                        "changed_files": list(patch.changed_files),
+                        "patch_id": patch.patch_id,
+                        "patch_sha256": patch.patch_sha256,
+                        "status": "CANDIDATE_ONLY",
+                    },
+                )
+            )
+            await _emit_result(trace, builder, result, checkpoint, failed=False)
+            _print_candidate_result(
+                result,
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+                patch_id=patch.patch_id,
+                acceptance_sha256=patch.acceptance_sha256,
+                patch_sha256=patch.patch_sha256,
+                changed_files=patch.changed_files,
+                changed_symbols=patch.changed_symbols,
+                json_output=json_output,
+            )
+            return int(ExitCode.SUCCESS)
         checkpoint = checkpoint.model_copy(
             update={
                 "stage": SessionStage.VERIFICATION,
@@ -613,14 +856,12 @@ async def run_model_command(
             )
         )
         verify_lease = await acquire_capability("verify.deterministic")
-        from rivet.verify.service import VerificationService
-
-        outcome = await VerificationService(
-            manager,
-            scope=module_scope(verify_lease.instance),
+        verifier = cast(VerificationCapability, verify_lease.capability)
+        outcome = await verifier.verify(
+            transaction_id,
             project_configuration=detection.configuration,
             configuration_confirmed=detection.configuration is not None,
-        ).verify(transaction_id)
+        )
         await trace.emit(
             builder.build(
                 event_type="verification.completed",
@@ -655,6 +896,8 @@ async def run_model_command(
         )
         _print_fix_result(
             result,
+            run_id=run_id,
+            session_id=session_id,
             transaction_id=transaction_id,
             patch_id=patch.patch_id,
             evidence_id=outcome.verdict.evidence_id,
@@ -703,7 +946,61 @@ async def run_model_command(
                 _suspend_if_active(manager, transaction_id)
         finally:
             try:
-                await shutdown_cli_kernel(kernel, leases)
+                remaining_records = tuple(lease_records)
+                try:
+                    await shutdown_cli_kernel(
+                        kernel,
+                        tuple(record.lease for record in remaining_records),
+                    )
+                except BaseException as error:
+                    if trace_started:
+                        for record in remaining_records:
+                            await trace.emit(
+                                builder.build(
+                                    event_type="module.release_failed",
+                                    run_id=run_id,
+                                    session_id=session_id,
+                                    transaction_id=transaction_id,
+                                    result_summary=(
+                                        f"任务退出时能力释放失败：{record.module_id}"
+                                    ),
+                                    payload={
+                                        "capability_id": record.capability_id,
+                                        "error_type": type(error).__name__,
+                                        "module_id": record.module_id,
+                                        "reason": "task_shutdown",
+                                    },
+                                )
+                            )
+                    raise
+                if trace_started:
+                    snapshots = {
+                        snapshot.module_id: snapshot
+                        for snapshot in kernel.runtime.snapshots()
+                    }
+                    for record in remaining_records:
+                        snapshot = snapshots[record.module_id]
+                        await trace.emit(
+                            builder.build(
+                                event_type="module.released",
+                                run_id=run_id,
+                                session_id=session_id,
+                                transaction_id=transaction_id,
+                                result_summary=(
+                                    f"任务退出时已释放能力：{record.module_id}"
+                                ),
+                                payload={
+                                    "capability_id": record.capability_id,
+                                    "lease_count": snapshot.lease_count,
+                                    "module_id": record.module_id,
+                                    "reason": "task_shutdown",
+                                    "resource_count": (
+                                        snapshot.resource_counts.resource_count
+                                    ),
+                                    "state": snapshot.state.value,
+                                },
+                            )
+                        )
             finally:
                 if trace_started:
                     await trace.close()
@@ -1141,6 +1438,7 @@ def _checkpoint_from_result(
         query=checkpoint.query,
         status=status,
         stage=next_stage,
+        candidate_only=checkpoint.candidate_only,
         model=checkpoint.model,
         messages=messages,
         termination_reason=result.termination_reason.value,
@@ -1360,23 +1658,6 @@ def _stream_trace_payload(environment: Mapping[str, str]) -> dict[str, JsonValue
     return {}
 
 
-def _create_provider(
-    *,
-    base_url: str,
-    scope: ResourceScope,
-    environment: Mapping[str, str],
-) -> ModelProvider:
-    """只在 Provider capability 已获 Lease 后导入并构造具体适配器。"""
-    from rivet.providers.deepseek import DeepSeekProvider
-    from rivet.providers.models import DeepSeekConfig
-
-    return DeepSeekProvider(
-        DeepSeekConfig(base_url=base_url),
-        scope=scope,
-        environment=environment,
-    )
-
-
 def _transaction_next_action(transaction_id: str | None) -> str:
     """为失败事务提供不会自动应用的可操作下一步。"""
     if transaction_id is None:
@@ -1417,6 +1698,8 @@ def _print_model_result(
 def _print_fix_result(
     result: AgentLoopResult,
     *,
+    run_id: str,
+    session_id: str,
     transaction_id: str,
     patch_id: str,
     evidence_id: str,
@@ -1442,6 +1725,8 @@ def _print_fix_result(
         "model_status": result.completion_status.value,
         "patch_id": patch_id,
         "patch_sha256": patch_sha256,
+        "run_id": run_id,
+        "session_id": session_id,
         "status": status,
         "transaction_id": transaction_id,
         "verification_results": [
@@ -1456,6 +1741,50 @@ def _print_fix_result(
         print(f"{key}: {value}")
     if passed:
         print(f"审查后运行：rivet apply {transaction_id}")
+
+
+def _print_candidate_result(
+    result: AgentLoopResult,
+    *,
+    run_id: str,
+    session_id: str,
+    transaction_id: str,
+    patch_id: str,
+    acceptance_sha256: str,
+    patch_sha256: str,
+    changed_files: tuple[str, ...],
+    changed_symbols: tuple[str, ...],
+    json_output: bool,
+) -> None:
+    """展示无 Evidence 的候选补丁，并明确其不能 Apply。"""
+    payload: dict[str, object] = {
+        "answer": result.answer or "",
+        "acceptance_sha256": acceptance_sha256,
+        "apply_eligible": False,
+        "apply_required": False,
+        "candidate_only": True,
+        "changed_files": list(changed_files),
+        "changed_symbols": list(changed_symbols),
+        "evidence_id": None,
+        "manifest_sha256": None,
+        "model_status": result.completion_status.value,
+        "next_action": (
+            "配置独立 verification.acceptance 后运行 rivet verify "
+            f"{transaction_id}；只有 VERIFIED 事务才能 Apply"
+        ),
+        "patch_id": patch_id,
+        "patch_sha256": patch_sha256,
+        "run_id": run_id,
+        "session_id": session_id,
+        "status": "CANDIDATE_ONLY",
+        "transaction_id": transaction_id,
+        "verification_results": [],
+    }
+    if json_output:
+        _print_json(payload)
+        return
+    for key, value in payload.items():
+        print(f"{key}: {value}")
 
 
 def _print_json(payload: object) -> None:
