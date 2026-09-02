@@ -73,7 +73,6 @@ export function evidencePanelModel({
             passedChecks,
             totalChecks,
             evidence.changedFiles.length,
-            evidence.changedSymbols.length,
           ),
       failedChecks.length === 0 ? "primary" : "warning",
     ),
@@ -149,6 +148,11 @@ function appendEvidenceDetails(
       "primary",
     ),
     line(
+      "base-commit",
+      `基线提交 ${compactIdentifier(evidence.baseCommit, 18)}`,
+      "muted",
+    ),
+    line(
       "acceptance-hash",
       `验收哈希 ${compactHash(evidence.acceptanceSha256)}`,
       "muted",
@@ -168,18 +172,6 @@ function appendEvidenceDetails(
     lines.push(line("files-heading", "变更", "accent"));
     for (const [index, path] of evidence.changedFiles.entries()) {
       lines.push(line(`changed-file-${index}`, `  ${path}`, "primary"));
-    }
-  }
-  if (evidence.changedSymbols.length > 0) {
-    lines.push(line("symbols-heading", `符号 ${evidence.changedSymbols.length}`, "accent"));
-    for (const [index, symbol] of evidence.changedSymbols.entries()) {
-      lines.push(
-        line(
-          `changed-symbol-${index}`,
-          `  ${compactIdentifier(symbol, 22)}`,
-          "muted",
-        ),
-      );
     }
   }
   if (evidence.verificationResults.length > 0) {
@@ -282,7 +274,6 @@ export function verificationStatusText(status: string): string {
     BLOCKED: "阻塞",
     INCONCLUSIVE: "不确定",
     NOT_RUN: "未验证",
-    CANDIDATE_ONLY: "候选",
   };
   return labels[status.toUpperCase()] ?? status;
 }
@@ -323,11 +314,9 @@ function evidenceCountLine(
   passed: number,
   total: number,
   files: number,
-  symbols: number,
 ): string {
   const parts = [`${passed}/${total}`];
   if (files > 0) parts.push(`${files} 文件`);
-  if (symbols > 0) parts.push(`${symbols} 符号`);
   return parts.join(" · ");
 }
 

@@ -1,11 +1,14 @@
-"""把 diff、verify、apply 与 abort 接到持久化事务事实。"""
+"""执行最小 diff/verify/apply/abort 事务命令。"""
 
 from __future__ import annotations
 
+import hashlib
 import json
+import uuid
 from argparse import Namespace
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import cast
 
 from rivet.cli.errors import (
     CliConfigurationError,
@@ -13,100 +16,87 @@ from rivet.cli.errors import (
     CliVerificationError,
 )
 from rivet.cli.exit_codes import ExitCode
-from rivet.cli.runtime import create_cli_kernel, shutdown_cli_kernel
+from rivet.cli.runtime import close_cli_runtime, start_cli_runtime
 from rivet.contracts.transactions import TransactionRecord, TransactionState
-from rivet.kernel.errors import KernelError, SafeModeViolationError
+from rivet.kernel.capability_demand import DemandContext
+from rivet.kernel.errors import KernelError
 from rivet.kernel.module_runtime import CapabilityLease
 from rivet.modules.capabilities import VerificationCapability
+from rivet.tools.executor import (
+    SideEffectJournal,
+    ToolExecutionContext,
+    UnknownSideEffect,
+)
 from rivet.trace.paths import RuntimePaths
+from rivet.trace.verification import VerificationTraceJournal
 from rivet.transaction.errors import TransactionError
+from rivet.transaction.manager import TransactionManager
 from rivet.transaction.store import TransactionStore
 from rivet.verify.errors import VerificationError
 from rivet.verify.evidence_query import EvidenceQueryService
-
-if TYPE_CHECKING:
-    from rivet.verify.detector import ProjectDetection
 
 
 async def run_transaction_command(
     arguments: Namespace,
     *,
     repository: Path,
+    environment: Mapping[str, str],
     json_output: bool,
-    safe_mode: bool = False,
 ) -> int:
-    """执行一个事务命令并保证临时资源按状态清理或移交。"""
+    """按用户 Demand 激活所需能力；diff 不检查 Provider 或沙箱。"""
     command = cast(str, arguments.command)
-    detection = None
-    if command == "verify":
-        from rivet.verify.detector import ProjectDetector, evidence_readiness
-
-        try:
-            detection = ProjectDetector().detect(repository)
-        except VerificationError as error:
-            raise CliVerificationError(
-                error.code,
-                error.summary,
-                "修复 .rivet/project.toml 后重试 Verify",
-            ) from error
-        readiness = evidence_readiness(detection)
-        if not readiness.ready:
-            raise CliVerificationError(
-                "verification.acceptance_not_ready",
-                f"独立 Verify 尚未就绪：{readiness.reason}",
-                readiness.next_action,
-            )
-    kernel = create_cli_kernel(repository, safe_mode=safe_mode)
+    store = _store(repository, environment=environment)
+    transaction_id = _resolve_transaction_id(
+        store,
+        cast(str | None, getattr(arguments, "transaction_id", None)),
+    )
+    runtime = await start_cli_runtime(repository, environment=environment)
     leases: list[CapabilityLease[object]] = []
-    manager = None
+    manager: TransactionManager | None = None
     suspended = False
-    registered_transaction_id: str | None = None
     try:
-        await kernel.start()
-        transaction_lease = await kernel.acquire("transaction.worktree")
-        leases.append(transaction_lease)
-        from rivet.transaction.manager import TransactionManager
-
-        manager = cast(TransactionManager, transaction_lease.capability)
-        store = _store(repository)
-        transaction_id = _resolve_transaction_id(
-            store,
-            cast(str | None, getattr(arguments, "transaction_id", None)),
+        run_id = f"run_{uuid.uuid4().hex}"
+        session_id = f"session_{uuid.uuid4().hex}"
+        root = await runtime.kernel.begin_user_demand(
+            f"transaction.{command}",
+            reason=f"user requested rivet {command}",
+            context=DemandContext(
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+            ),
+            operation_id=f"transaction-command:{command}",
         )
         if command == "diff":
             record, content = _load_patch(store, transaction_id)
-            if json_output:
-                _print_json(
-                    {
-                        "diff": content.decode("utf-8", errors="replace"),
-                        "state": record.state.value,
-                        "transaction_id": record.transaction_id,
-                    }
-                )
-            else:
-                print(content.decode("utf-8", errors="replace"), end="")
+            _print_diff(record, content, json_output=json_output)
             return int(ExitCode.SUCCESS)
+
+        transaction_lease = await runtime.kernel.acquire_required(
+            "transaction.worktree",
+            parent=root,
+            reason=f"{command} requires transaction state",
+            operation_id=f"transaction-command:{command}",
+        )
+        leases.append(transaction_lease)
+        manager = cast(TransactionManager, transaction_lease.capability)
+        checkpoint = SideEffectJournal(runtime.trace, builder=runtime.builder)
+        unknown_side_effects = checkpoint.unknown_for_transaction(
+            transaction_id=transaction_id
+        )
+
         if command == "verify":
-            verify_lease = await kernel.acquire("verify.deterministic")
-            leases.append(verify_lease)
-            record = store.load_record(transaction_id)
-            if record.state is TransactionState.VERIFIED:
-                _verify_record_evidence(store, record)
-                _print_mapping(
-                    cast(
-                        dict[str, object],
-                        EvidenceQueryService(store).detail(transaction_id),
-                    ),
-                    json_output=json_output,
-                )
-                return int(ExitCode.SUCCESS)
-            if record.state in {
+            if unknown_side_effects:
+                raise _unknown_side_effect_error(unknown_side_effects)
+            existing = store.load_record(transaction_id)
+            if existing.state in {
+                TransactionState.VERIFIED,
                 TransactionState.REJECTED,
                 TransactionState.INCONCLUSIVE,
                 TransactionState.BLOCKED,
                 TransactionState.CANCELLED,
             }:
-                _verify_record_evidence(store, record)
+                _verify_record_evidence(store, existing)
                 _print_mapping(
                     cast(
                         dict[str, object],
@@ -114,8 +104,12 @@ async def run_transaction_command(
                     ),
                     json_output=json_output,
                 )
-                return int(ExitCode.VERIFICATION_FAILED)
-            if record.state not in {
+                return (
+                    int(ExitCode.SUCCESS)
+                    if existing.state is TransactionState.VERIFIED
+                    else int(ExitCode.VERIFICATION_FAILED)
+                )
+            if existing.state not in {
                 TransactionState.PATCHING,
                 TransactionState.VERIFYING,
             }:
@@ -125,16 +119,44 @@ async def run_transaction_command(
                     "先完成 fix 或查看 rivet diff",
                 )
             await manager.recover(transaction_id)
-            registered_transaction_id = transaction_id
-            if record.state is TransactionState.PATCHING:
-                await manager.adopt_project_verification_configuration(transaction_id)
+            if existing.state is TransactionState.PATCHING:
                 await manager.begin_verification(transaction_id)
-            detection = cast("ProjectDetection", detection)
+            verify_lease = await runtime.kernel.acquire_required(
+                "verify.deterministic",
+                parent=root,
+                reason="user requested independent verification",
+                operation_id=f"verify:{transaction_id}",
+            )
+            leases.append(verify_lease)
             verifier = cast(VerificationCapability, verify_lease.capability)
-            outcome = await verifier.verify(
-                transaction_id,
-                project_configuration=detection.configuration,
-                configuration_confirmed=detection.configuration is not None,
+            verification_trace = VerificationTraceJournal(
+                runtime.trace,
+                builder=runtime.builder,
+            )
+            verification_event_id = await verification_trace.started(
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+                parent_event_id=verify_lease.demand_handle.event_id,
+            )
+            try:
+                outcome = await verifier.verify(transaction_id)
+            except BaseException as error:
+                await verification_trace.failed(
+                    run_id=run_id,
+                    session_id=session_id,
+                    transaction_id=transaction_id,
+                    parent_event_id=verification_event_id,
+                    error=error,
+                )
+                raise
+            await verification_trace.completed(
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+                parent_event_id=verification_event_id,
+                verdict=outcome.verdict,
+                manifest_sha256=outcome.manifest_sha256,
             )
             manager.suspend(transaction_id)
             suspended = True
@@ -148,20 +170,97 @@ async def run_transaction_command(
                 if outcome.verdict.passed
                 else int(ExitCode.VERIFICATION_FAILED)
             )
+
+        existing = store.load_record(transaction_id)
+        if command == "abort" and any(
+            fact.operation == "apply" for fact in unknown_side_effects
+        ):
+            raise CliSecurityError(
+                "transaction.apply_recovery_required",
+                "事务存在状态未知的 apply，不能 abort",
+                f"运行 rivet apply {transaction_id} 完成确定性恢复",
+            )
+        if existing.state not in {TransactionState.APPLIED, TransactionState.ABORTED}:
+            await manager.recover(transaction_id)
         if command == "apply":
-            record = await manager.apply(transaction_id)
-            _print_record(record, json_output=json_output)
-            return int(ExitCode.SUCCESS)
-        if command == "abort":
+            unknown_non_apply = tuple(
+                fact for fact in unknown_side_effects if fact.operation != "apply"
+            )
+            unknown_apply = tuple(
+                fact for fact in unknown_side_effects if fact.operation == "apply"
+            )
+            if unknown_non_apply or len(unknown_apply) > 1:
+                raise _unknown_side_effect_error(unknown_side_effects)
+            recovering = unknown_apply[0] if unknown_apply else None
+            operation_id = (
+                recovering.operation_id
+                if recovering is not None
+                else f"apply_{uuid.uuid4().hex}"
+            )
+            arguments_sha256 = (
+                recovering.arguments_sha256
+                if recovering is not None
+                else _arguments_sha256({"transaction_id": transaction_id})
+            )
+            execution_context = ToolExecutionContext(
+                parent_demand=root,
+                run_id=run_id,
+                session_id=session_id,
+                transaction_id=transaction_id,
+            )
+            if recovering is None:
+                await checkpoint.operation_started(
+                    operation_id=operation_id,
+                    operation="apply",
+                    arguments_sha256=arguments_sha256,
+                    context=execution_context,
+                    parent_event_id=root.event_id,
+                )
+            try:
+                record = await manager.apply(transaction_id)
+            except BaseException as error:
+                await checkpoint.operation_failed(
+                    operation_id=operation_id,
+                    operation="apply",
+                    arguments_sha256=arguments_sha256,
+                    error=error,
+                    context=execution_context,
+                    parent_event_id=root.event_id,
+                    originating_run_id=(
+                        recovering.originating_run_id
+                        if recovering is not None
+                        else None
+                    ),
+                )
+                raise
+            await checkpoint.operation_succeeded(
+                operation_id=operation_id,
+                operation="apply",
+                arguments_sha256=arguments_sha256,
+                result=record.state.value,
+                context=execution_context,
+                parent_event_id=root.event_id,
+                originating_run_id=(
+                    recovering.originating_run_id if recovering is not None else None
+                ),
+            )
+        elif command == "abort":
             record = await manager.abort(transaction_id)
-            _print_record(record, json_output=json_output)
-            return int(ExitCode.SUCCESS)
-        raise CliConfigurationError(
-            "transaction.command_unknown",
-            "事务命令未注册",
-            "运行 rivet --help",
-        )
+        else:
+            raise CliConfigurationError(
+                "transaction.command_unknown",
+                "事务命令未注册",
+                "运行 rivet --help",
+            )
+        _print_record(record, json_output=json_output)
+        return int(ExitCode.SUCCESS)
     except TransactionError as error:
+        if error.code == "transaction.apply_recovery_required":
+            raise CliSecurityError(
+                error.code,
+                error.summary,
+                f"运行 rivet apply {transaction_id} 完成确定性恢复",
+            ) from error
         if error.code in {
             "transaction.dirty_repository_rejected",
             "transaction.repository_drift",
@@ -171,54 +270,64 @@ async def run_transaction_command(
             raise CliSecurityError(
                 error.code,
                 error.summary,
-                "检查仓库状态和事务证据后再决定是否重试",
+                "检查仓库状态与事务 Evidence 后再决定是否重试",
             ) from error
         raise CliVerificationError(
             error.code,
             error.summary,
-            "运行 rivet diff/trace 检查事务状态",
+            "运行 rivet diff 检查事务状态",
         ) from error
     except VerificationError as error:
         raise CliVerificationError(
             error.code,
             error.summary,
-            "检查 Evidence 和冻结验收条件",
-        ) from error
-    except SafeModeViolationError as error:
-        raise CliSecurityError(
-            "module.safe_mode_denied",
-            "Safe Mode 不允许执行事务命令",
-            "保持只读操作，或审查配置后关闭 Safe Mode",
+            "检查 Evidence 与冻结 AcceptanceSpec",
         ) from error
     except KernelError as error:
         raise CliVerificationError(
             "module.transaction_unavailable",
-            "事务模块无法安全激活或关闭",
-            "运行 rivet modules 和 rivet doctor 检查模块状态",
+            "事务能力无法安全激活或关闭",
+            "检查 Git、bubblewrap 和 XDG 状态目录",
         ) from error
     finally:
         try:
-            if (
-                manager is not None
-                and not suspended
-                and registered_transaction_id is not None
-            ):
+            if manager is not None and not suspended:
                 try:
-                    manager.suspend(registered_transaction_id)
+                    record = store.load_record(transaction_id)
+                    if record.state not in {
+                        TransactionState.APPLIED,
+                        TransactionState.ABORTED,
+                    }:
+                        manager.suspend(transaction_id)
                 except TransactionError as error:
                     if error.code not in {
                         "transaction.suspend_terminal",
                         "transaction.worktree_missing",
+                        "transaction.suspend_unregistered",
                     }:
                         raise
         finally:
-            await shutdown_cli_kernel(kernel, leases)
+            await close_cli_runtime(runtime, leases)
 
 
-def _store(repository: Path) -> TransactionStore:
-    """返回与 TransactionManager 默认路径完全一致的只读 Store。"""
+def transaction_store(
+    repository: Path,
+    *,
+    environment: Mapping[str, str],
+) -> TransactionStore:
+    """供 CLI 与 IPC 共用的 XDG TransactionStore。"""
+    return _store(repository, environment=environment)
+
+
+def _store(
+    repository: Path,
+    *,
+    environment: Mapping[str, str],
+) -> TransactionStore:
+    paths = RuntimePaths.for_repository(repository, environment=environment)
     return TransactionStore(
-        RuntimePaths.for_repository(repository).runtime_root / "transactions"
+        paths.transactions_root,
+        evidence_root=paths.evidence_root,
     )
 
 
@@ -226,7 +335,6 @@ def _resolve_transaction_id(
     store: TransactionStore,
     transaction_id: str | None,
 ) -> str:
-    """显式 ID 优先；缺省时选择 updated_at 最新的有效事务。"""
     if transaction_id is not None:
         store.load_record(transaction_id)
         return transaction_id
@@ -252,7 +360,6 @@ def _load_patch(
     store: TransactionStore,
     transaction_id: str,
 ) -> tuple[TransactionRecord, bytes]:
-    """复核记录已绑定当前补丁后返回完整 binary diff。"""
     record = store.load_record(transaction_id)
     if record.current_patch_id is None:
         raise CliVerificationError(
@@ -268,7 +375,6 @@ def _verify_record_evidence(
     store: TransactionStore,
     record: TransactionRecord,
 ) -> None:
-    """复核当前补丁与已判定 Evidence 的完整绑定。"""
     if record.current_patch_id is None:
         raise CliVerificationError(
             "transaction.patch_missing",
@@ -282,8 +388,26 @@ def _verify_record_evidence(
     )
 
 
+def _print_diff(
+    record: TransactionRecord,
+    content: bytes,
+    *,
+    json_output: bool,
+) -> None:
+    visible = content.decode("utf-8", errors="replace")
+    if json_output:
+        _print_json(
+            {
+                "diff": visible,
+                "state": record.state.value,
+                "transaction_id": record.transaction_id,
+            }
+        )
+    else:
+        print(visible, end="")
+
+
 def _print_record(record: TransactionRecord, *, json_output: bool) -> None:
-    """展示不含仓库绝对路径和用户内容的事务状态。"""
     _print_mapping(
         {
             "evidence_id": record.evidence_id,
@@ -296,7 +420,6 @@ def _print_record(record: TransactionRecord, *, json_output: bool) -> None:
 
 
 def _print_mapping(payload: dict[str, object], *, json_output: bool) -> None:
-    """同时支持稳定 JSON 与简洁人类输出。"""
     if json_output:
         _print_json(payload)
         return
@@ -305,7 +428,6 @@ def _print_mapping(payload: dict[str, object], *, json_output: bool) -> None:
 
 
 def _print_json(payload: object) -> None:
-    """输出稳定紧凑 JSON。"""
     print(
         json.dumps(
             payload,
@@ -313,4 +435,25 @@ def _print_json(payload: object) -> None:
             sort_keys=True,
             separators=(",", ":"),
         )
+    )
+
+
+def _arguments_sha256(arguments: Mapping[str, object]) -> str:
+    serialized = json.dumps(
+        arguments,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(serialized).hexdigest()}"
+
+
+def _unknown_side_effect_error(
+    unknown_side_effects: Sequence[UnknownSideEffect],
+) -> CliSecurityError:
+    operations = ", ".join(sorted({fact.operation for fact in unknown_side_effects}))
+    return CliSecurityError(
+        "transaction.side_effect_unknown",
+        f"事务存在崩溃后状态未知的副作用：{operations}",
+        "只允许重放具备 ApplyIntent 恢复协议的单个 apply；其他情况请审计 Trace 后 abort",
     )

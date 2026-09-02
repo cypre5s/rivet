@@ -1,12 +1,11 @@
 import type { IpcEvent } from "./contracts/ipc.ts";
 import { initialRivetState, reduceTraceEvent } from "./state/reducer.ts";
-import { buildViewModel } from "./ui/view-model.ts";
+import { computeLayout } from "./ui/layout.ts";
 import { parseCommandInput } from "./ui/commands.ts";
 
 const commandContext = {
   modelConfigured: true,
   currentModel: "deepseek-v4-pro",
-  hasSession: true,
   transactionId: "tx_one",
   verificationStatus: "PASSED",
   evidenceId: "evidence_one",
@@ -31,18 +30,14 @@ const permissionEvent: IpcEvent = {
 };
 
 const state = reduceTraceEvent(initialRivetState(), permissionEvent);
-const view = buildViewModel(state, {
-  width: 200,
-  height: 50,
-  noColor: process.env.NO_COLOR !== undefined,
-});
+const layout = computeLayout(200, 50);
 const commandMethods = [
-  "/ask q",
-  "/plan q",
+  "explain this repository",
   "/fix q",
   "/verify",
   "/diff",
   "/apply tx_one",
+  "/abort tx_one",
 ].map((command) => {
   const outcome = parseCommandInput(command, commandContext);
   return outcome.kind === "worker" ? outcome.method : outcome.action;
@@ -50,10 +45,10 @@ const commandMethods = [
 
 process.stdout.write(
   `${JSON.stringify({
-    layout: view.layout.mode,
-    no_color: view.noColor,
-    inspector_tabs: view.inspectorTabs,
-    permission_visible: view.permission !== null,
+    layout: layout.mode,
+    no_color: process.env.NO_COLOR !== undefined,
+    inspector_tabs: ["Diff", "Verify", "Evidence"],
+    permission_visible: state.permission !== null,
     command_methods: commandMethods,
   })}\n`,
 );

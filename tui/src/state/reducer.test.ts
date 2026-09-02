@@ -23,142 +23,81 @@ function event(
   };
 }
 
-describe("Trace-driven reducer", () => {
-  test("projects plan, context, diff, evidence, modules and budget", () => {
+describe("focused Trace reducer", () => {
+  test("projects only live model, transaction, patch and evidence state", () => {
     const events = [
       event(0, "worker.ready", {
         repository: "/repo",
         branch: "main",
         model: "reasoner-large",
         models: ["chat-fast", "reasoner-large"],
-        base_url: "https://gateway.example.test/v1",
-        max_rounds: 18,
-        max_total_tokens: 64000,
-        max_cost_usd: "2.50",
-        safe_mode: true,
         credential_configured: true,
+        acceptance_ready: true,
       }),
-      event(1, "plan.updated", { phase: "VERIFY", summary: "执行验证" }),
-      event(2, "context.selected", { path: "src/app.py", reason: "错误栈" }),
-      event(3, "patch.updated", { diff: "@@ -1 +1 @@" }),
+      event(1, "transaction.started", { transaction_id: "tx_one" }),
+      event(2, "patch.updated", { diff: "@@ -1 +1 @@" }),
+      event(3, "verification.completed", { status: "PASSED" }),
       event(4, "evidence.published", {
+        transaction_id: "tx_one",
         evidence_id: "evidence_one",
+        base_commit: "b".repeat(40),
         acceptance_sha256: "a".repeat(64),
         patch_sha256: "p".repeat(64),
         manifest_sha256: "m".repeat(64),
         changed_files: ["calculator.py"],
-        changed_symbols: ["total_with_tax"],
-        verification_results: [
-          { kind: "V0_ENVIRONMENT", status: "PASSED" },
-          { kind: "V10_RESOURCE", status: "PASSED" },
-        ],
+        verification_results: [{ kind: "Behavior", status: "PASSED" }],
       }),
-      event(5, "module.activated", { module_id: "reader.pdf" }),
-      event(6, "budget.updated", { tokens: 120, cost_usd: 0.02, elapsed_ms: 80 }),
     ];
-
     const state = events.reduce(reduceTraceEvent, initialRivetState());
 
-    expect(state.connection).toBe("ready");
-    expect(state.repository).toBe("/repo");
-    expect(state.branch).toBe("main");
-    expect(state.credentialConfigured).toBeTrue();
-    expect(state.model).toBe("reasoner-large");
-    expect(state.models).toEqual(["chat-fast", "reasoner-large"]);
-    expect(state.baseUrl).toBe("https://gateway.example.test/v1");
-    expect(state.maxRounds).toBe(18);
-    expect(state.maxTotalTokens).toBe(64_000);
-    expect(state.maxCostUsd).toBe("2.50");
-    expect(state.safeMode).toBeTrue();
-    expect(state.plan.phase).toBe("VERIFY");
-    expect(state.context).toEqual([{ path: "src/app.py", reason: "错误栈" }]);
+    expect(state).toMatchObject({
+      connection: "ready",
+      repository: "/repo",
+      branch: "main",
+      model: "reasoner-large",
+      models: ["chat-fast", "reasoner-large"],
+      credentialConfigured: true,
+      acceptanceReady: true,
+      transaction: "tx_one",
+      verifyStatus: "PASSED",
+      evidenceId: "evidence_one",
+    });
     expect(state.diff).toContain("@@");
-    expect(state.evidenceId).toBe("evidence_one");
     expect(state.evidence?.changedFiles).toEqual(["calculator.py"]);
-    expect(state.evidence?.changedSymbols).toEqual(["total_with_tax"]);
+    expect(state.evidence?.baseCommit).toBe("b".repeat(40));
     expect(state.evidence?.verificationResults).toMatchObject([
-      { kind: "V0_ENVIRONMENT", status: "PASSED" },
-      { kind: "V10_RESOURCE", status: "PASSED" },
+      { kind: "Behavior", status: "PASSED" },
     ]);
-    expect(state.taskModules).toEqual(["reader.pdf"]);
-    expect(state.budget.tokens).toBe(120);
-    expect(state.timeline).toHaveLength(7);
-    expect(state.timeline[0]?.title).toBe("就绪");
-    expect(state.timeline[0]?.title).not.toContain("worker.ready");
   });
 
-  test("opens and resolves permission modal from events", () => {
-    const requested = reduceTraceEvent(
+  test("preserves Demand causality fields for grouped timeline audit", () => {
+    const state = reduceTraceEvent(
       initialRivetState(),
-      event(0, "permission.requested", {
-        request_id: "request_permission",
-        permission: "EXECUTE",
-        reason: "运行测试",
-        argv: "pytest -q",
-        cwd: ".",
-        timeout_seconds: 60,
+      event(0, "demand.created", {
+        demand_id: "demand_one",
+        operation_id: "operation_one",
+        parent_event_id: "event_parent",
+        parent_demand_id: "demand_parent",
+        capability_id: "context.search.lexical",
       }),
     );
-
-    expect(requested.permission?.permission).toBe("EXECUTE");
-    expect(requested.permission?.argv).toBe("pytest -q");
-
-    const resolved = reduceTraceEvent(
-      requested,
-      event(1, "permission.resolved", { request_id: "request_permission" }),
-    );
-    expect(resolved.permission).toBeNull();
+    expect(state.timeline[0]).toMatchObject({
+      demandId: "demand_one",
+      operationId: "operation_one",
+      parentEventId: "event_parent",
+      parentDemandId: "demand_parent",
+      title: "搜索代码",
+    });
   });
 
-  test("ignores duplicate or stale sequence and exposes worker recovery", () => {
-    let state = reduceTraceEvent(
-      initialRivetState(),
-      event(2, "worker.crashed", { summary: "worker stopped" }),
-    );
-    state = reduceTraceEvent(state, event(2, "worker.ready", {}));
-    expect(state.connection).toBe("crashed");
-    expect(state.timeline).toHaveLength(1);
-
-    state = reduceTraceEvent(state, event(3, "worker.recovered", {}));
-    expect(state.connection).toBe("ready");
-    expect(state.error).toBeNull();
-  });
-
-  test("clears a recovered tool error when the overall command completes", () => {
-    let state = reduceTraceEvent(
-      initialRivetState(),
-      event(0, "tool.failed", { summary: "目录工具失败" }),
-    );
-    expect(state.error).toBe("目录工具失败");
-
-    state = reduceTraceEvent(
-      state,
-      event(1, "command.completed", { summary: "/plan 已完成" }),
-    );
-
-    expect(state.error).toBeNull();
-    expect(state.timeline.map((item) => item.status)).toEqual([
-      "failed",
-      "success",
-    ]);
-  });
-
-  test("updates one assistant item from cumulative stream snapshots and finalizes it", () => {
+  test("updates one assistant item from cumulative stream snapshots", () => {
     let state = reduceTraceEvent(
       initialRivetState(),
       event(0, "agent.output.delta", {
         response_id: "response_one",
         content: "正在分析",
-        summary: "模型回复正在生成",
       }),
     );
-    expect(state.timeline).toHaveLength(1);
-    expect(state.timeline[0]).toMatchObject({
-      kind: "assistant",
-      status: "running",
-      detail: "正在分析",
-    });
-
     state = reduceTraceEvent(
       state,
       event(1, "agent.output.delta", {
@@ -167,61 +106,81 @@ describe("Trace-driven reducer", () => {
       }),
     );
     expect(state.timeline).toHaveLength(1);
-    expect(state.timeline[0]?.detail).toBe("正在分析仓库。");
+    expect(state.timeline[0]).toMatchObject({
+      kind: "assistant",
+      status: "running",
+      detail: "正在分析仓库。",
+    });
 
     state = reduceTraceEvent(
       state,
       event(2, "agent.answered", {
         response_id: "response_one",
         status: "ANSWERED",
-        summary: "正在分析仓库。结论如下。",
+        summary: "结论如下。",
       }),
     );
     expect(state.timeline).toHaveLength(1);
-    expect(state.timeline[0]).toMatchObject({
-      kind: "assistant",
-      status: "success",
-      detail: "正在分析仓库。结论如下。",
-    });
+    expect(state.timeline[0]).toMatchObject({ status: "success", detail: "结论如下。" });
   });
 
-  test("transport status does not consume the worker trace sequence", () => {
-    let state = reduceRivetState(initialRivetState(), {
-      kind: "worker-status",
-      state: "crashed",
-      summary: "worker stopped",
-    });
-    state = reduceRivetState(state, {
-      kind: "trace",
-      event: event(0, "worker.ready", { repository: "/repo" }),
-    });
-
-    expect(state.connection).toBe("ready");
-    expect(state.repository).toBe("/repo");
-    expect(state.lastSequence).toBe(0);
-  });
-
-  test("merges duplicate ready events and tracks session snapshots", () => {
-    let state = reduceTraceEvent(
+  test("opens and resolves permission prompts", () => {
+    const requested = reduceTraceEvent(
       initialRivetState(),
-      event(0, "worker.ready", { repository: "/repo" }),
+      event(0, "permission.requested", {
+        request_id: "request_permission",
+        permission: "EXECUTE",
+        reason: "确认真实提案",
+        goal: "修复解析器",
+        read_scope: ["src/parser.py", "src/context.py"],
+        write_scope: ["src/parser.py"],
+        allowed_new_paths: ["src/generated.py"],
+        forbidden_paths: ["tests/test_parser.py"],
+        expected_behaviors: ["拒绝负数端口"],
+        preserved_behaviors: ["正常端口仍可解析"],
+        acceptance_commands: [["pytest", "tests/test_parser.py", "-q"]],
+        regression_commands: [["pytest", "-q"]],
+        budgets: {
+          max_wall_seconds: 900,
+          max_tokens: 8192,
+          max_tool_calls: 64,
+          max_cost_usd: "1.25",
+        },
+        investigation: "负数分支缺失",
+        proposal_run_id: "run_proposal_one",
+        acceptance_sha256: `sha256:${"a".repeat(64)}`,
+        base_commit: "b".repeat(40),
+        argv: "rivet fix --allow-write src/parser.py --yes --acceptance-sha256 sha256:aaaaaaaa --base-commit bbbbbbbb",
+        cwd: "批准后创建独立 Git Worktree",
+        timeout_seconds: 900,
+      }),
     );
-    state = reduceTraceEvent(
-      state,
-      event(1, "worker.ready", { repository: "/repo" }),
+    expect(requested.permission).toMatchObject({
+      goal: "修复解析器",
+      readScope: ["src/parser.py", "src/context.py"],
+      writeScope: ["src/parser.py"],
+      allowedNewPaths: ["src/generated.py"],
+      forbiddenPaths: ["tests/test_parser.py"],
+      expectedBehaviors: ["拒绝负数端口"],
+      preservedBehaviors: ["正常端口仍可解析"],
+      acceptanceCommands: [["pytest", "tests/test_parser.py", "-q"]],
+      regressionCommands: [["pytest", "-q"]],
+      budgets: {
+        maxWallSeconds: 900,
+        maxTokens: 8192,
+        maxToolCalls: 64,
+        maxCostUsd: "1.25",
+      },
+      investigation: "负数分支缺失",
+      proposalRunId: "run_proposal_one",
+      acceptanceSha256: `sha256:${"a".repeat(64)}`,
+      baseCommit: "b".repeat(40),
+    });
+    const resolved = reduceTraceEvent(
+      requested,
+      event(1, "permission.resolved", { request_id: "request_permission" }),
     );
-    state = reduceTraceEvent(
-      state,
-      event(2, "session.updated", { session_id: "session_one" }),
-    );
-    state = reduceTraceEvent(
-      state,
-      event(3, "sessions.snapshot", { sessions: ["session_two"] }),
-    );
-
-    expect(state.timeline.filter((item) => item.eventType === "worker.ready")).toHaveLength(1);
-    expect(state.sessionId).toBe("session_one");
-    expect(state.sessions).toEqual(["session_one", "session_two"]);
+    expect(resolved.permission).toBeNull();
   });
 
   test("tracks validated historical transaction snapshots", () => {
@@ -234,85 +193,37 @@ describe("Trace-driven reducer", () => {
             state: "VERIFIED",
             evidence_id: "evidence_verified",
           },
-          {
-            transaction_id: "tx_rejected",
-            state: "REJECTED",
-            evidence_id: "evidence_rejected",
-          },
         ],
       }),
     );
-
     expect(state.transactions).toMatchObject([
       {
         transactionId: "tx_verified",
         state: "VERIFIED",
         evidenceId: "evidence_verified",
-      },
-      {
-        transactionId: "tx_rejected",
-        state: "REJECTED",
-        evidenceId: "evidence_rejected",
+        applyEligible: true,
       },
     ]);
   });
 
-  test("projects structured module snapshots and lifecycle updates", () => {
+  test("ignores stale sequence and keeps transport status separate", () => {
     let state = reduceTraceEvent(
       initialRivetState(),
-      event(0, "modules.snapshot", {
-        modules: [
-          {
-            module_id: "context.syntax",
-            policy: "ENABLED",
-            availability: "AVAILABLE",
-            manifest_default_enabled: true,
-            persisted_override: null,
-            configured_enabled: true,
-            effective_enabled: true,
-            runtime_state: "INACTIVE",
-            activation: "on_demand",
-            scope: "workspace",
-            manual_control: true,
-            sleep_policy: "automatic",
-            dependencies: ["context.lexical"],
-            dependents: ["context.lsp"],
-            provided_capabilities: ["context.search.syntax"],
-            lease_count: 0,
-            active_resource_count: 0,
-            last_error: null,
-          },
-        ],
-      }),
+      event(2, "worker.crashed", { summary: "worker stopped" }),
     );
+    state = reduceTraceEvent(state, event(2, "worker.ready", {}));
+    expect(state.connection).toBe("crashed");
 
-    expect(state.moduleStatuses[0]?.moduleId).toBe("context.syntax");
-    expect(state.moduleStatuses[0]?.dependencies).toEqual(["context.lexical"]);
-    expect(state.taskModules).toEqual([]);
-
-    state = reduceTraceEvent(
-      state,
-      event(1, "module.operation.completed", {
-        module_id: "context.syntax",
-        operation: "disable",
-        current_state: "INACTIVE",
-        effective_enabled: false,
-      }),
-    );
-    expect(state.moduleStatuses[0]?.policy).toBe("DISABLED");
-    expect(state.moduleStatuses[0]?.configuredEnabled).toBeFalse();
-    expect(state.taskModules).toEqual([]);
-
-    state = reduceTraceEvent(
-      state,
-      event(2, "module.activated", { module_id: "context.syntax" }),
-    );
-    expect(state.taskModules).toEqual(["context.syntax"]);
-
-    state = reduceTraceEvent(
-      state,
-      event(3, "module.released", { module_id: "context.syntax" }),
-    );
-    expect(state.taskModules).toEqual([]);
+    state = reduceRivetState(initialRivetState(), {
+      kind: "worker-status",
+      state: "crashed",
+      summary: "worker stopped",
+    });
+    state = reduceRivetState(state, {
+      kind: "trace",
+      event: event(0, "worker.ready", { repository: "/repo" }),
+    });
+    expect(state.connection).toBe("ready");
+    expect(state.lastSequence).toBe(0);
   });
 });

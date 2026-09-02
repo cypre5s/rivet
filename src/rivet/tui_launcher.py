@@ -27,8 +27,6 @@ TUI_ENVIRONMENT_NAMES = frozenset(
         "RIVET_MAX_TOTAL_TOKENS",
         "RIVET_MODEL",
         "RIVET_MODELS",
-        "RIVET_SAFE_MODE",
-        "RIVET_TRANSCRIPTION_MODEL_PATH",
         "TERM",
         "TZ",
         "XDG_CACHE_HOME",

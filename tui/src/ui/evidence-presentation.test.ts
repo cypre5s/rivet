@@ -39,11 +39,11 @@ function evidence(results: VerificationSummary[]): EvidenceSummary {
     evidenceVerified: true,
     evidenceId: "evidence_1234567890abcdefghijklmnopqrstuvwxyz",
     patchId: "patch_1234567890abcdefghijklmnopqrstuvwxyz",
+    baseCommit: "e".repeat(40),
     acceptanceSha256: "a".repeat(64),
     patchSha256: "b".repeat(64),
     manifestSha256: "c".repeat(64),
     changedFiles: ["src/app.py"],
-    changedSymbols: ["run"],
     verificationResults: results,
     files: [
       { path: "manifest.json", sha256: "d".repeat(64), sizeBytes: 2_048 },
@@ -69,7 +69,7 @@ function transaction(): TransactionSummary {
 describe("concise evidence presentation", () => {
   test("shows only the decision and progress before details are requested", () => {
     const model = evidencePanelModel({
-      evidence: evidence([check("V0_ENVIRONMENT"), check("V10_RESOURCE")]),
+      evidence: evidence([check("BASELINE"), check("RESOURCE")]),
       evidenceLog: null,
       transactions: [transaction()],
       selectedIndex: 0,
@@ -78,7 +78,7 @@ describe("concise evidence presentation", () => {
     const text = model.lines.map((line) => line.text).join("\n");
 
     expect(text).toContain("✓ 通过");
-    expect(text).toContain("2/2 · 1 文件 · 1 符号");
+    expect(text).toContain("2/2 · 1 文件");
     expect(text).toContain("✓ 可应用");
     expect(text).toContain("D 详情");
     expect(text).not.toContain("验收哈希");
@@ -91,7 +91,7 @@ describe("concise evidence presentation", () => {
 
   test("reveals hashes, commands and file index only on demand", () => {
     const model = evidencePanelModel({
-      evidence: evidence([check("V0_ENVIRONMENT"), check("V3_TARGETED")]),
+      evidence: evidence([check("BASELINE"), check("BEHAVIOR")]),
       evidenceLog: null,
       transactions: [transaction()],
       selectedIndex: 0,
@@ -100,10 +100,11 @@ describe("concise evidence presentation", () => {
     const text = model.lines.map((line) => line.text).join("\n");
 
     expect(text).toContain("验收哈希");
+    expect(text).toContain("基线提交");
     expect(text).toContain("事务 tx_123456");
     expect(text).not.toContain("sha256:");
     expect(text).toContain("补丁哈希");
-    expect(text).toContain("pytest -q tests/V3_TARGETED.py");
+    expect(text).toContain("pytest -q tests/BEHAVIOR.py");
     expect(text).toContain("manifest.json");
     expect(text).toContain("D 收起");
     expect(
@@ -115,7 +116,7 @@ describe("concise evidence presentation", () => {
 
   test("keeps failed checks visible in the compact summary", () => {
     const model = evidencePanelModel({
-      evidence: evidence([check("V0_ENVIRONMENT"), check("V3_TARGETED", "FAILED")]),
+      evidence: evidence([check("BASELINE"), check("BEHAVIOR", "FAILED")]),
       evidenceLog: null,
       transactions: [transaction()],
       selectedIndex: 0,
@@ -123,19 +124,19 @@ describe("concise evidence presentation", () => {
     });
 
     expect(model.lines.map((line) => line.text).join("\n")).toContain(
-      "× V3_TARGETED · 失败",
+      "× BEHAVIOR · 失败",
     );
   });
 
   test("hides a previously loaded log after details are collapsed", () => {
     const model = evidencePanelModel({
-      evidence: evidence([check("V0_ENVIRONMENT")]),
+      evidence: evidence([check("BASELINE")]),
       evidenceLog: {
         transactionId: "tx_1234567890abcdefghijklmnopqrstuvwxyz",
         evidenceId: "evidence_1234567890abcdefghijklmnopqrstuvwxyz",
-        stepId: "step_V0_ENVIRONMENT",
+        stepId: "step_BASELINE",
         status: "PASSED",
-        logPath: "V0_ENVIRONMENT.log",
+        logPath: "baseline.log",
         logSha256: "f".repeat(64),
         content: "private technical log",
         truncated: false,
@@ -152,7 +153,7 @@ describe("concise evidence presentation", () => {
 
   test("describes an applied transaction as complete instead of unavailable", () => {
     const applied = {
-      ...evidence([check("V0_ENVIRONMENT")]),
+      ...evidence([check("BASELINE")]),
       state: "APPLIED",
       applyEligible: false,
     };

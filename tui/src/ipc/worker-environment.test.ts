@@ -13,7 +13,6 @@ describe("TUI worker environment", () => {
       RIVET_MAX_COST_USD: "2.50",
       RIVET_MODEL: "team-reasoner",
       RIVET_MODELS: "team-chat,team-reasoner",
-      RIVET_SAFE_MODE: "true",
       UNRELATED_SECRET: "must-not-pass",
     });
 

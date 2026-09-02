@@ -1,52 +1,30 @@
 import { useKeyboard } from "@opentui/react";
-import {
-  useEffect,
-  useRef,
-  type Dispatch,
-  type SetStateAction,
-} from "react";
+import { useEffect, useRef, type Dispatch, type SetStateAction } from "react";
 
 import type { PasteAttachment } from "../components/composer.tsx";
 import type { PickerOption } from "../components/option-picker.tsx";
 import type { WorkerClient } from "../ipc/client.ts";
 import type { RivetAction, RivetState } from "../state/reducer.ts";
-import {
-  clampIndex,
-  explicitTaskMode,
-  MODES,
-  overlayItemCount,
-  replaceExplicitTaskMode,
-  type Overlay,
-} from "../ui/app-model.ts";
+import { clampIndex, overlayItemCount, type Overlay } from "../ui/app-model.ts";
 import type {
   CommandDescriptor,
   CommandOutcome,
   PanelName,
-  WorkMode,
 } from "../ui/command-registry.ts";
 import type { CommandSearchResult } from "../ui/command-search.ts";
-import {
-  resolveCtrlCIntent,
-  resolveKeyCommand,
-  resolveLeaderCommand,
-} from "../ui/keymap.ts";
+import { resolveCtrlCIntent, resolveKeyCommand } from "../ui/keymap.ts";
 
 export interface AppKeyboardState {
   rivet: RivetState;
   topOverlay: Overlay | null;
   openPanel: PanelName | null;
   input: string;
-  history: string[];
-  historyCursor: number;
-  mode: WorkMode;
   running: boolean;
   activeRequestId: string | null;
   selectedIndex: number;
   evidenceExpanded: boolean;
   slashResults: CommandSearchResult[];
-  paletteResults: CommandSearchResult[];
   rankedFiles: string[];
-  historyOptions: PickerOption[];
   modelOptions: PickerOption[];
   argumentOptions: PickerOption[];
 }
@@ -58,9 +36,7 @@ export interface AppKeyboardActions {
   setInlineError: Dispatch<SetStateAction<string | null>>;
   setNotice: Dispatch<SetStateAction<string | null>>;
   setOpenPanel: Dispatch<SetStateAction<PanelName | null>>;
-  setScreen: Dispatch<SetStateAction<"welcome" | "session">>;
-  setMode: Dispatch<SetStateAction<WorkMode>>;
-  setHistoryCursor: Dispatch<SetStateAction<number>>;
+  setScreen: Dispatch<SetStateAction<"welcome" | "workbench">>;
   setSelectedIndex: Dispatch<SetStateAction<number>>;
   setEvidenceExpanded: Dispatch<SetStateAction<boolean>>;
   closeTopOverlay(): void;
@@ -129,73 +105,39 @@ export function useAppKeyboard(
       }
       return;
     }
-    if (state.topOverlay?.kind === "leader") {
-      key.preventDefault();
-      if (key.name === "escape") {
-        actions.closeTopOverlay();
-        return;
-      }
-      const commandName = resolveLeaderCommand(key.name);
-      actions.closeTopOverlay();
-      if (commandName === null) {
-        actions.setNotice("未绑定快捷键");
-      } else {
-        executeLeader(commandName);
-      }
-      return;
-    }
-    if (state.topOverlay?.kind === "config") {
-      return;
-    }
     if (state.topOverlay !== null) {
       if (handleOverlayKey(key.name, key.shift)) key.preventDefault();
       return;
     }
-    if (state.openPanel === "Modules" && handleModulesPanelKey(key)) {
-      key.preventDefault();
-      return;
-    }
-    if (state.openPanel === "Evidence" && handleEvidencePanelKey(key)) {
-      key.preventDefault();
-      return;
-    }
-    if (command === "palette.open") {
-      key.preventDefault();
-      actions.pushOverlay({ kind: "palette" });
-    } else if (command === "files.open") {
-      key.preventDefault();
-      actions.pushOverlay({ kind: "files" });
-    } else if (command === "history.open") {
-      key.preventDefault();
-      actions.pushOverlay({ kind: "history" });
-    } else if (command === "models.open") {
+    if (command === "models.open") {
       key.preventDefault();
       actions.pushOverlay({ kind: "models" });
-    } else if (command === "config.open") {
-      key.preventDefault();
-      actions.pushOverlay({ kind: "config" });
-    } else if (command === "leader.open") {
-      key.preventDefault();
-      actions.pushOverlay({ kind: "leader" });
-    } else if (command === "timeline.clear") {
-      key.preventDefault();
-      actions.dispatch({ kind: "timeline-clear" });
-    } else if (command === "mode.next" || command === "mode.previous") {
-      key.preventDefault();
-      cycleMode(command === "mode.next" ? 1 : -1);
-    } else if (command === "worker.recover") {
+      return;
+    }
+    if (command === "worker.recover") {
       key.preventDefault();
       if (state.rivet.connection === "crashed") services.onRecover?.();
-    } else if (command === "overlay.close") {
+      return;
+    }
+    if (command === "overlay.close") {
       key.preventDefault();
       if (state.openPanel !== null) actions.setOpenPanel(null);
       else actions.setInlineError(null);
-    } else if (
-      !state.running &&
-      (key.name === "up" || key.name === "down")
-    ) {
+      return;
+    }
+    if (state.openPanel !== null && !key.ctrl) {
+      const panel = ({ d: "Diff", v: "Verify", e: "Evidence" } as const)[
+        key.name as "d" | "v" | "e"
+      ];
+      if (panel !== undefined) {
+        key.preventDefault();
+        actions.setOpenPanel(panel);
+        if (panel === "Evidence") actions.setSelectedIndex(0);
+        return;
+      }
+    }
+    if (state.openPanel === "Evidence" && handleEvidencePanelKey(key)) {
       key.preventDefault();
-      browseHistory(key.name === "up" ? 1 : -1);
     }
   });
 
@@ -244,100 +186,7 @@ export function useAppKeyboard(
     }
   }
 
-  function cycleMode(direction: 1 | -1) {
-    const current = MODES.indexOf(state.mode);
-    const next = (current + direction + MODES.length) % MODES.length;
-    const nextMode = MODES[next] ?? "ASK";
-    actions.setMode(nextMode);
-    if (explicitTaskMode(state.input) !== null) {
-      actions.setInput(replaceExplicitTaskMode(state.input, nextMode));
-    }
-  }
-
-  function browseHistory(direction: 1 | -1) {
-    if (state.history.length === 0) return;
-    const next = Math.max(
-      -1,
-      Math.min(state.history.length - 1, state.historyCursor + direction),
-    );
-    actions.setHistoryCursor(next);
-    actions.setInput(
-      next < 0 ? "" : state.history[state.history.length - 1 - next] ?? "",
-    );
-  }
-
-  function executeLeader(commandName: string) {
-    if (commandName === "plan" || commandName === "fix") {
-      actions.setMode(commandName === "plan" ? "PLAN" : "FIX");
-      return;
-    }
-    if (commandName === "quit") {
-      services.onExit?.();
-      return;
-    }
-    if (commandName === "modules") {
-      actions.executeInput("/modules list");
-      return;
-    }
-    const panelByCommand: Partial<Record<string, PanelName>> = {
-      context: "Context",
-      diff: "Diff",
-      evidence: "Evidence",
-      sessions: "Sessions",
-      trace: "Trace",
-    };
-    const panel = panelByCommand[commandName];
-    if (panel !== undefined) {
-      actions.setScreen("session");
-      actions.setOpenPanel(panel);
-      return;
-    }
-    actions.executeInput(`/${commandName}`);
-  }
-
-  function handleModulesPanelKey(key: {
-    name: string;
-    ctrl: boolean;
-  }): boolean {
-    const modules = state.rivet.moduleStatuses;
-    if (key.ctrl || modules.length === 0) return false;
-    if (key.name === "up" || key.name === "down") {
-      const delta = key.name === "up" ? -1 : 1;
-      actions.setSelectedIndex((current) =>
-        clampIndex(current + delta, modules.length),
-      );
-      return true;
-    }
-    const module = modules[clampIndex(state.selectedIndex, modules.length)];
-    if (module === undefined || !["e", "d"].includes(key.name)) {
-      return false;
-    }
-    if (
-      !module.manualControl ||
-      module.activation === "required" ||
-      module.activation === "eager"
-    ) {
-      actions.setNotice("仅由 Kernel 管理");
-      return true;
-    }
-    const operation = { e: "enable", d: "disable" }[key.name];
-    if (operation === undefined) return false;
-    if (operation === "enable" && module.configuredEnabled) {
-      actions.setNotice("已启用");
-      return true;
-    }
-    if (operation === "disable" && !module.configuredEnabled) {
-      actions.setNotice("已禁用");
-      return true;
-    }
-    actions.executeInput(`/modules ${operation} ${module.moduleId}`);
-    return true;
-  }
-
-  function handleEvidencePanelKey(key: {
-    name: string;
-    ctrl: boolean;
-  }): boolean {
+  function handleEvidencePanelKey(key: { name: string; ctrl: boolean }): boolean {
     if (key.ctrl) return false;
     const transactions = state.rivet.transactions;
     if (key.name === "up" || key.name === "down") {
@@ -347,10 +196,6 @@ export function useAppKeyboard(
       actions.setSelectedIndex((current) =>
         clampIndex(current + delta, transactions.length),
       );
-      return true;
-    }
-    if (key.name === "d") {
-      actions.setEvidenceExpanded((current) => !current);
       return true;
     }
     if (key.name !== "l" && key.name !== "return") return false;
@@ -382,39 +227,18 @@ export function useAppKeyboard(
     const count = overlayItemCount(
       state.topOverlay,
       state.slashResults.length,
-      state.paletteResults.length,
       state.rankedFiles.length,
-      state.historyOptions.length,
       state.modelOptions.length,
       state.argumentOptions.length,
     );
-    if (
-      keyName === "up" ||
-      keyName === "down" ||
-      keyName === "pageup" ||
-      keyName === "pagedown"
-    ) {
+    if (["up", "down", "pageup", "pagedown"].includes(keyName)) {
       const delta =
-        keyName === "up"
-          ? -1
-          : keyName === "down"
-            ? 1
-            : keyName === "pageup"
-              ? -5
-              : 5;
+        keyName === "up" ? -1 : keyName === "down" ? 1 : keyName === "pageup" ? -5 : 5;
       actions.setSelectedIndex((current) => clampIndex(current + delta, count));
       return true;
     }
-    if (
-      keyName === "tab" &&
-      (state.topOverlay?.kind === "slash" ||
-        state.topOverlay?.kind === "palette")
-    ) {
-      const results =
-        state.topOverlay.kind === "slash"
-          ? state.slashResults
-          : state.paletteResults;
-      const command = results[state.selectedIndex]?.command;
+    if (keyName === "tab" && state.topOverlay?.kind === "slash") {
+      const command = state.slashResults[state.selectedIndex]?.command;
       if (command !== undefined) actions.selectCommand(command, !shift);
       return true;
     }
@@ -423,43 +247,31 @@ export function useAppKeyboard(
       return true;
     }
     if (keyName !== "return") return false;
-    if (
-      state.topOverlay?.kind === "slash" ||
-      state.topOverlay?.kind === "palette"
-    ) {
-      const results =
-        state.topOverlay.kind === "slash"
-          ? state.slashResults
-          : state.paletteResults;
-      const command = results[state.selectedIndex]?.command;
+    if (state.topOverlay?.kind === "slash") {
+      const command = state.slashResults[state.selectedIndex]?.command;
       if (command !== undefined) actions.selectCommand(command, false);
     } else if (state.topOverlay?.kind === "files") {
       const path = state.rankedFiles[state.selectedIndex];
       if (path !== undefined) actions.selectFile(path, shift);
-    } else if (state.topOverlay?.kind === "history") {
-      const option = state.historyOptions[state.selectedIndex];
-      if (option !== undefined) {
-        actions.setInput(option.title);
-        actions.closeTopOverlay();
-      }
     } else if (state.topOverlay?.kind === "models") {
       const option = state.modelOptions[state.selectedIndex];
       if (option !== undefined) actions.selectModel(option.id);
     } else if (state.topOverlay?.kind === "arguments") {
-      selectArgumentOption();
+      selectArgumentOption(true);
     }
     return true;
   }
 
-  function selectArgumentOption() {
+  function selectArgumentOption(submitExact = false) {
     if (state.topOverlay?.kind !== "arguments") return;
     const option = state.argumentOptions[state.selectedIndex];
     if (option === undefined) return;
-    if (option.available === false) {
-      actions.setInlineError(option.description ?? "该参数当前不可用");
+    const completed = `/${state.topOverlay.commandName} ${option.id}`;
+    actions.closeTopOverlay();
+    if (submitExact && state.input.trim() === completed) {
+      actions.executeInput(completed);
       return;
     }
-    actions.setInput(`/${state.topOverlay.commandName} ${option.id}`);
-    actions.closeTopOverlay();
+    actions.setInput(completed);
   }
 }

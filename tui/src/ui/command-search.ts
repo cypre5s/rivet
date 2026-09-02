@@ -8,16 +8,12 @@ export interface CommandSearchResult {
 export function searchCommands(
   commands: readonly CommandDescriptor[],
   query: string,
-  recentCommandIds: readonly string[] = [],
 ): CommandSearchResult[] {
   const normalized = normalize(query);
-  const recentRanks = new Map(
-    [...recentCommandIds].reverse().map((id, index) => [id, index]),
-  );
   return commands
     .map((command) => ({
       command,
-      score: commandScore(command, normalized, recentRanks.get(command.id)),
+      score: commandScore(command, normalized),
     }))
     .filter((result) => result.score >= 0)
     .sort(
@@ -31,14 +27,12 @@ export function searchCommands(
 function commandScore(
   command: CommandDescriptor,
   query: string,
-  recentRank: number | undefined,
 ): number {
-  if (!query) return recentRank === undefined ? 100 : 400 - recentRank;
+  if (!query) return 100;
   const fields = [
     command.name,
     command.title,
     command.description,
-    ...command.aliases,
   ].map(normalize);
   let best = -1;
   for (const field of fields) {
@@ -50,9 +44,6 @@ function commandScore(
       const fuzzy = subsequenceScore(field, query);
       if (fuzzy >= 0) best = Math.max(best, 300 + fuzzy);
     }
-  }
-  if (best >= 0 && recentRank !== undefined) {
-    best += Math.max(0, 40 - recentRank);
   }
   return best;
 }

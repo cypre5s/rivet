@@ -13,8 +13,6 @@ export interface RivetTheme {
   selection: string;
 }
 
-export type ThemeName = "dark" | "light";
-
 export const DARK_THEME: RivetTheme = {
   background: "#090909",
   surface: "#171717",
@@ -30,25 +28,7 @@ export const DARK_THEME: RivetTheme = {
   selection: "#173c43",
 };
 
-export const LIGHT_THEME: RivetTheme = {
-  background: "#f5f5f3",
-  surface: "#ffffff",
-  surfaceHover: "#ececea",
-  textPrimary: "#202020",
-  textSecondary: "#5f5f5f",
-  textMuted: "#8b8b8b",
-  accent: "#087f8c",
-  border: "#d5d5d2",
-  success: "#2f7d4a",
-  warning: "#946b18",
-  danger: "#b04444",
-  selection: "#d5eef1",
-};
-
-export function createTheme(
-  noColor: boolean,
-  name: ThemeName = "dark",
-): RivetTheme {
+export function createTheme(noColor: boolean): RivetTheme {
   if (noColor) {
     return {
       background: "black",
@@ -65,5 +45,5 @@ export function createTheme(
       selection: "gray",
     };
   }
-  return name === "light" ? LIGHT_THEME : DARK_THEME;
+  return DARK_THEME;
 }

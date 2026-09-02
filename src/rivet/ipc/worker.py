@@ -11,11 +11,20 @@ from typing import BinaryIO, Protocol, runtime_checkable
 from pydantic import JsonValue
 
 from rivet.contracts.common import ErrorDetail
-from rivet.contracts.ipc import IpcCancel, IpcEvent, IpcRequest, IpcResponse
+from rivet.contracts.ipc import (
+    IPC_APPLICATION_METHODS,
+    IpcCancel,
+    IpcEvent,
+    IpcRequest,
+    IpcResponse,
+)
 from rivet.ipc.codec import MAX_IPC_LINE_BYTES, IpcProtocolError, decode_ipc_line
 
 WriteMessage = Callable[[str], Awaitable[None]]
 EmitEvent = Callable[[str, dict[str, JsonValue]], Awaitable[None]]
+MAX_IPC_OUTBOUND_BYTES = MAX_IPC_LINE_BYTES
+DEFAULT_MAX_PENDING_REQUESTS = 64
+DEFAULT_MAX_REQUEST_IDS = 100_000
 
 
 class WorkerMethodError(RuntimeError):
@@ -71,7 +80,7 @@ class ClosableWorkerApplication(Protocol):
 
 
 class BaseWorkerApplication:
-    """提供不执行 Agent 副作用的健康检查与初始快照。"""
+    """提供不执行 Agent 副作用的握手首屏状态。"""
 
     def __init__(self, repository: Path) -> None:
         self._repository = repository.resolve(strict=True)
@@ -92,23 +101,7 @@ class BaseWorkerApplication:
         emit: EmitEvent,
         cancel_event: asyncio.Event,
     ) -> JsonValue:
-        """处理基础方法；未知业务命令明确留给 Phase 13 网关。"""
-        if request.method == "worker.ping":
-            return "pong"
-        if request.method == "worker.snapshot":
-            return {
-                "connection": "ready",
-                "repository": str(self._repository),
-                "phase": "IDLE",
-                "inspector_tabs": [
-                    "Plan",
-                    "Context",
-                    "Diff",
-                    "Verify",
-                    "Evidence",
-                    "Modules",
-                ],
-            }
+        """基础应用不公开握手与关闭以外的业务方法。"""
         raise WorkerMethodError(
             "ipc.method_unknown",
             "Worker 方法未注册",
@@ -125,15 +118,23 @@ class WorkerSession:
         *,
         write_message: WriteMessage,
         application: WorkerApplication | None = None,
+        max_pending_requests: int = DEFAULT_MAX_PENDING_REQUESTS,
+        max_request_ids: int = DEFAULT_MAX_REQUEST_IDS,
     ) -> None:
+        if max_pending_requests < 1 or max_request_ids < 2:
+            raise ValueError("Worker 请求边界必须为正，且至少容纳握手与关闭")
         self._repository = repository.resolve(strict=True)
         self._write_message = write_message
         self._application = application or BaseWorkerApplication(self._repository)
         self._pending: dict[str, tuple[asyncio.Task[None], asyncio.Event]] = {}
         self._seen_request_ids: set[str] = set()
+        self._max_pending_requests = max_pending_requests
+        self._max_request_ids = max_request_ids
         self._handshaken = False
         self._sequence = 0
         self._event_counter = 0
+        self._event_lock = asyncio.Lock()
+        self._write_lock = asyncio.Lock()
         self.shutdown_requested = False
 
     async def receive(self, line: bytes) -> None:
@@ -149,10 +150,7 @@ class WorkerSession:
                     next_action="升级客户端或检查 IPC 输入",
                 )
             return
-        if isinstance(message, IpcCancel):
-            await self._cancel(message)
-            return
-        if not isinstance(message, IpcRequest):
+        if not isinstance(message, (IpcRequest, IpcCancel)):
             return
         if message.request_id in self._seen_request_ids:
             await self._send_error(
@@ -162,9 +160,21 @@ class WorkerSession:
                 next_action="为每次请求生成新的 ID",
             )
             return
+        if len(self._seen_request_ids) >= self._max_request_ids:
+            await self._send_error(
+                message.request_id,
+                code="ipc.connection_request_limit",
+                summary="当前 Worker 连接已达到请求上限",
+                next_action="重新连接 Worker 后继续",
+            )
+            self.shutdown_requested = True
+            return
         self._seen_request_ids.add(message.request_id)
         if not self._handshaken:
-            if message.method != "worker.handshake":
+            if (
+                not isinstance(message, IpcRequest)
+                or message.method != "worker.handshake"
+            ):
                 await self._send_error(
                     message.request_id,
                     code="ipc.handshake_required",
@@ -173,6 +183,9 @@ class WorkerSession:
                 )
                 return
             await self._handshake(message)
+            return
+        if isinstance(message, IpcCancel):
+            await self._cancel(message)
             return
         if message.method == "worker.handshake":
             await self._send_error(
@@ -183,9 +196,26 @@ class WorkerSession:
             )
             return
         if message.method == "worker.shutdown":
+            if message.params:
+                await self._send_error(
+                    message.request_id,
+                    code="ipc.params_invalid",
+                    summary="worker.shutdown 不接受参数",
+                    next_action="发送空 params 后重试",
+                )
+                return
             await self._send_success(message.request_id, {"status": "stopping"})
             await self.emit("worker.stopping", {})
             self.shutdown_requested = True
+            return
+        if len(self._pending) >= self._max_pending_requests:
+            await self._send_error(
+                message.request_id,
+                code="ipc.backpressure",
+                summary="Worker 在途请求已达到上限",
+                next_action="等待现有请求完成或取消后重试",
+                retryable=True,
+            )
             return
         cancel_event = asyncio.Event()
         task = asyncio.create_task(self._run_request(message, cancel_event))
@@ -198,15 +228,23 @@ class WorkerSession:
 
     async def emit(self, event_type: str, payload: dict[str, JsonValue]) -> None:
         """按单调 sequence 发布一个可由 reducer 消费的事件。"""
-        event = IpcEvent(
-            event_id=f"event_worker_{self._event_counter:08d}",
-            event_type=event_type,
-            sequence=self._sequence,
-            payload=payload,
-        )
-        self._event_counter += 1
-        self._sequence += 1
-        await self._write(event.model_dump_json() + "\n")
+        async with self._event_lock:
+            event = IpcEvent(
+                event_id=f"event_worker_{self._event_counter:08d}",
+                event_type=event_type,
+                sequence=self._sequence,
+                payload=payload,
+            )
+            line = event.model_dump_json() + "\n"
+            if len(line.encode("utf-8")) > MAX_IPC_OUTBOUND_BYTES:
+                raise WorkerMethodError(
+                    "ipc.event_too_large",
+                    "Worker 事件超过消息上限",
+                    "缩小请求范围或使用 headless 命令查看完整产物",
+                )
+            await self._write(line)
+            self._event_counter += 1
+            self._sequence += 1
 
     async def close(self) -> None:
         """有界取消所有在途请求并等待任务回收。"""
@@ -222,6 +260,23 @@ class WorkerSession:
 
     async def _handshake(self, request: IpcRequest) -> None:
         """返回协议能力后才把连接标记为可用。"""
+        client = request.params.get("client")
+        if set(request.params) - {"client"} or (
+            client is not None
+            and (
+                not isinstance(client, str)
+                or not client
+                or len(client) > 128
+                or "\x00" in client
+            )
+        ):
+            await self._send_error(
+                request.request_id,
+                code="ipc.params_invalid",
+                summary="worker.handshake 参数无效",
+                next_action="仅发送可选的有界 client 名称",
+            )
+            return
         self._handshaken = True
         await self._send_success(
             request.request_id,
@@ -231,10 +286,10 @@ class WorkerSession:
                 "capabilities": [
                     "events",
                     "cancel",
-                    "snapshot",
                     "commands",
                     "permissions",
                 ],
+                "methods": list(IPC_APPLICATION_METHODS),
             },
         )
         payload: dict[str, JsonValue] = {
@@ -257,6 +312,7 @@ class WorkerSession:
                 emit=self.emit,
                 cancel_event=cancel_event,
             )
+            await self._send_success(request.request_id, result)
         except asyncio.CancelledError:
             await self._send_error(
                 request.request_id,
@@ -278,10 +334,8 @@ class WorkerSession:
                 request.request_id,
                 code="ipc.worker_internal",
                 summary="Worker 发生已脱敏内部错误",
-                next_action="查看 stderr 诊断并恢复会话",
+                next_action="查看 stderr 诊断并重新启动 Worker",
             )
-        else:
-            await self._send_success(request.request_id, result)
 
     async def _cancel(self, message: IpcCancel) -> None:
         """只取消明确目标，不把未知目标视为成功。"""
@@ -311,7 +365,16 @@ class WorkerSession:
     async def _send_success(self, request_id: str, result: JsonValue) -> None:
         """发送带原请求 ID 的成功响应。"""
         response = IpcResponse(request_id=request_id, ok=True, result=result)
-        await self._write(response.model_dump_json() + "\n")
+        line = response.model_dump_json() + "\n"
+        if len(line.encode("utf-8")) > MAX_IPC_OUTBOUND_BYTES:
+            await self._send_error(
+                request_id,
+                code="ipc.response_too_large",
+                summary="Worker 响应超过消息上限",
+                next_action="缩小请求范围或使用 headless 命令查看完整产物",
+            )
+            return
+        await self._write(line)
 
     async def _send_error(
         self,
@@ -339,7 +402,14 @@ class WorkerSession:
 
     async def _write(self, message: str) -> None:
         """确保每次只把完整协议行交给唯一 writer。"""
-        await self._write_message(message)
+        if len(message.encode("utf-8")) > MAX_IPC_OUTBOUND_BYTES:
+            raise WorkerMethodError(
+                "ipc.output_too_large",
+                "Worker 输出超过消息上限",
+                "缩小请求范围后重试",
+            )
+        async with self._write_lock:
+            await self._write_message(message)
 
 
 async def run_stdio_worker(repository: Path) -> int:

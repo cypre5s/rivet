@@ -8,51 +8,37 @@ import type {
 import type { CommandSearchResult } from "../ui/command-search.ts";
 import type { CommandArgumentRequest } from "../ui/commands.ts";
 import { slashQuery } from "../ui/commands.ts";
-import type { ConfigurationDraft } from "../ui/runtime-config.ts";
-import { CommandPalette } from "./command-palette.tsx";
-import { ConfigDialog } from "./config-dialog.tsx";
 import { ConfirmDialog } from "./confirm-dialog.tsx";
 import { FilePicker } from "./file-picker.tsx";
 import { InfoOverlay } from "./info-overlay.tsx";
-import { LeaderHelp } from "./leader-help.tsx";
 import { OptionPicker, type PickerOption } from "./option-picker.tsx";
 import { PermissionModal } from "./permission-modal.tsx";
+import { SlashMenu } from "./slash-menu.tsx";
 import type { RivetTheme } from "./theme.ts";
 
 export interface OverlayDisplayState {
   topOverlay: Overlay | null;
   input: string;
-  overlayQuery: string;
   fileQuery: string;
   slashResults: CommandSearchResult[];
-  paletteResults: CommandSearchResult[];
   files: string[];
-  historyOptions: PickerOption[];
   modelOptions: PickerOption[];
   argumentRequest: CommandArgumentRequest | null;
   argumentOptions: PickerOption[];
   selectedIndex: number;
   filesLoading: boolean;
-  contextFiles: string[];
+  selectedFiles: string[];
   notice: string | null;
-  configurationDraft: ConfigurationDraft;
-  configurationErrors: string[];
-  configurationSaving: boolean;
 }
 
 export interface OverlayActions {
-  queryPalette(value: string): void;
   queryFiles(value: string): void;
   queryArgument(commandName: string, value: string): void;
   selectCommand(command: CommandDescriptor): void;
   selectFile(path: string): void;
-  selectHistory(option: PickerOption): void;
   selectModel(option: PickerOption): void;
   selectArgument(commandName: string, option: PickerOption): void;
   hover(index: number): void;
-  changeConfiguration(draft: ConfigurationDraft): void;
-  saveConfiguration(): void;
-  closeConfiguration(): void;
 }
 
 export function AppOverlays({
@@ -75,25 +61,15 @@ export function AppOverlays({
   const overlay = display.topOverlay;
   return (
     <>
-      {overlay?.kind === "palette" || overlay?.kind === "slash" ? (
-        <CommandPalette
-          variant={overlay.kind}
-          query={
-            overlay.kind === "slash"
-              ? slashQuery(display.input) ?? ""
-              : display.overlayQuery
-          }
-          results={
-            overlay.kind === "slash"
-              ? display.slashResults
-              : display.paletteResults
-          }
+      {overlay?.kind === "slash" ? (
+        <SlashMenu
+          query={slashQuery(display.input) ?? ""}
+          results={display.slashResults}
           selectedIndex={display.selectedIndex}
           context={commandContext}
           compact={compact}
           viewportHeight={viewportHeight}
           theme={theme}
-          onQuery={actions.queryPalette}
           onSelect={actions.selectCommand}
           onHover={actions.hover}
         />
@@ -104,7 +80,7 @@ export function AppOverlays({
           files={display.files}
           selectedIndex={display.selectedIndex}
           loading={display.filesLoading}
-          selectedPaths={display.contextFiles}
+          selectedPaths={display.selectedFiles}
           compact={compact}
           viewportHeight={viewportHeight}
           theme={theme}
@@ -113,48 +89,19 @@ export function AppOverlays({
           onHover={actions.hover}
         />
       ) : null}
-      {overlay?.kind === "history" ? (
-        <OptionPicker
-          title="历史"
-          placeholder="搜索"
-          query={display.overlayQuery}
-          options={display.historyOptions}
-          selectedIndex={display.selectedIndex}
-          compact={compact}
-          viewportHeight={viewportHeight}
-          theme={theme}
-          onQuery={actions.queryPalette}
-          onSelect={actions.selectHistory}
-          onHover={actions.hover}
-        />
-      ) : null}
       {overlay?.kind === "models" ? (
         <OptionPicker
           title="模型"
           placeholder="搜索"
-          query={display.overlayQuery}
+          query=""
           options={display.modelOptions}
           selectedIndex={display.selectedIndex}
           compact={compact}
           viewportHeight={viewportHeight}
           theme={theme}
-          onQuery={actions.queryPalette}
+          onQuery={() => {}}
           onSelect={actions.selectModel}
           onHover={actions.hover}
-        />
-      ) : null}
-      {overlay?.kind === "config" ? (
-        <ConfigDialog
-          draft={display.configurationDraft}
-          credentialConfigured={state.credentialConfigured}
-          errors={display.configurationErrors}
-          saving={display.configurationSaving}
-          compact={compact}
-          viewportHeight={viewportHeight}
-          theme={theme}
-          onChange={actions.changeConfiguration}
-          onSave={actions.saveConfiguration}
-          onClose={actions.closeConfiguration}
         />
       ) : null}
       {overlay?.kind === "arguments" && display.argumentRequest !== null ? (
@@ -168,13 +115,10 @@ export function AppOverlays({
           viewportHeight={viewportHeight}
           theme={theme}
           onQuery={(value) => actions.queryArgument(overlay.commandName, value)}
-          onSelect={(option) =>
-            actions.selectArgument(overlay.commandName, option)
-          }
+          onSelect={(option) => actions.selectArgument(overlay.commandName, option)}
           onHover={actions.hover}
         />
       ) : null}
-      {overlay?.kind === "leader" ? <LeaderHelp theme={theme} /> : null}
       {overlay?.kind === "info" ? (
         <InfoOverlay
           title={overlay.title}
@@ -186,9 +130,9 @@ export function AppOverlays({
       ) : null}
       {overlay?.kind === "confirm" ? (
         <ConfirmDialog
-          title={overlay.title ?? overlay.command.title}
-          description={overlay.description ?? overlay.command.description}
-          impact={overlay.impact ?? dangerousImpact(overlay.command.name, state)}
+          title={overlay.command.title}
+          description={overlay.command.description}
+          impact={dangerousImpact(overlay.command.name, state)}
           compact={compact}
           viewportHeight={viewportHeight}
           theme={theme}

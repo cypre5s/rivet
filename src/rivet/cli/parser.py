@@ -1,4 +1,4 @@
-"""构造正式命令、全局选项和严格 argparse 输入边界。"""
+"""构造极简公开 CLI 与隐藏 IPC Worker 入口。"""
 
 from __future__ import annotations
 
@@ -9,29 +9,18 @@ from pathlib import Path
 OFFICIAL_COMMANDS = (
     "init",
     "ask",
-    "read",
-    "plan",
     "fix",
-    "verify",
     "diff",
+    "verify",
     "apply",
     "abort",
-    "trace",
-    "resume",
-    "modules",
-    "doctor",
-    "benchmark",
-    "config",
-    "clean",
-    "export",
 )
 
 
 def build_parser() -> ArgumentParser:
-    """返回同时支持 TUI 默认入口和全部 headless 子命令的解析器。"""
     parser = ArgumentParser(
         prog="rivet",
-        description="可靠、可审计的本地编程智能体",
+        description="Demand-driven、Evidence-gated 的本地 Coding Agent",
     )
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {version('rivet')}"
@@ -42,22 +31,21 @@ def build_parser() -> ArgumentParser:
     parser.add_argument(
         "--headless",
         action="store_true",
-        help="不启动 TUI，仅使用命令行接口",
+        help="不启动 TUI；未给子命令时显示帮助",
     )
     parser.add_argument("--model")
     parser.add_argument("--base-url")
     parser.add_argument("--max-rounds", type=int)
     parser.add_argument("--max-total-tokens", type=int)
     parser.add_argument("--max-cost-usd")
-    parser.add_argument("--safe-mode", action="store_true", default=None)
     subparsers = parser.add_subparsers(dest="command")
 
-    init_parser = subparsers.add_parser("init", help="初始化项目配置")
+    init_parser = subparsers.add_parser("init", help="建立独立 Evidence oracle")
     init_parser.add_argument("path", nargs="?", type=Path)
     init_parser.add_argument(
         "--yes",
         action="store_true",
-        help="确认把只读检测建议写入 .rivet/project.toml",
+        help="写入只读检测建议；acceptance 仍须由用户填写",
     )
     _add_runtime_aliases(init_parser)
 
@@ -65,140 +53,64 @@ def build_parser() -> ArgumentParser:
     ask_parser.add_argument("query")
     _add_runtime_aliases(ask_parser)
 
-    read_parser = subparsers.add_parser("read", help="安全读取本地文件")
-    read_parser.add_argument("file", type=Path)
-    read_parser.add_argument("--ocr", action="store_true")
-    read_parser.add_argument("--transcribe", action="store_true")
-    read_parser.add_argument("--frames", type=int, default=20)
-    read_parser.add_argument("--max-ocr-pages", type=int, default=100)
-    read_parser.add_argument("--max-image-pixels", type=int, default=40_000_000)
-    read_parser.add_argument("--max-audio-duration", type=int, default=14_400)
-    read_parser.add_argument("--max-output-chars", type=int, default=1_000_000)
-    read_parser.add_argument("--timeout", type=int, default=30)
-    _add_runtime_aliases(read_parser)
-
-    plan_parser = subparsers.add_parser("plan", help="生成可验证计划")
-    plan_parser.add_argument("task")
-    _add_runtime_aliases(plan_parser)
-
-    fix_parser = subparsers.add_parser("fix", help="在隔离事务中修复代码")
+    fix_parser = subparsers.add_parser("fix", help="隔离修改并独立验证")
     fix_parser.add_argument("task")
-    fix_parser.add_argument("--yes", action="store_true")
     fix_parser.add_argument(
-        "--candidate-only",
+        "--yes",
         action="store_true",
-        help="仅生成不可 Apply 的候选补丁，跳过独立 Verify 与 Evidence",
+        help="确认显示的 AcceptanceSpec 和限定写范围",
+    )
+    fix_parser.add_argument(
+        "--allow-read",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="允许只读调查的现有仓库相对文件或目录；可重复",
     )
     fix_parser.add_argument(
         "--allow-write",
         action="append",
         default=[],
         metavar="PATH",
-        help="显式授权本任务可修改的仓库相对文件或目录；可重复",
+        help="允许修改的现有仓库相对文件或目录；可重复",
     )
     fix_parser.add_argument(
-        "--dirty-policy",
-        choices=("reject", "snapshot"),
-        default="reject",
+        "--allow-new",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="允许新建的仓库相对文件或目录；可重复",
+    )
+    fix_parser.add_argument(
+        "--acceptance-sha256",
+        help="确认前一次只读提案返回的 AcceptanceSpec 哈希",
+    )
+    fix_parser.add_argument(
+        "--base-commit",
+        help="确认前一次只读调查绑定的 Git 基线提交",
     )
     _add_runtime_aliases(fix_parser)
 
-    for command, description in (
-        ("verify", "验证事务补丁"),
-        ("diff", "查看事务补丁"),
+    for command, help_text in (
+        ("diff", "查看隔离事务补丁"),
+        ("verify", "重新独立验证事务"),
     ):
-        command_parser = subparsers.add_parser(command, help=description)
-        command_parser.add_argument("transaction_id", nargs="?")
-        _add_runtime_aliases(command_parser)
+        child = subparsers.add_parser(command, help=help_text)
+        child.add_argument("transaction_id", nargs="?")
+        _add_runtime_aliases(child)
 
-    apply_parser = subparsers.add_parser("apply", help="显式应用已验证补丁")
-    apply_parser.add_argument("transaction_id")
-    _add_runtime_aliases(apply_parser)
-
-    abort_parser = subparsers.add_parser("abort", help="终止并清理事务")
-    abort_parser.add_argument("transaction_id")
-    _add_runtime_aliases(abort_parser)
-
-    trace_parser = subparsers.add_parser("trace", help="回放结构化执行轨迹")
-    trace_parser.add_argument("run_id", nargs="?")
-    _add_runtime_aliases(trace_parser)
-
-    export_parser = subparsers.add_parser(
-        "export", help="原子导出 Evidence、Trace 或 Session"
-    )
-    export_parser.add_argument("kind", choices=("evidence", "trace", "session"))
-    export_parser.add_argument("path", nargs="?", type=Path)
-    _add_runtime_aliases(export_parser)
-
-    resume_parser = subparsers.add_parser("resume", help="恢复持久化会话")
-    resume_parser.add_argument("session_id")
-    resume_parser.add_argument(
-        "--yes",
-        action="store_true",
-        help="重新批准中断 fix 的事务写入与验证",
-    )
-    _add_runtime_aliases(resume_parser)
-
-    modules_parser = subparsers.add_parser("modules", help="查看或配置能力策略")
-    _add_runtime_aliases(modules_parser)
-    module_subparsers = modules_parser.add_subparsers(dest="module_command")
-    module_list_parser = module_subparsers.add_parser("list", help="列出模块状态")
-    _add_runtime_aliases(module_list_parser)
-    module_show_parser = module_subparsers.add_parser("show", help="查看模块详情")
-    module_show_parser.add_argument("module_id")
-    _add_runtime_aliases(module_show_parser)
-    module_enable_parser = module_subparsers.add_parser("enable", help="持久化启用模块")
-    module_enable_parser.add_argument("module_id")
-    module_enable_parser.add_argument("--with-dependencies", action="store_true")
-    _add_runtime_aliases(module_enable_parser)
-    module_disable_parser = module_subparsers.add_parser(
-        "disable",
-        help="安全释放并持久化禁用能力",
-    )
-    module_disable_parser.add_argument("module_id")
-    module_disable_parser.add_argument("--cascade", action="store_true")
-    module_disable_parser.add_argument("--wait", action="store_true")
-    module_disable_parser.add_argument("--timeout", type=float, default=30.0)
-    module_disable_parser.add_argument("--yes", action="store_true")
-    _add_runtime_aliases(module_disable_parser)
-
-    doctor_parser = subparsers.add_parser("doctor", help="检测本地运行依赖")
-    doctor_parser.add_argument(
-        "--section",
-        choices=("all", "core", "tui", "sandbox", "readers", "lsp", "provider"),
-        default="all",
-    )
-    _add_runtime_aliases(doctor_parser)
-
-    benchmark_parser = subparsers.add_parser("benchmark", help="运行本地评测套件")
-    benchmark_parser.add_argument(
-        "--suite",
-        choices=(
-            "context-smoke",
-            "context-full",
-            "security",
-            "functional",
-            "faults",
-            "performance",
-            "all",
-        ),
-        default="context-smoke",
-    )
-    _add_runtime_aliases(benchmark_parser)
-
-    config_parser = subparsers.add_parser("config", help="查看非秘密有效配置")
-    config_parser.add_argument("--show-sources", action="store_true")
-    _add_runtime_aliases(config_parser)
-
-    clean_parser = subparsers.add_parser("clean", help="清理 Rivet 自有临时资源")
-    clean_parser.add_argument("--dry-run", action="store_true")
-    _add_runtime_aliases(clean_parser)
-
+    for command, help_text in (
+        ("apply", "显式应用 VERIFIED 补丁"),
+        ("abort", "终止并清理事务"),
+    ):
+        child = subparsers.add_parser(command, help=help_text)
+        child.add_argument("transaction_id")
+        _add_runtime_aliases(child)
     return parser
 
 
 def build_internal_parser() -> ArgumentParser:
-    """构造不进入公开帮助的版本化 Worker 入口。"""
+    """构造不出现在公开帮助中的版本化 Worker 入口。"""
     parser = ArgumentParser(prog="rivet internal")
     parser.set_defaults(
         command="internal",
@@ -207,18 +119,15 @@ def build_internal_parser() -> ArgumentParser:
         json_output=False,
     )
     subparsers = parser.add_subparsers(dest="internal_command", required=True)
-    worker_parser = subparsers.add_parser("worker")
-    worker_parser.add_argument("--stdio", action="store_true", required=True)
-    worker_parser.add_argument("--repository", type=Path, default=Path.cwd())
+    worker = subparsers.add_parser("worker")
+    worker.add_argument("--stdio", action="store_true", required=True)
+    worker.add_argument("--repository", type=Path, default=Path.cwd())
     return parser
 
 
 def _add_runtime_aliases(parser: ArgumentParser) -> None:
-    """兼容把仓库和 JSON 选项放在子命令后的常见写法。"""
+    """允许仓库和 JSON 选项位于子命令之后。"""
     parser.add_argument("--repository", type=Path, default=SUPPRESS)
     parser.add_argument(
-        "--json",
-        action="store_true",
-        dest="json_output",
-        default=SUPPRESS,
+        "--json", action="store_true", dest="json_output", default=SUPPRESS
     )

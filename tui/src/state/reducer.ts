@@ -4,10 +4,7 @@ import {
   type TimelineKind,
   type TimelineStatus,
 } from "../ui/event-presenter.ts";
-import type { PanelName } from "../ui/command-registry.ts";
-
 export type ConnectionState = "connecting" | "ready" | "crashed";
-export type InspectorTab = PanelName;
 
 export interface TimelineItem {
   eventId: string;
@@ -17,12 +14,30 @@ export interface TimelineItem {
   detail: string;
   kind: TimelineKind;
   status: TimelineStatus;
+  demandId: string | null;
+  operationId: string | null;
+  parentEventId: string | null;
+  parentDemandId: string | null;
 }
 
 export interface PermissionPrompt {
   requestId: string;
   permission: string;
   reason: string;
+  goal: string;
+  readScope: string[];
+  writeScope: string[];
+  allowedNewPaths: string[];
+  forbiddenPaths: string[];
+  expectedBehaviors: string[];
+  preservedBehaviors: string[];
+  acceptanceCommands: string[][];
+  regressionCommands: string[][];
+  budgets: PermissionBudgets;
+  investigation: string;
+  proposalRunId: string;
+  acceptanceSha256: string;
+  baseCommit: string;
   argv: string;
   cwd: string;
   paths: string;
@@ -30,27 +45,11 @@ export interface PermissionPrompt {
   timeoutSeconds: number;
 }
 
-export interface ModuleStatus {
-  moduleId: string;
-  policy: string;
-  availability: string;
-  missingComponents?: string[];
-  availabilityAction?: string | null;
-  manifestDefaultEnabled: boolean;
-  persistedOverride: boolean | null;
-  configuredEnabled: boolean;
-  effectiveEnabled: boolean;
-  runtimeState: string;
-  activation: string;
-  scope: string;
-  manualControl: boolean;
-  sleepPolicy: string;
-  dependencies: string[];
-  dependents: string[];
-  providedCapabilities: string[];
-  leaseCount: number;
-  activeResourceCount: number;
-  lastError: string | null;
+export interface PermissionBudgets {
+  maxWallSeconds: number;
+  maxTokens: number;
+  maxToolCalls: number;
+  maxCostUsd: string | number | null;
 }
 
 export interface TransactionSummary {
@@ -93,11 +92,11 @@ export interface EvidenceSummary {
   evidenceVerified: boolean;
   evidenceId: string | null;
   patchId: string | null;
+  baseCommit: string;
   acceptanceSha256: string;
   patchSha256: string;
   manifestSha256: string;
   changedFiles: string[];
-  changedSymbols: string[];
   verificationResults: VerificationSummary[];
   files: EvidenceFileSummary[];
   updatedAt: string;
@@ -116,49 +115,25 @@ export interface EvidenceLog {
   truncated: boolean;
 }
 
-export interface VerificationSuggestion {
-  kind: string;
-  category: string;
-  argv: string[];
-}
-
 export interface RivetState {
   connection: ConnectionState;
   repository: string;
   branch: string;
   model: string;
   models: string[];
-  baseUrl: string;
-  maxRounds: number;
-  maxTotalTokens: number;
-  maxCostUsd: string | null;
-  safeMode: boolean;
-  configSources: Record<string, string>;
   credentialConfigured: boolean;
   acceptanceReady: boolean;
-  acceptanceReason: string;
-  acceptanceAction: string;
-  projectKinds: string[];
-  verificationSuggestions: VerificationSuggestion[];
-  sessionId: string | null;
-  sessions: string[];
   transaction: string;
   transactions: TransactionSummary[];
-  plan: { phase: string; summary: string };
-  context: Array<{ path: string; reason: string }>;
   fileTree: string[];
   diff: string;
   verifyStatus: string;
   evidenceId: string;
   evidence: EvidenceSummary | null;
   evidenceLog: EvidenceLog | null;
-  taskModules: string[];
-  moduleStatuses: ModuleStatus[];
   permission: PermissionPrompt | null;
-  budget: { tokens: number; costUsd: number; elapsedMs: number };
   error: string | null;
   timeline: TimelineItem[];
-  inspectorTab: InspectorTab;
   lastSequence: number;
 }
 
@@ -171,7 +146,6 @@ export type RivetAction =
     }
   | { kind: "local-error"; summary: string }
   | { kind: "local-message"; summary: string }
-  | { kind: "configuration-loaded"; payload: Record<string, JsonValue> }
   | { kind: "timeline-clear" };
 
 const MAX_TIMELINE_ITEMS = 500;
@@ -183,37 +157,19 @@ export function initialRivetState(): RivetState {
     branch: "",
     model: "未连接",
     models: ["deepseek-v4-pro", "deepseek-v4-flash"],
-    baseUrl: "https://api.deepseek.com",
-    maxRounds: 24,
-    maxTotalTokens: 128_000,
-    maxCostUsd: null,
-    safeMode: false,
-    configSources: {},
     credentialConfigured: false,
     acceptanceReady: false,
-    acceptanceReason: "尚未完成 Evidence 预检",
-    acceptanceAction: "运行 rivet init 查看项目检测建议",
-    projectKinds: [],
-    verificationSuggestions: [],
-    sessionId: null,
-    sessions: [],
     transaction: "无",
     transactions: [],
-    plan: { phase: "IDLE", summary: "等待任务" },
-    context: [],
     fileTree: [],
     diff: "",
     verifyStatus: "未验证",
     evidenceId: "无",
     evidence: null,
     evidenceLog: null,
-    taskModules: [],
-    moduleStatuses: [],
     permission: null,
-    budget: { tokens: 0, costUsd: 0, elapsedMs: 0 },
     error: null,
     timeline: [],
-    inspectorTab: "Plan",
     lastSequence: -1,
   };
 }
@@ -226,12 +182,9 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
     timeline: appendTimeline(state.timeline, event),
   };
   switch (event.event_type) {
-    case "run.started":
-    case "run.resumed":
-      return { ...next, taskModules: [] };
     case "worker.ready":
     case "worker.recovered":
-      return projectConfiguration(
+      return projectState(
         {
           ...next,
           connection: "ready",
@@ -241,51 +194,14 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
         },
         event.payload,
       );
-    case "config.updated":
-      return projectConfiguration(next, event.payload);
     case "worker.crashed":
       return {
         ...next,
         connection: "crashed",
         error: text(event.payload.summary, "Worker 已退出"),
       };
-    case "plan.updated":
-      return {
-        ...next,
-        plan: {
-          phase: text(event.payload.phase, state.plan.phase),
-          summary: text(event.payload.summary, state.plan.summary),
-        },
-      };
-    case "context.selected":
-      return {
-        ...next,
-        context: [
-          ...state.context,
-          {
-            path: text(event.payload.path, "未知路径"),
-            reason: text(event.payload.reason, "未说明"),
-          },
-        ],
-      };
     case "workspace.tree_updated":
       return { ...next, fileTree: stringArray(event.payload.paths) };
-    case "session.updated": {
-      const sessionId = text(event.payload.session_id, "");
-      if (!sessionId) return next;
-      return {
-        ...next,
-        sessionId,
-        sessions: [sessionId, ...state.sessions.filter((item) => item !== sessionId)],
-      };
-    }
-    case "sessions.snapshot": {
-      const sessions = stringArray(event.payload.sessions);
-      if (state.sessionId !== null && !sessions.includes(state.sessionId)) {
-        sessions.unshift(state.sessionId);
-      }
-      return { ...next, sessions };
-    }
     case "transaction.started":
       return {
         ...next,
@@ -302,11 +218,6 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       return {
         ...next,
         verifyStatus: text(event.payload.status, "UNKNOWN"),
-      };
-    case "candidate.ready":
-      return {
-        ...next,
-        verifyStatus: "CANDIDATE_ONLY",
       };
     case "evidence.published":
       return {
@@ -334,65 +245,6 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
         ...next,
         evidenceLog: evidenceLog(event.payload),
       };
-    case "module.activated": {
-      const moduleId = text(event.payload.module_id, "");
-      if (moduleId.length === 0 || state.taskModules.includes(moduleId)) return next;
-      return { ...next, taskModules: [...state.taskModules, moduleId] };
-    }
-    case "module.released": {
-      const moduleId = text(event.payload.module_id, "");
-      if (number(event.payload.lease_count, 0) > 0) return next;
-      return {
-        ...next,
-        taskModules: state.taskModules.filter((item) => item !== moduleId),
-      };
-    }
-    case "module.slept": {
-      const moduleId = text(event.payload.module_id, "");
-      return {
-        ...next,
-        taskModules: state.taskModules.filter((item) => item !== moduleId),
-      };
-    }
-    case "module.state.changed":
-    case "module.enablement.changed":
-    case "module.operation.completed": {
-      const moduleId = text(event.payload.module_id, "");
-      if (!moduleId) return next;
-      const statuses = state.moduleStatuses.map((status) =>
-        status.moduleId === moduleId
-          ? {
-              ...status,
-              configuredEnabled:
-                event.event_type === "module.operation.completed"
-                  ? text(event.payload.operation, "") === "enable"
-                    ? true
-                    : text(event.payload.operation, "") === "disable"
-                      ? false
-                      : status.configuredEnabled
-                  : status.configuredEnabled,
-              runtimeState: text(event.payload.current_state, status.runtimeState),
-              effectiveEnabled: boolean(
-                event.payload.effective_enabled,
-                status.effectiveEnabled,
-              ),
-              policy:
-                status.policy === "LOCKED"
-                  ? "LOCKED"
-                  : text(event.payload.operation, "") === "enable"
-                    ? "ENABLED"
-                    : text(event.payload.operation, "") === "disable"
-                      ? "DISABLED"
-                      : status.policy,
-            }
-          : status,
-      );
-      return { ...next, moduleStatuses: statuses };
-    }
-    case "modules.snapshot": {
-      const statuses = moduleStatusArray(event.payload.modules);
-      return statuses.length === 0 ? next : { ...next, moduleStatuses: statuses };
-    }
     case "permission.requested":
       return { ...next, permission: permissionPrompt(event.payload) };
     case "permission.resolved":
@@ -400,15 +252,6 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
         return next;
       }
       return { ...next, permission: null };
-    case "budget.updated":
-      return {
-        ...next,
-        budget: {
-          tokens: number(event.payload.tokens, state.budget.tokens),
-          costUsd: number(event.payload.cost_usd, state.budget.costUsd),
-          elapsedMs: number(event.payload.elapsed_ms, state.budget.elapsedMs),
-        },
-      };
     case "tool.failed":
       return { ...next, error: text(event.payload.summary, "工具执行失败") };
     case "command.completed":
@@ -430,14 +273,15 @@ export function reduceRivetState(state: RivetState, action: RivetAction): RivetS
       detail: "",
       kind: "user",
       status: "success",
+      demandId: null,
+      operationId: null,
+      parentEventId: null,
+      parentDemandId: null,
     };
     return {
       ...state,
       timeline: [...state.timeline, item].slice(-MAX_TIMELINE_ITEMS),
     };
-  }
-  if (action.kind === "configuration-loaded") {
-    return projectConfiguration(state, action.payload);
   }
   if (action.kind === "local-error") {
     return { ...state, error: action.summary };
@@ -452,7 +296,7 @@ export function reduceRivetState(state: RivetState, action: RivetAction): RivetS
   };
 }
 
-function projectConfiguration(
+function projectState(
   state: RivetState,
   payload: Record<string, JsonValue>,
 ): RivetState {
@@ -461,45 +305,12 @@ function projectConfiguration(
     ...state,
     model: text(payload.model, state.model),
     models: models.length > 0 ? models : state.models,
-    baseUrl: text(payload.base_url, state.baseUrl),
-    maxRounds: number(payload.max_rounds, state.maxRounds),
-    maxTotalTokens: number(payload.max_total_tokens, state.maxTotalTokens),
-    maxCostUsd:
-      payload.max_cost_usd === null
-        ? null
-        : text(payload.max_cost_usd, state.maxCostUsd ?? "") || null,
-    safeMode: boolean(payload.safe_mode, state.safeMode),
     credentialConfigured: boolean(
       payload.credential_configured,
       state.credentialConfigured,
     ),
     acceptanceReady: boolean(payload.acceptance_ready, state.acceptanceReady),
-    acceptanceReason: text(payload.acceptance_reason, state.acceptanceReason),
-    acceptanceAction: text(payload.acceptance_action, state.acceptanceAction),
-    projectKinds:
-      payload.project_kinds === undefined
-        ? state.projectKinds
-        : stringArray(payload.project_kinds),
-    verificationSuggestions:
-      payload.verification_suggestions === undefined
-        ? state.verificationSuggestions
-        : verificationSuggestionArray(payload.verification_suggestions),
-    configSources: stringRecord(payload.sources, state.configSources),
   };
-}
-
-function verificationSuggestionArray(
-  value: JsonValue | undefined,
-): VerificationSuggestion[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item) => {
-    if (item === null || Array.isArray(item) || typeof item !== "object") return [];
-    const suggestion = item as Record<string, JsonValue>;
-    const argv = stringArray(suggestion.argv);
-    const kind = text(suggestion.kind, "");
-    const category = text(suggestion.category, "");
-    return argv.length > 0 && kind && category ? [{ kind, category, argv }] : [];
-  });
 }
 
 function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem[] {
@@ -519,6 +330,10 @@ function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem
         : event.event_id,
     eventType: event.event_type,
     sequence: event.sequence,
+    demandId: text(event.payload.demand_id, "") || null,
+    operationId: text(event.payload.operation_id, "") || null,
+    parentEventId: text(event.payload.parent_event_id, "") || null,
+    parentDemandId: text(event.payload.parent_demand_id, "") || null,
     ...presented,
   };
   if (event.event_type === "agent.output.delta" && responseId) {
@@ -547,11 +362,40 @@ function permissionPrompt(payload: Record<string, JsonValue>): PermissionPrompt 
     requestId: text(payload.request_id, "request_unknown"),
     permission: text(payload.permission, "UNKNOWN"),
     reason: text(payload.reason, "未说明"),
+    goal: text(payload.goal, "未提供 Goal"),
+    readScope: stringArray(payload.read_scope),
+    writeScope: stringArray(payload.write_scope),
+    allowedNewPaths: stringArray(payload.allowed_new_paths),
+    forbiddenPaths: stringArray(payload.forbidden_paths),
+    expectedBehaviors: stringArray(payload.expected_behaviors),
+    preservedBehaviors: stringArray(payload.preserved_behaviors),
+    acceptanceCommands: stringMatrix(payload.acceptance_commands),
+    regressionCommands: stringMatrix(payload.regression_commands),
+    budgets: permissionBudgets(payload.budgets),
+    investigation: text(payload.investigation, "未提供调查结论"),
+    proposalRunId: text(payload.proposal_run_id, ""),
+    acceptanceSha256: text(payload.acceptance_sha256, ""),
+    baseCommit: text(payload.base_commit, ""),
     argv: text(payload.argv, "无"),
     cwd: text(payload.cwd, "."),
     paths: text(payload.paths, "无"),
     network: text(payload.network, "禁用"),
     timeoutSeconds: number(payload.timeout_seconds, 0),
+  };
+}
+
+function permissionBudgets(value: JsonValue | undefined): PermissionBudgets {
+  const payload: Record<string, JsonValue> =
+    value !== null && !Array.isArray(value) && typeof value === "object"
+      ? value as Record<string, JsonValue>
+      : {};
+  const cost = payload.max_cost_usd;
+  return {
+    maxWallSeconds: number(payload.max_wall_seconds, 0),
+    maxTokens: number(payload.max_tokens, 0),
+    maxToolCalls: number(payload.max_tool_calls, 0),
+    maxCostUsd:
+      typeof cost === "string" || typeof cost === "number" ? cost : null,
   };
 }
 
@@ -569,6 +413,14 @@ function boolean(value: JsonValue | undefined, fallback: boolean): boolean {
 
 function stringArray(value: JsonValue | undefined): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function stringMatrix(value: JsonValue | undefined): string[][] {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((item): item is JsonValue[] => Array.isArray(item))
+    .map((item) => item.filter((argument): argument is string => typeof argument === "string"))
+    .filter((command) => command.length > 0);
 }
 
 function transactionSummaryArray(value: JsonValue | undefined): TransactionSummary[] {
@@ -641,11 +493,11 @@ function evidenceSummary(payload: Record<string, JsonValue>): EvidenceSummary | 
     evidenceVerified: boolean(payload.evidence_verified, evidenceId !== null),
     evidenceId,
     patchId: typeof payload.patch_id === "string" ? payload.patch_id : null,
+    baseCommit: text(payload.base_commit, "未提供"),
     acceptanceSha256: text(payload.acceptance_sha256, "未提供"),
     patchSha256: text(payload.patch_sha256, "未提供"),
     manifestSha256: text(payload.manifest_sha256, "未提供"),
     changedFiles: stringArray(payload.changed_files),
-    changedSymbols: stringArray(payload.changed_symbols),
     verificationResults,
     files,
     updatedAt: text(payload.updated_at, ""),
@@ -673,62 +525,4 @@ function evidenceLog(payload: Record<string, JsonValue>): EvidenceLog | null {
     content: text(payload.content, ""),
     truncated: boolean(payload.truncated, false),
   };
-}
-
-function stringRecord(
-  value: JsonValue | undefined,
-  fallback: Record<string, string>,
-): Record<string, string> {
-  if (value === null || Array.isArray(value) || typeof value !== "object") {
-    return fallback;
-  }
-  const result: Record<string, string> = {};
-  for (const [key, item] of Object.entries(value)) {
-    if (typeof item === "string") result[key] = item;
-  }
-  return result;
-}
-
-function moduleStatusArray(value: JsonValue | undefined): ModuleStatus[] {
-  if (!Array.isArray(value)) return [];
-  const statuses: ModuleStatus[] = [];
-  for (const item of value) {
-    if (typeof item !== "object" || item === null || Array.isArray(item)) continue;
-    const moduleId = text(item.module_id, "");
-    if (!moduleId) continue;
-    statuses.push({
-      moduleId,
-      policy: text(
-        item.policy,
-        boolean(item.manual_control, false)
-          ? boolean(item.configured_enabled, false)
-            ? "ENABLED"
-            : "DISABLED"
-          : "LOCKED",
-      ),
-      availability: text(item.availability, "AVAILABLE"),
-      missingComponents: stringArray(item.missing_components),
-      availabilityAction:
-        typeof item.availability_action === "string"
-          ? item.availability_action
-          : null,
-      manifestDefaultEnabled: boolean(item.manifest_default_enabled, false),
-      persistedOverride:
-        typeof item.persisted_override === "boolean" ? item.persisted_override : null,
-      configuredEnabled: boolean(item.configured_enabled, false),
-      effectiveEnabled: boolean(item.effective_enabled, false),
-      runtimeState: text(item.runtime_state, "UNKNOWN"),
-      activation: text(item.activation, "unknown"),
-      scope: text(item.scope, "workspace"),
-      manualControl: boolean(item.manual_control, false),
-      sleepPolicy: text(item.sleep_policy, "unknown"),
-      dependencies: stringArray(item.dependencies),
-      dependents: stringArray(item.dependents),
-      providedCapabilities: stringArray(item.provided_capabilities),
-      leaseCount: number(item.lease_count, 0),
-      activeResourceCount: number(item.active_resource_count, 0),
-      lastError: typeof item.last_error === "string" ? item.last_error : null,
-    });
-  }
-  return statuses;
 }

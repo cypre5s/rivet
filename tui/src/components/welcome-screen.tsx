@@ -27,7 +27,7 @@ export function WelcomeScreen({
         justifyContent="center"
         flexDirection="column"
         paddingX={layout.mode === "minimal" ? 1 : 2}
-        gap={layout.logoSize === "large" ? 2 : 1}
+        gap={1}
       >
         <RivetLogo size={layout.logoSize} theme={theme} />
         <box width={layout.contentWidth} flexDirection="column" gap={1}>
@@ -35,7 +35,7 @@ export function WelcomeScreen({
           {layout.mode === "minimal" ? null : (
             <text
               fg={theme.textMuted}
-              content="Tab · / · @"
+              content="/ 命令 · @ 文件"
             />
           )}
         </box>
@@ -73,7 +73,7 @@ function RivetLogo({
   return (
     <ascii-font
       text="RIVET"
-      font={size === "large" ? "block" : "tiny"}
+      font="tiny"
       color={theme.accent}
       backgroundColor={theme.background}
       selectable={false}

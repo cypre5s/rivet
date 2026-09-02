@@ -8,87 +8,57 @@ import {
 } from "./command-registry.ts";
 import { searchCommands } from "./command-search.ts";
 
-const BASE_CONTEXT: CommandContext = {
+const READY: CommandContext = {
   modelConfigured: true,
   currentModel: "deepseek-v4-pro",
-  hasSession: true,
   transactionId: "tx_one",
   verificationStatus: "PASSED",
   evidenceId: "evidence_one",
   acceptanceReady: true,
 };
 
-describe("unified command registry", () => {
-  test("contains every published operation with unique names and ids", () => {
-    const required = [
-      "new", "sessions", "resume", "clear", "history", "quit",
-      "ask", "plan", "fix", "verify", "diff", "evidence", "apply", "abort",
-      "read", "files", "context", "search", "model", "mode", "modules",
-      "trace", "status", "cost", "init", "doctor", "benchmark", "config",
-      "clean", "help", "keys", "theme", "export",
-    ];
-    const names = COMMAND_REGISTRY.map((command) => command.name);
-    const ids = COMMAND_REGISTRY.map((command) => command.id);
-
-    expect(names).toEqual(required);
-    expect(new Set(names).size).toBe(names.length);
-    expect(new Set(ids).size).toBe(ids.length);
-  });
-
-  test("keeps command-palette copy within a concise display budget", () => {
-    for (const command of COMMAND_REGISTRY) {
-      expect(command.title.length).toBeLessThanOrEqual(4);
-      expect(command.description.length).toBeLessThanOrEqual(15);
-    }
-  });
-
-  test("supports exact, prefix, recent, fuzzy, Chinese and alias search", () => {
-    expect(searchCommands(COMMAND_REGISTRY, "verify")[0]?.command.name).toBe(
+describe("focused Slash registry", () => {
+  test("exposes exactly the seven supported Slash commands", () => {
+    expect(COMMAND_REGISTRY.map((command) => command.name)).toEqual([
+      "help",
+      "fix",
+      "diff",
       "verify",
-    );
+      "apply",
+      "abort",
+      "model",
+    ]);
+    expect(new Set(COMMAND_REGISTRY.map((command) => command.id)).size).toBe(7);
+  });
+
+  test("searches stable names and localized labels", () => {
     expect(searchCommands(COMMAND_REGISTRY, "ver")[0]?.command.name).toBe(
       "verify",
     );
     expect(searchCommands(COMMAND_REGISTRY, "验证")[0]?.command.name).toBe(
       "verify",
     );
-    expect(findCommand("退出")?.name).toBe("quit");
-    expect(
-      searchCommands(COMMAND_REGISTRY, "", ["command.fix"])[0]?.command.name,
-    ).toBe("fix");
+    expect(findCommand("计划")).toBeNull();
   });
 
-  test("explains unavailable and dangerous operations without hiding them", () => {
-    const unavailable = {
-      ...BASE_CONTEXT,
-      modelConfigured: false,
-      transactionId: null,
-      verificationStatus: "FAILED",
-      evidenceId: null,
-    };
-    expect(commandAvailability(findCommand("ask")!, unavailable)).toEqual({
+  test("gates FIX on acceptance and Apply on independent verification", () => {
+    expect(commandAvailability(findCommand("fix")!, {
+      ...READY,
+      acceptanceReady: false,
+    })).toEqual({
       available: false,
-      reason: "未配置模型凭据",
+      reason: "缺少独立 AcceptanceSpec，不能开始修复",
     });
-    expect(commandAvailability(findCommand("apply")!, unavailable).reason).toBe(
-      "无活动事务",
-    );
-    expect(
-      commandAvailability(findCommand("apply")!, {
-        ...unavailable,
-        transactionId: "tx_one",
-      }).reason,
-    ).toBe("事务未通过验证");
-    expect(findCommand("apply")?.dangerous).toBeTrue();
-    expect(findCommand("clean")?.dangerous).toBeTrue();
+    expect(commandAvailability(findCommand("apply")!, {
+      ...READY,
+      verificationStatus: "NOT_RUN",
+    }).available).toBeFalse();
+    expect(commandAvailability(findCommand("apply")!, READY).available).toBeTrue();
   });
 
-  test("opens runtime configuration locally without invoking the display-only CLI", () => {
-    expect(findCommand("config")?.execute("", BASE_CONTEXT)).toEqual({
-      kind: "ui",
-      action: "open-config",
-      argument: "",
-    });
-    expect(findCommand("config")?.shortcut).toBe("Ctrl+G");
+  test("keeps dangerous operations explicit", () => {
+    expect(findCommand("apply")?.dangerous).toBeTrue();
+    expect(findCommand("abort")?.dangerous).toBeTrue();
+    expect(findCommand("fix")?.dangerous).not.toBeTrue();
   });
 });

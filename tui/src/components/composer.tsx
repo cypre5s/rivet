@@ -6,7 +6,6 @@ import {
 import { usePaste } from "@opentui/react";
 import { useEffect, useRef } from "react";
 
-import type { WorkMode } from "../ui/command-registry.ts";
 import type { RivetTheme } from "./theme.ts";
 
 export interface PasteAttachment {
@@ -29,45 +28,41 @@ export const MAX_TOTAL_PASTE_CHARACTERS = 48_000;
 export function Composer({
   value,
   placeholder,
-  mode,
   modelLabel,
   credentialConfigured,
   focused,
   compact,
   running,
-  contextFiles,
+  selectedFiles,
   attachments,
   error,
   theme,
   onInput,
   onSubmit,
-  onRemoveContext,
+  onRemoveFile,
   onRemoveAttachment,
   onLargePaste,
   onPathPaste,
   onOpenModels,
-  onOpenConfig,
 }: {
   value: string;
   placeholder: string;
-  mode: WorkMode;
   modelLabel: string;
   credentialConfigured: boolean;
   focused: boolean;
   compact: boolean;
   running: boolean;
-  contextFiles: string[];
+  selectedFiles: string[];
   attachments: PasteAttachment[];
   error: string | null;
   theme: RivetTheme;
   onInput(value: string): void;
   onSubmit(value: string): boolean;
-  onRemoveContext(path: string): void;
+  onRemoveFile(path: string): void;
   onRemoveAttachment(id: string): void;
   onLargePaste(content: string): void;
   onPathPaste(path: string): void;
   onOpenModels(): void;
-  onOpenConfig(): void;
 }) {
   const editor = useRef<TextareaRenderable | null>(null);
 
@@ -94,7 +89,7 @@ export function Composer({
     }
   });
 
-  const attachmentRows = contextFiles.length + attachments.length;
+  const attachmentRows = selectedFiles.length + attachments.length;
   const editorHeight = compact ? 1 : 2;
   const metadataHeight = 1;
   const totalHeight = editorHeight + metadataHeight + Math.min(attachmentRows, 2) + 2;
@@ -108,14 +103,14 @@ export function Composer({
     >
       <box width={1} backgroundColor={theme.accent} />
       <box flexGrow={1} flexDirection="column" paddingX={2} paddingY={1}>
-        {contextFiles.length === 0 && attachments.length === 0 ? null : (
+        {selectedFiles.length === 0 && attachments.length === 0 ? null : (
           <box height={Math.min(attachmentRows, 2)} flexDirection="row" gap={1}>
-            {contextFiles.slice(0, 3).map((path) => (
+            {selectedFiles.slice(0, 3).map((path) => (
               <box
                 key={path}
                 backgroundColor={theme.surfaceHover}
                 paddingX={1}
-                onMouseDown={() => onRemoveContext(path)}
+                onMouseDown={() => onRemoveFile(path)}
               >
                 <text fg={theme.accent} content={`@${path} ×`} />
               </box>
@@ -165,16 +160,11 @@ export function Composer({
             <box onMouseDown={onOpenModels}>
               <text
                 fg={theme.textSecondary}
-                content={`${mode} · ${modelLabel} ▾`}
+                content={`${modelLabel} ▾`}
               />
             </box>
             {credentialConfigured ? null : (
-              <box onMouseDown={onOpenConfig}>
-                <text
-                  fg={theme.warning}
-                  content={compact ? "Key ○" : "Key ○ · Ctrl+G"}
-                />
-              </box>
+              <text fg={theme.warning} content="Key ○" />
             )}
           </box>
           {running ? <text fg={theme.warning} content="◌ · Ctrl+C" /> : null}

@@ -4,18 +4,11 @@ import {
   findCommand,
   type CommandContext,
   type CommandOutcome,
-  type WorkMode,
 } from "./command-registry.ts";
-import type { ModuleStatus } from "../state/reducer.ts";
 
 export interface CommandSources {
   models: string[];
-  sessions: string[];
   transactions: string[];
-  modules: string[];
-  moduleStatuses?: ModuleStatus[];
-  files: string[];
-  contextFiles: string[];
 }
 
 export interface CommandArgumentRequest {
@@ -23,10 +16,15 @@ export interface CommandArgumentRequest {
   query: string;
 }
 
+export interface FixCommandArgument {
+  query: string;
+  writeScope: string[];
+  allowedNewPaths: string[];
+}
+
 export const DEFAULT_COMMAND_CONTEXT: CommandContext = {
   modelConfigured: true,
   currentModel: "deepseek-v4-pro",
-  hasSession: true,
   transactionId: null,
   verificationStatus: "NOT_RUN",
   evidenceId: null,
@@ -36,44 +34,81 @@ export const DEFAULT_COMMAND_CONTEXT: CommandContext = {
 export function parseCommandInput(
   value: string,
   context: CommandContext = DEFAULT_COMMAND_CONTEXT,
-  mode: WorkMode = "ASK",
 ): CommandOutcome {
   const trimmed = value.trim();
   if (!trimmed) throw new Error("请输入任务或命令");
   if (!trimmed.startsWith("/")) {
-    const command = findCommand(mode.toLocaleLowerCase());
-    if (command === null) throw new Error("当前工作模式无效");
-    const availability = commandAvailability(command, context);
-    if (!availability.available) {
-      throw new Error(availability.reason ?? "命令当前不可用");
-    }
-    return command.execute(trimmed, context);
+    if (!context.modelConfigured) throw new Error("未配置模型凭据");
+    return {
+      kind: "worker",
+      method: "command.ask",
+      params: { query: trimmed, model: context.currentModel },
+    };
   }
+
   const separator = trimmed.search(/\s/);
   const name = trimmed.slice(1, separator < 0 ? undefined : separator);
   const argument = separator < 0 ? "" : trimmed.slice(separator).trim();
   const command = findCommand(name);
   if (command === null) throw new Error(`未知命令：/${name}`);
-  validateRequiredArgument(command.name, command.argumentKind, argument);
-  const executionContext =
-    command.requiresTransaction && argument
-      ? {
-          ...context,
-          transactionId: argument,
-          verificationStatus:
-            argument === context.transactionId
-              ? context.verificationStatus
-              : context.transactionStates?.[argument]?.toUpperCase() === "VERIFIED"
-                ? "PASSED"
-                : "NOT_RUN",
-          transactionStates: {},
-        }
-      : context;
+  const fixArgument = command.name === "fix" ? parseFixArgument(argument) : null;
+  const normalizedArgument = fixArgument?.query ?? argument;
+  validateRequiredArgument(command.name, command.argumentKind, normalizedArgument);
+  const executionContext = contextForTransaction(
+    command.name,
+    normalizedArgument,
+    context,
+  );
   const availability = commandAvailability(command, executionContext);
   if (!availability.available) {
     throw new Error(availability.reason ?? "命令当前不可用");
   }
-  return command.execute(argument, executionContext);
+  const outcome = command.execute(normalizedArgument, executionContext);
+  if (fixArgument !== null && outcome.kind === "worker") {
+    if (fixArgument.writeScope.length > 0) {
+      outcome.params.write_scope = fixArgument.writeScope;
+    }
+    if (fixArgument.allowedNewPaths.length > 0) {
+      outcome.params.allowed_new_paths = fixArgument.allowedNewPaths;
+    }
+  }
+  return outcome;
+}
+
+export function parseFixArgument(argument: string): FixCommandArgument {
+  const normalized = argument.trim();
+  if (!normalized.startsWith("--write ") && !normalized.startsWith("--new ")) {
+    return { query: normalized, writeScope: [], allowedNewPaths: [] };
+  }
+  const tokens = normalized.split(/\s+/);
+  const writeScope: string[] = [];
+  const allowedNewPaths: string[] = [];
+  let index = 0;
+  while (index < tokens.length && tokens[index] !== "--") {
+    const option = tokens[index];
+    if (option !== "--write" && option !== "--new") {
+      throw new Error("/fix 范围必须使用 --write PATH、--new PATH，并以 -- 结束");
+    }
+    const path = tokens[index + 1];
+    if (path === undefined || !validScopePath(path)) {
+      throw new Error(`${option} 需要安全的仓库相对路径`);
+    }
+    const target = option === "--write" ? writeScope : allowedNewPaths;
+    if (target.includes(path) || (option === "--new" && writeScope.includes(path))) {
+      throw new Error(`/fix 范围路径重复：${path}`);
+    }
+    if (option === "--write" && allowedNewPaths.includes(path)) {
+      throw new Error(`/fix 范围路径重复：${path}`);
+    }
+    target.push(path);
+    index += 2;
+  }
+  if (tokens[index] !== "--") {
+    throw new Error("/fix 范围后必须使用 -- 分隔任务文本");
+  }
+  const query = tokens.slice(index + 1).join(" ").trim();
+  if (!query) throw new Error("/fix 需要任务文本");
+  return { query, writeScope, allowedNewPaths };
 }
 
 export function slashQuery(value: string): string | null {
@@ -93,12 +128,20 @@ export function replaceFileMention(value: string, path: string): string {
   });
 }
 
-export function commandArgumentRequest(value: string): CommandArgumentRequest | null {
+export function commandArgumentRequest(
+  value: string,
+): CommandArgumentRequest | null {
   const match = /^\/([a-z][a-z-]*)\s+(.*)$/i.exec(value);
   if (match?.[1] === undefined || match[2] === undefined) return null;
   const command = findCommand(match[1]);
-  if (command === null || !hasFiniteChoices(command.argumentKind)) return null;
-  if (command.name === "read" && /\s--/.test(match[2])) return null;
+  if (
+    command === null ||
+    !["transaction", "optional-transaction", "model"].includes(
+      command.argumentKind,
+    )
+  ) {
+    return null;
+  }
   return { commandName: command.name, query: match[2] };
 }
 
@@ -109,7 +152,12 @@ export function commandArgumentCompletions(
 ): string[] {
   const command = findCommand(name);
   if (command === null) return [];
-  const choices = completionChoices(command.argumentKind, sources);
+  const choices =
+    command.argumentKind === "model"
+      ? sources.models
+      : ["transaction", "optional-transaction"].includes(command.argumentKind)
+        ? sources.transactions
+        : [];
   const normalized = query.toLocaleLowerCase();
   return choices
     .filter((choice) => choice.toLocaleLowerCase().includes(normalized))
@@ -120,101 +168,25 @@ export function commandNames(): string[] {
   return COMMAND_REGISTRY.map((command) => command.name);
 }
 
-export function moduleCommandUnavailableReason(
-  value: string,
-  statuses: ModuleStatus[],
-): string | null {
-  const [operation, moduleId] = value.split(/\s+/, 2);
-  if (moduleId === undefined || !["enable", "disable"].includes(operation ?? "")) {
-    return null;
+function contextForTransaction(
+  commandName: string,
+  argument: string,
+  context: CommandContext,
+): CommandContext {
+  if (!["diff", "verify", "apply", "abort"].includes(commandName) || !argument) {
+    return context;
   }
-  const status = statuses.find((item) => item.moduleId === moduleId);
-  if (status === undefined) return null;
-  if (!status.manualControl) return "内部模块仅由 Kernel 控制";
-  if (
-    ["required", "eager"].includes(status.activation) &&
-    operation === "disable"
-  ) {
-    return "系统必需或常驻模块不能被禁用";
-  }
-  return null;
-}
-
-function completionChoices(
-  kind: (typeof COMMAND_REGISTRY)[number]["argumentKind"],
-  sources: CommandSources,
-): string[] {
-  if (kind === "model") return sources.models;
-  if (kind === "mode") return ["ask", "plan", "fix"];
-  if (kind === "session") return sources.sessions;
-  if (kind === "transaction" || kind === "optional-transaction") {
-    return sources.transactions;
-  }
-  if (kind === "module") {
-    return moduleChoices(sources);
-  }
-  if (kind === "path" || kind === "optional-path") return sources.files;
-  if (kind === "context") {
-    return [
-      "list",
-      "clear",
-      ...sources.files.map((path) => `add ${path}`),
-      ...sources.contextFiles.map((path) => `remove ${path}`),
-    ];
-  }
-  if (kind === "theme") return ["dark", "light"];
-  if (kind === "export") return ["trace", "evidence", "session"];
-  return [];
-}
-
-function moduleChoices(sources: CommandSources): string[] {
-  const statuses = sources.moduleStatuses ?? [];
-  if (statuses.length === 0) {
-    return [
-      "list",
-      ...sources.modules.flatMap((moduleId) => [
-        `show ${moduleId}`,
-        `enable ${moduleId}`,
-        `disable ${moduleId}`,
-      ]),
-    ];
-  }
-  const choices = ["list"];
-  for (const status of statuses) {
-    choices.push(`show ${status.moduleId}`);
-    if (!status.manualControl) continue;
-    if (["required", "eager"].includes(status.activation)) continue;
-    if (!status.configuredEnabled) {
-      choices.push(
-        `enable ${status.moduleId}`,
-        `enable ${status.moduleId} --with-dependencies`,
-      );
-      continue;
-    }
-    choices.push(`disable ${status.moduleId}`);
-    if (status.dependents.length > 0) {
-      choices.push(`disable ${status.moduleId} --cascade --yes`);
-    }
-  }
-  return choices;
-}
-
-function hasFiniteChoices(
-  kind: (typeof COMMAND_REGISTRY)[number]["argumentKind"],
-): boolean {
-  return [
-    "path",
-    "optional-path",
-    "transaction",
-    "optional-transaction",
-    "session",
-    "mode",
-    "model",
-    "theme",
-    "module",
-    "context",
-    "export",
-  ].includes(kind);
+  return {
+    ...context,
+    transactionId: argument,
+    verificationStatus:
+      argument === context.transactionId
+        ? context.verificationStatus
+        : context.transactionStates?.[argument]?.toUpperCase() === "VERIFIED"
+          ? "PASSED"
+          : "NOT_RUN",
+    transactionStates: {},
+  };
 }
 
 function validateRequiredArgument(
@@ -222,11 +194,22 @@ function validateRequiredArgument(
   argumentKind: (typeof COMMAND_REGISTRY)[number]["argumentKind"],
   argument: string,
 ): void {
-  if (argument || !["query", "path", "transaction", "session"].includes(argumentKind)) {
-    return;
+  if (argumentKind === "query" && !argument) {
+    throw new Error(`/${commandName} 需要任务文本`);
   }
-  if (argumentKind === "query") throw new Error(`/${commandName} 需要任务文本`);
-  if (argumentKind === "path") throw new Error(`/${commandName} 需要仓库内文件路径`);
-  if (argumentKind === "session") throw new Error(`/${commandName} 需要会话 ID`);
-  throw new Error(`/${commandName} 需要事务 ID`);
+  if (argumentKind === "transaction" && !argument) {
+    throw new Error(`/${commandName} 需要事务 ID`);
+  }
+}
+
+function validScopePath(path: string): boolean {
+  const parts = path.split("/");
+  return (
+    path.length > 0 &&
+    path.length <= 4_096 &&
+    !path.startsWith("/") &&
+    !path.includes("\\") &&
+    !path.includes("\0") &&
+    parts.every((part) => part !== "" && part !== "." && part !== "..")
+  );
 }

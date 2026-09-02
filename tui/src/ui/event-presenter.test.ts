@@ -16,21 +16,46 @@ function event(eventType: string, payload: IpcEvent["payload"] = {}): IpcEvent {
 }
 
 describe("trace event presentation", () => {
+  test("recognizes only the focused nine-tool surface", () => {
+    const supportedTools = [
+      "workspace_info",
+      "context_search",
+      "file_read",
+      "file_write",
+      "file_replace",
+      "file_create",
+      "file_delete",
+      "process_run",
+      "git_diff",
+    ];
+
+    for (const tool of supportedTools) {
+      expect(
+        presentTraceEvent(event("tool.completed", { tool_name: tool })).title,
+      ).not.toBe(tool);
+    }
+    expect(
+      presentTraceEvent(
+        event("tool.completed", { tool_name: "search_text" }),
+      ).title,
+    ).toBe("search_text · 完成");
+  });
+
   test("turns internal event names into restrained user language", () => {
     expect(presentTraceEvent(event("worker.ready")).title).toBe("就绪");
     expect(
-      presentTraceEvent(event("tool.started", { tool: "search_text" })),
-    ).toMatchObject({ title: "search_text · 运行", status: "running" });
+      presentTraceEvent(event("tool.started", { tool: "context_search" })),
+    ).toMatchObject({ title: "搜索代码 · 运行", status: "running" });
     expect(
       presentTraceEvent(
-        event("module.activated", { module_id: "context.syntax" }),
+        event("module.activated", { module_id: "context.lexical" }),
       ).title,
-    ).toBe("context.syntax · 激活");
+    ).toBe("context.lexical · 激活");
     expect(
       presentTraceEvent(
-        event("module.released", { module_id: "context.syntax" }),
+        event("module.released", { module_id: "context.lexical" }),
       ).title,
-    ).toBe("context.syntax · 释放");
+    ).toBe("context.lexical · 释放");
     expect(
       presentTraceEvent(
         event("verification.completed", { status: "PASSED" }),
@@ -47,11 +72,15 @@ describe("trace event presentation", () => {
     expect(
       presentTraceEvent(event("agent.answered", { status: "ANSWERED" })),
     ).toMatchObject({ title: "已回答", kind: "assistant" });
-    expect(presentTraceEvent(event("config.updated"))).toMatchObject({
-      title: "配置更新",
-      kind: "status",
+    expect(presentTraceEvent(event("acceptance.proposed"))).toMatchObject({
+      title: "验收提案待确认",
       status: "success",
     });
+    expect(
+      presentTraceEvent(
+        event("demand.created", { capability_id: "context.search.lexical" }),
+      ).title,
+    ).toBe("搜索代码");
   });
 
   test("keeps unknown events generic instead of exposing raw protocol names", () => {
@@ -61,19 +90,18 @@ describe("trace event presentation", () => {
     });
   });
 
-  test("shows module failure reason and next action", () => {
+  test("shows activation failure reason and next action", () => {
     const presented = presentTraceEvent(
-      event("module.operation.blocked", {
-        module_id: "context.syntax",
-        operation: "sleep",
+      event("module.activation_failed", {
+        module_id: "context.lexical",
         human_message: "模块存在活动 Lease",
         suggested_action: "等待任务结束后重试",
       }),
     );
 
-    expect(presented.title).toContain("context.syntax");
+    expect(presented.title).toBe("能力激活失败");
     expect(presented.detail).toContain("模块存在活动 Lease");
     expect(presented.detail).toContain("等待任务结束后重试");
-    expect(presented.status).toBe("blocked");
+    expect(presented.status).toBe("failed");
   });
 });

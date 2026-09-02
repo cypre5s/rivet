@@ -7,81 +7,53 @@ import { COMMAND_REGISTRY } from "../ui/command-registry.ts";
 import { searchCommands } from "../ui/command-search.ts";
 import {
   commandArgumentCompletions,
-  moduleCommandUnavailableReason,
   slashQuery,
   type CommandArgumentRequest,
 } from "../ui/commands.ts";
-import { searchHistory } from "../ui/history.ts";
-import { createPaletteResources } from "../ui/palette-resources.ts";
 
 export function useCommandOptions({
   state,
   topOverlay,
   input,
-  overlayQuery,
   selectedModel,
-  recentCommandIds,
-  history,
   files,
   fileQuery,
-  contextFiles,
+  selectedFiles,
   argumentRequest,
   models,
 }: {
   state: RivetState;
   topOverlay: Overlay | null;
   input: string;
-  overlayQuery: string;
   selectedModel: string;
-  recentCommandIds: string[];
-  history: string[];
   files: string[];
   fileQuery: string;
-  contextFiles: string[];
+  selectedFiles: string[];
   argumentRequest: CommandArgumentRequest | null;
   models: string[];
 }) {
   const slashResults = useMemo(
-    () =>
-      searchCommands(
-        COMMAND_REGISTRY,
-        slashQuery(input) ?? "",
-        recentCommandIds,
-      ),
-    [input, recentCommandIds],
+    () => searchCommands(COMMAND_REGISTRY, slashQuery(input) ?? ""),
+    [input],
   );
-  const paletteResources = useMemo(
-    () => createPaletteResources(state, files, models),
-    [files, models, state],
-  );
-  const paletteResults = useMemo(
-    () =>
-      searchCommands(
-        [...COMMAND_REGISTRY, ...paletteResources],
-        overlayQuery,
-        recentCommandIds,
-      ),
-    [overlayQuery, paletteResources, recentCommandIds],
-  );
-  const historyOptions = useMemo(
-    () =>
-      searchHistory(history, overlayQuery).map((value, index) => ({
-        id: `history-${index}-${value}`,
-        title: value,
-      })),
-    [history, overlayQuery],
-  );
-  const modelOptions = models.filter((model) =>
-    model.toLocaleLowerCase().includes(overlayQuery.toLocaleLowerCase()),
-  ).map((model) => ({
+  const modelOptions = models.map((model) => ({
     id: model,
     title: model,
     description: model === selectedModel ? "当前" : "",
     marker: model === selectedModel ? "●" : "○",
   }));
   const rankedFiles = useMemo(
-    () => rankFilePaths(files, fileQuery, contextFiles),
-    [contextFiles, fileQuery, files],
+    () => rankFilePaths(files, fileQuery, selectedFiles),
+    [fileQuery, files, selectedFiles],
+  );
+  const transactions = useMemo(
+    () => [
+      ...(state.transaction === "无" ? [] : [state.transaction]),
+      ...state.transactions
+        .map((transaction) => transaction.transactionId)
+        .filter((transactionId) => transactionId !== state.transaction),
+    ],
+    [state.transaction, state.transactions],
   );
   const argumentOptions = useMemo(() => {
     if (
@@ -93,53 +65,13 @@ export function useCommandOptions({
     return commandArgumentCompletions(
       topOverlay.commandName,
       argumentRequest.query,
-      {
-        models,
-        sessions: state.sessions,
-        transactions: [
-          ...(state.transaction === "无" ? [] : [state.transaction]),
-          ...state.transactions
-            .map((transaction) => transaction.transactionId)
-            .filter((transactionId) => transactionId !== state.transaction),
-        ],
-        modules: state.taskModules,
-        moduleStatuses: state.moduleStatuses,
-        files,
-        contextFiles,
-      },
-    ).map((value) => {
-      const unavailableReason =
-        topOverlay.commandName === "modules"
-          ? moduleCommandUnavailableReason(value, state.moduleStatuses)
-          : null;
-      return {
-        id: value,
-        title: value,
-        ...(unavailableReason === null
-          ? topOverlay.commandName === "modules" && /^disable\b/.test(value)
-            ? { description: "高影响操作 · 执行前需要确认" }
-            : {}
-          : { available: false, description: unavailableReason }),
-      };
-    });
-  }, [
-    argumentRequest,
-    contextFiles,
-    files,
-    models,
-    state.taskModules,
-    state.moduleStatuses,
-    state.sessions,
-    state.transaction,
-    state.transactions,
-    topOverlay,
-  ]);
+      { models, transactions },
+    ).map((value) => ({ id: value, title: value }));
+  }, [argumentRequest, models, topOverlay, transactions]);
 
   return {
     argumentOptions,
-    historyOptions,
     modelOptions,
-    paletteResults,
     rankedFiles,
     slashResults,
   };

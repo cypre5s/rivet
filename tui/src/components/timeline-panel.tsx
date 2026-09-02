@@ -57,7 +57,7 @@ export function TimelinePanel({
                   >
                     <text
                       fg={failed ? theme.warning : theme.accent}
-                      content={`${expanded ? "⌄" : "›"} ${entry.items.length} 步${failed ? " · !" : ""}`}
+                      content={`${expanded ? "⌄" : "›"} ${entry.title}${expanded ? ` · ${entry.items.length} 条审计` : ""}${failed ? " · !" : ""}`}
                     />
                   </box>
                   {expanded
@@ -107,20 +107,20 @@ export function TimelinePanel({
 const QUIET_TIMELINE_EVENTS = new Set([
   "budget.updated",
   "command.completed",
-  "config.updated",
   "evidence.log",
-  "module.operation.requested",
-  "module.operation.started",
-  "module.state.changed",
   "permission.resolved",
-  "plan.updated",
+  "run.started",
   "run.completed",
-  "session.updated",
   "worker.ready",
   "workspace.tree_updated",
 ]);
 
 function showInTimeline(item: TimelineItem): boolean {
+  if (
+    item.operationId?.startsWith("model:") &&
+    (item.eventType === "module.released" || item.eventType === "module.slept")
+  )
+    return false;
   return (
     !item.eventType.endsWith(".snapshot") &&
     !QUIET_TIMELINE_EVENTS.has(item.eventType)
@@ -129,7 +129,7 @@ function showInTimeline(item: TimelineItem): boolean {
 
 type TimelineEntry =
   | { kind: "item"; item: TimelineItem }
-  | { kind: "group"; id: string; items: TimelineItem[] };
+  | { kind: "group"; id: string; title: string; items: TimelineItem[] };
 
 function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
   const entries: TimelineEntry[] = [];
@@ -137,7 +137,20 @@ function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
   const flush = () => {
     const first = pending[0];
     if (first !== undefined) {
-      entries.push({ kind: "group", id: `progress-${first.eventId}`, items: pending });
+      const demand = pending.find((item) => item.eventType === "demand.created");
+      const operation = [...pending]
+        .reverse()
+        .find(
+          (item) =>
+            item.eventType === "tool.completed" ||
+            item.eventType === "operation.executed",
+        );
+      entries.push({
+        kind: "group",
+        id: `progress-${first.eventId}`,
+        title: demand?.title ?? operation?.title ?? `${pending.length} 项运行状态`,
+        items: pending,
+      });
     }
     pending = [];
   };
@@ -146,6 +159,25 @@ function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
       flush();
       entries.push({ kind: "item", item });
     } else {
+      const previous = pending.at(-1);
+      const pendingDemandIds = new Set(
+        pending.flatMap((pendingItem) =>
+          pendingItem.demandId === null ? [] : [pendingItem.demandId],
+        ),
+      );
+      const causallyRelated =
+        item.demandId === previous?.demandId ||
+        (item.parentDemandId !== null && pendingDemandIds.has(item.parentDemandId)) ||
+        (item.demandId !== null &&
+          pending.some(
+            (pendingItem) => pendingItem.parentDemandId === item.demandId,
+          ));
+      if (
+        previous !== undefined &&
+        !causallyRelated &&
+        (previous.demandId !== null || item.demandId !== null)
+      )
+        flush();
       pending.push(item);
     }
   }
