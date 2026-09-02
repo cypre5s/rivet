@@ -8,6 +8,42 @@ permissions:
   contents: read
 
 jobs:
+  core-profile:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.13.15"
+          enable-cache: true
+      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: uv sync --dev --locked
+      - name: Prove heavy profiles are absent
+        run: |
+          uv run python - <<'PY'
+          import importlib.util
+          blocked = (
+              "PIL",
+              "faster_whisper",
+              "imageio_ffmpeg",
+              "markitdown",
+              "py7zr",
+              "tree_sitter",
+          )
+          present = [name for name in blocked if importlib.util.find_spec(name)]
+          if present:
+              raise SystemExit(f"core profile unexpectedly contains: {present}")
+          PY
+      - name: Exercise core-only degradation and readers
+        run: |
+          uv run pytest -q \
+            tests/unit/cli/test_model_commands.py::test_core_profile_ask_degrades_when_syntax_extra_is_missing \
+            tests/unit/readers/test_text_and_structured.py \
+            tests/security/test_archive_safety.py \
+            tests/e2e/test_cli_commands.py::test_init_config_modules_doctor_and_clean_are_offline
+      - run: uv run rivet --json doctor --section readers
+      - run: uv run rivet --json modules list
+
   python-quality:
     runs-on: ubuntu-24.04
     steps:
