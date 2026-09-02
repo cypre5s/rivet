@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -68,6 +69,28 @@ async def test_tampered_evidence_blocks_previously_passed_patch(tmp_path: Path) 
         await prepared.manager.apply(prepared.outcome.transaction.transaction_id)
 
     assert captured.value.code == "transaction.evidence_hash_mismatch"
+    assert worktree_digest(prepared.repository) == digest_before
+    await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
+    prepared.scope.assert_empty()
+    await prepared.scope.close()
+
+
+@pytest.mark.asyncio
+async def test_manifest_base_binding_tamper_blocks_apply(tmp_path: Path) -> None:
+    prepared = await run_verification_case(tmp_path, VERIFICATION_CASES[0])
+    digest_before = worktree_digest(prepared.repository)
+    manifest_path = prepared.outcome.evidence_directory / "manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["base_commit"] = "f" * 40
+    manifest_path.write_text(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(TransactionError) as captured:
+        await prepared.manager.apply(prepared.outcome.transaction.transaction_id)
+
+    assert captured.value.code == "transaction.evidence_manifest_mismatch"
     assert worktree_digest(prepared.repository) == digest_before
     await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
     prepared.scope.assert_empty()

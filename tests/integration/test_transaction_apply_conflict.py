@@ -30,11 +30,12 @@ async def _verified_transaction(
     repository = initialize_repository(tmp_path)
     scope = ResourceScope(f"transaction.conflict.{transaction_id}")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id=transaction_id)
-    await manager.freeze_acceptance(
-        record.transaction_id,
-        acceptance_spec(),
+    record = await manager.create(
+        acceptance_spec(
+            acceptance_id=f"acceptance_{transaction_id.removeprefix('tx_')}"
+        ),
         confirmed=True,
+        transaction_id=transaction_id,
     )
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))
     writer.write("tracked.txt", "transaction tracked\n")
@@ -122,13 +123,36 @@ async def test_apply_recovers_when_state_write_fails_after_patch(
         await manager.apply("tx_apply_recovery")
     monkeypatch.setattr(TransactionStore, "save_record", original_save)
 
+    store = TransactionStore(tmp_path / "state" / "transactions")
+    record = store.load_record("tx_apply_recovery")
+    assert record.current_patch_id is not None
+    patch, _ = store.load_patch("tx_apply_recovery", record.current_patch_id)
+    intent = store.load_apply_intent("tx_apply_recovery")
+    assert intent.base_commit == record.base_commit
+    assert intent.acceptance_sha256 == record.acceptance_sha256
+    assert intent.patch_sha256 == patch.patch_sha256
+    assert intent.evidence_manifest_sha256 == record.evidence_manifest_sha256
+    worktree = manager.worktree_path("tx_apply_recovery")
+    record_before_abort = store.record_path("tx_apply_recovery").read_bytes()
+
+    with pytest.raises(TransactionError) as abort_error:
+        await manager.abort("tx_apply_recovery")
+
+    assert abort_error.value.code == "transaction.apply_recovery_required"
+    assert store.record_path("tx_apply_recovery").read_bytes() == record_before_abort
+    assert store.load_record("tx_apply_recovery").state is TransactionState.VERIFIED
+    assert worktree.is_dir()
+    assert (repository / "tracked.txt").read_text(encoding="utf-8") == (
+        "transaction tracked\n"
+    )
+
     applied = await manager.apply("tx_apply_recovery")
 
     assert applied.state is TransactionState.APPLIED
     assert (repository / "tracked.txt").read_text(encoding="utf-8") == (
         "transaction tracked\n"
     )
-    assert not manager.worktree_path("tx_apply_recovery").exists()
+    assert not worktree.exists()
     scope.assert_empty()
     await scope.close()
 

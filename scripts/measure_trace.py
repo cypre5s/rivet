@@ -74,7 +74,6 @@ async def measure_trace() -> dict[str, object]:
             "queue_capacity": store.queue_capacity,
             "queue_peak_size": store.queue_peak_size,
             "pending_event_count": store.pending_event_count,
-            "database_event_count": store.database_event_count_before_close,
             "ndjson_size_bytes": paths.events_path.stat().st_size,
         }
 

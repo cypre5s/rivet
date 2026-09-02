@@ -1,392 +1,279 @@
-"""覆盖 ModuleRuntime 的失败关闭、幂等和 Safe Mode 分支。"""
+"""验证 Runtime Permit、并发归因和资源回滚边界。"""
 
 from __future__ import annotations
 
 import asyncio
-import json
-from collections.abc import Callable
 from pathlib import Path
 
 import pytest
 
-from rivet.contracts.modules import (
-    ActivationPolicy,
-    ModuleAvailability,
-    ModuleManifest,
-    ModuleState,
+from rivet.contracts.modules import ModuleManifest, ModuleState
+from rivet.kernel.application import RivetKernel
+from rivet.kernel.capability_demand import (
+    DemandContext,
+    DemandHandle,
+    InMemoryDemandJournal,
 )
-from rivet.kernel.errors import (
-    ActivationJournalError,
-    CapabilityNotFoundError,
-    ModuleActivationError,
-    ModuleDependencyError,
-    ModuleShutdownError,
-    ModuleUnavailableError,
-    SafeModeViolationError,
-)
+from rivet.kernel.errors import ModuleActivationError, ModuleShutdownError
 from rivet.kernel.module_api import ModuleActivationContext
-from rivet.kernel.module_runtime import ActivationJournal, ModuleRuntime
-from rivet.kernel.resources import ResourceScope
-
-FACTORY = "tests.fixtures.kernel.fake_modules:create_recording_module"
-
-
-class ControlledModule:
-    """按开关制造激活、休眠或关闭故障。"""
-
-    def __init__(
-        self,
-        *,
-        fail_sleep: bool = False,
-        fail_shutdown: bool = False,
-        block_activation: bool = False,
-        capability_override: str | None = None,
-    ) -> None:
-        self.fail_sleep = fail_sleep
-        self.fail_shutdown = fail_shutdown
-        self.block_activation = block_activation
-        self.capability_override = capability_override
-        self.activation_started = asyncio.Event()
-
-    async def activate(
-        self,
-        context: ModuleActivationContext,
-        scope: ResourceScope,
-    ) -> dict[str, object]:
-        """记录开始，并可等待取消。"""
-        del scope
-        self.activation_started.set()
-        if self.block_activation:
-            await asyncio.Event().wait()
-        capabilities = (
-            (self.capability_override,)
-            if self.capability_override is not None
-            else context.declared_capabilities
-        )
-        return {capability_id: self for capability_id in capabilities}
-
-    async def sleep(self) -> None:
-        """按配置制造休眠故障。"""
-        if self.fail_sleep:
-            raise RuntimeError("fixture sleep failure")
-
-    async def shutdown(self) -> None:
-        """按配置制造关闭故障。"""
-        if self.fail_shutdown:
-            raise RuntimeError("fixture shutdown failure")
+from rivet.kernel.module_events import InMemoryModuleLifecycleSink
+from rivet.kernel.module_runtime import ModuleRuntime
+from tests.fixtures.kernel import fake_modules
 
 
 def _manifest(
-    module_id: str = "test.hardening",
-    capability_id: str = "test.hardening.resolve",
+    module_id: str,
+    capability_id: str,
     *,
-    activation: ActivationPolicy = ActivationPolicy.ON_DEMAND,
+    factory: str = "create_recording_module",
     requires: tuple[str, ...] = (),
-    required_python_packages: tuple[str, ...] = (),
-    install_extra: str | None = None,
 ) -> ModuleManifest:
-    """构造最小有效 Manifest。"""
     return ModuleManifest(
         module_id=module_id,
-        module_version="1.0.0",
-        activation=activation,
-        factory=FACTORY,
+        factory=f"tests.fixtures.kernel.fake_modules:{factory}",
         provides=(capability_id,),
         requires=requires,
-        required_python_packages=required_python_packages,
-        install_extra=install_extra,
-        idle_timeout_seconds=None,
     )
 
 
-def _factory_loader(instance: object) -> Callable[[str], Callable[[], object]]:
-    """构造带完整类型的固定 factory loader。"""
-
-    def load(_factory_path: str) -> Callable[[], object]:
-        """忽略路径并返回固定实例 factory。"""
-        return lambda: instance
-
-    return load
-
-
-@pytest.mark.parametrize(
-    "document",
-    (
-        "not-json",
-        "[]",
-        '{"schema_version":2,"pending_module_ids":[]}',
-        '{"schema_version":1,"pending_module_ids":"bad"}',
-        '{"schema_version":1,"pending_module_ids":[1]}',
-        '{"schema_version":1,"pending_module_ids":["test.one","test.one"]}',
-    ),
-)
-def test_activation_journal_rejects_each_corrupt_shape(
+def _kernel(
     tmp_path: Path,
-    document: str,
-) -> None:
-    path = tmp_path / "journal.json"
-    path.write_text(document, encoding="utf-8")
-
-    with pytest.raises(ActivationJournalError):
-        ActivationJournal(path).pending_module_ids()
-
-
-def test_activation_journal_write_failure_is_classified(tmp_path: Path) -> None:
-    blocked_parent = tmp_path / "blocked"
-    blocked_parent.write_text("not a directory", encoding="utf-8")
-
-    with pytest.raises(ActivationJournalError, match="原子写入"):
-        ActivationJournal(blocked_parent / "journal.json").mark_pending(
-            "test.hardening"
-        )
-
-
-@pytest.mark.asyncio
-async def test_safe_mode_start_sleep_and_shutdown_are_idempotent(
-    tmp_path: Path,
-) -> None:
-    runtime = ModuleRuntime(
-        (
-            _manifest(
-                "test.required",
-                "test.required.resolve",
-                activation=ActivationPolicy.REQUIRED,
-            ),
-            _manifest("test.optional", "test.optional.resolve"),
+    manifests: tuple[ModuleManifest, ...],
+    *,
+    sink: InMemoryModuleLifecycleSink | None = None,
+) -> tuple[RivetKernel, InMemoryDemandJournal, InMemoryModuleLifecycleSink]:
+    fake_modules.reset_observations()
+    journal = InMemoryDemandJournal()
+    lifecycle = sink or InMemoryModuleLifecycleSink()
+    kernel = RivetKernel.from_manifests(
+        manifests,
+        demand_journal=journal,
+        lifecycle_sink=lifecycle,
+        activation_context=ModuleActivationContext(
+            repository=tmp_path,
         ),
-        journal=ActivationJournal(tmp_path / "journal.json"),
-        safe_mode=True,
     )
-
-    await runtime.start()
-    await runtime.start()
-
-    assert runtime.state("test.required") is ModuleState.ACTIVE
-    assert runtime.state("test.optional") is ModuleState.INACTIVE
-    assert not await runtime.sleep_module("test.required")
-    assert not await runtime.sleep_module("test.optional")
-    with pytest.raises(SafeModeViolationError):
-        await runtime.resolve("test.optional.resolve")
-    with pytest.raises(CapabilityNotFoundError):
-        runtime.state("test.missing")
-    await runtime.shutdown()
-    await runtime.shutdown()
+    return kernel, journal, lifecycle
 
 
-def test_safe_mode_rejects_required_dependency_on_optional(tmp_path: Path) -> None:
-    with pytest.raises(ModuleDependencyError, match="依赖可选模块"):
-        ModuleRuntime(
-            (
-                _manifest("test.optional", "test.optional.resolve"),
-                _manifest(
-                    "test.required",
-                    "test.required.resolve",
-                    activation=ActivationPolicy.REQUIRED,
-                    requires=("test.optional",),
-                ),
-            ),
-            journal=ActivationJournal(tmp_path / "journal.json"),
-            safe_mode=True,
-        )
-
-
-@pytest.mark.asyncio
-async def test_missing_optional_dependency_stays_inactive_and_never_loads_factory(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """缺 extra 是静态 Availability 事实，不得污染 Runtime FAILED。"""
-    runtime = ModuleRuntime(
-        (
-            _manifest(
-                required_python_packages=("rivet_fixture_missing_package",),
-                install_extra="syntax",
-            ),
+async def _root(kernel: RivetKernel, *, suffix: str = "root") -> DemandHandle:
+    return await kernel.begin_user_demand(
+        "test",
+        reason="测试根需求",
+        context=DemandContext(
+            run_id=f"run_{suffix}",
+            session_id=f"session_{suffix}",
         ),
-        journal=ActivationJournal(tmp_path / "journal.json"),
     )
-    factory_loaded = False
 
-    def fail_if_loaded(_factory_path: str) -> Callable[[], object]:
-        nonlocal factory_loaded
-        factory_loaded = True
-        return lambda: ControlledModule()
 
-    monkeypatch.setattr(ModuleRuntime, "_load_factory", staticmethod(fail_if_loaded))
+def test_runtime_exposes_no_string_activation_methods(tmp_path: Path) -> None:
+    runtime = ModuleRuntime(
+        (_manifest("test.runtime", "test.runtime.resolve"),),
+        activation_context=ModuleActivationContext(
+            repository=tmp_path,
+        ),
+        lifecycle_sink=InMemoryModuleLifecycleSink(),
+        activation_seal=object(),
+    )
 
-    report = runtime.availability("test.hardening")
-    assert report.state is ModuleAvailability.MISSING_DEPENDENCY
-    assert report.missing_components == ("rivet_fixture_missing_package",)
-    assert report.suggested_action == "运行 uv sync --extra syntax 安装该能力"
-    with pytest.raises(ModuleUnavailableError) as captured:
-        await runtime.acquire("test.hardening.resolve")
-
-    assert captured.value.availability == "MISSING_DEPENDENCY"
-    assert runtime.state("test.hardening") is ModuleState.INACTIVE
-    assert not factory_loaded
-    assert not runtime.journal.path.exists()
-    await runtime.shutdown()
+    assert not hasattr(runtime, "acquire")
+    assert not hasattr(runtime, "resolve")
+    assert not hasattr(runtime, "wake_module")
 
 
 @pytest.mark.asyncio
-async def test_lease_context_release_is_idempotent_and_underflow_is_rejected(
+async def test_concurrent_demands_activate_once_and_keep_lock_owner_attribution(
     tmp_path: Path,
 ) -> None:
-    runtime = ModuleRuntime(
-        (_manifest(),),
-        journal=ActivationJournal(tmp_path / "journal.json"),
+    kernel, journal, sink = _kernel(
+        tmp_path,
+        (_manifest("test.concurrent", "test.concurrent.resolve"),),
     )
-    lease = await runtime.acquire("test.hardening.resolve")
+    await kernel.start()
+    first_root = await _root(kernel, suffix="first")
+    second_root = await _root(kernel, suffix="second")
 
-    async with lease as instance:
-        assert instance is lease.capability
+    first, second = await asyncio.gather(
+        kernel.acquire_required(
+            "test.concurrent.resolve",
+            parent=first_root,
+            reason="第一个并发请求",
+        ),
+        kernel.acquire_required(
+            "test.concurrent.resolve",
+            parent=second_root,
+            reason="第二个并发请求",
+        ),
+    )
+
+    child_ids = {
+        record.demand.demand_id
+        for record in journal.records
+        if record.demand.capability_id == "test.concurrent.resolve"
+    }
+    assert len(sink.activation_events) == 1
+    assert first.capability is second.capability
+    assert sink.activation_events[0].demand_id in child_ids
+    assert kernel.snapshots()[0].activated_by_demand_id == (
+        sink.activation_events[0].demand_id
+    )
+    assert kernel.snapshots()[0].lease_count == 2
+
+    await first.release()
+    assert kernel.state("test.concurrent") is ModuleState.ACTIVE
+    await second.release()
+    assert kernel.state("test.concurrent") is ModuleState.INACTIVE
+    assert kernel.resource_counts().resource_count == 0
+    await kernel.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_dependency_activation_uses_same_durable_demand_inside_lock(
+    tmp_path: Path,
+) -> None:
+    dependency = _manifest(
+        "test.dependency",
+        "test.dependency.resolve",
+        factory="create_dependency_module",
+    )
+    target = _manifest(
+        "test.target",
+        "test.target.resolve",
+        requires=("test.dependency",),
+    )
+    kernel, journal, sink = _kernel(tmp_path, (target, dependency))
+    await kernel.start()
+    root = await _root(kernel)
+
+    lease = await kernel.acquire_required(
+        "test.target.resolve",
+        parent=root,
+        reason="目标能力依赖底层能力",
+    )
+
+    child = journal.records[-1]
+    assert [
+        (event.module_id, event.dependency) for event in sink.activation_events
+    ] == [
+        ("test.dependency", True),
+        ("test.target", False),
+    ]
+    assert {event.demand_id for event in sink.activation_events} == {
+        child.demand.demand_id
+    }
+    assert all(
+        event.demand_sequence == child.sequence for event in sink.activation_events
+    )
     await lease.release()
-    with pytest.raises(ModuleActivationError, match="下溢"):
-        await runtime.release_lease(("test.hardening",))
-    await runtime.shutdown()
+    assert [event.module_id for event in sink.release_events] == [
+        "test.target",
+        "test.dependency",
+    ]
+    await kernel.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_invalid_factory_result_enters_failed_and_cannot_retry(
+async def test_factory_failure_keeps_demand_but_never_publishes_active(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    runtime = ModuleRuntime(
-        (_manifest(),),
-        journal=ActivationJournal(tmp_path / "journal.json"),
+    kernel, journal, sink = _kernel(
+        tmp_path,
+        (
+            _manifest(
+                "test.failing",
+                "test.failing.resolve",
+                factory="create_failing_module",
+            ),
+        ),
     )
-    monkeypatch.setattr(
-        ModuleRuntime,
-        "_load_factory",
-        staticmethod(_factory_loader(object())),
-    )
-
-    with pytest.raises(ModuleActivationError, match="激活失败"):
-        await runtime.resolve("test.hardening.resolve")
-    with pytest.raises(ModuleActivationError, match="FAILED"):
-        await runtime.resolve("test.hardening.resolve")
-
-    assert runtime.journal.pending_module_ids() == frozenset()
-    await runtime.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_sleep_and_shutdown_failures_are_classified(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sleeping = ControlledModule(fail_sleep=True)
-    sleep_runtime = ModuleRuntime(
-        (_manifest("test.sleep", "test.sleep.resolve"),),
-        journal=ActivationJournal(tmp_path / "sleep-journal.json"),
-    )
-    monkeypatch.setattr(
-        ModuleRuntime,
-        "_load_factory",
-        staticmethod(_factory_loader(sleeping)),
-    )
-    await sleep_runtime.resolve("test.sleep.resolve")
-
-    with pytest.raises(ModuleActivationError, match="休眠失败"):
-        await sleep_runtime.sleep_module("test.sleep")
-    assert sleep_runtime.state("test.sleep") is ModuleState.FAILED
-    await sleep_runtime.shutdown()
-
-    shutting_down = ControlledModule(fail_shutdown=True)
-    shutdown_runtime = ModuleRuntime(
-        (_manifest("test.shutdown", "test.shutdown.resolve"),),
-        journal=ActivationJournal(tmp_path / "shutdown-journal.json"),
-    )
-    monkeypatch.setattr(
-        ModuleRuntime,
-        "_load_factory",
-        staticmethod(_factory_loader(shutting_down)),
-    )
-    await shutdown_runtime.resolve("test.shutdown.resolve")
-
-    with pytest.raises(ModuleShutdownError):
-        await shutdown_runtime.shutdown()
-    await shutdown_runtime.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_capability_mapping_must_exactly_match_manifest(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """ACTIVE 不得建立在缺失或伪造 capability 的模块实例上。"""
-    mismatched = ControlledModule(capability_override="test.unexpected")
-    runtime = ModuleRuntime(
-        (_manifest(),),
-        journal=ActivationJournal(tmp_path / "mapping-journal.json"),
-    )
-    monkeypatch.setattr(
-        ModuleRuntime,
-        "_load_factory",
-        staticmethod(_factory_loader(mismatched)),
-    )
+    await kernel.start()
+    root = await _root(kernel)
 
     with pytest.raises(ModuleActivationError):
-        await runtime.resolve("test.hardening.resolve")
+        await kernel.acquire_required(
+            "test.failing.resolve",
+            parent=root,
+            reason="触发可控 factory 失败",
+        )
 
-    assert runtime.state("test.hardening") is ModuleState.FAILED
-    assert not runtime.journal.path.exists()
-    await runtime.shutdown()
+    assert len(journal.records) == 2
+    assert sink.activation_events == []
+    assert sink.failure_events[0].demand_id == journal.records[-1].demand.demand_id
+    assert kernel.state("test.failing") is ModuleState.FAILED
+    assert kernel.resource_counts().resource_count == 0
+    await kernel.shutdown()
 
 
 @pytest.mark.asyncio
-async def test_cancelled_activation_clears_journal_and_resources(
+async def test_sink_failure_closes_real_resources_before_returning_error(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    blocking = ControlledModule(block_activation=True)
-    runtime = ModuleRuntime(
-        (_manifest(),),
-        journal=ActivationJournal(tmp_path / "journal.json"),
+    sink = InMemoryModuleLifecycleSink(fail_activation_for=frozenset({"test.resource"}))
+    kernel, _, _ = _kernel(
+        tmp_path,
+        (
+            _manifest(
+                "test.resource",
+                "test.resource.resolve",
+                factory="create_resource_module",
+            ),
+        ),
+        sink=sink,
     )
-    monkeypatch.setattr(
-        ModuleRuntime,
-        "_load_factory",
-        staticmethod(_factory_loader(blocking)),
+    await kernel.start()
+    root = await _root(kernel)
+
+    with pytest.raises(ModuleActivationError):
+        await kernel.acquire_required(
+            "test.resource.resolve",
+            parent=root,
+            reason="Lifecycle sink 必须先落盘",
+        )
+
+    assert kernel.state("test.resource") is ModuleState.FAILED
+    assert kernel.resource_counts().resource_count == 0
+    assert sink.activation_events == []
+    assert sink.failure_events[0].error_type == "RuntimeError"
+    await kernel.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_lease_release_failure_still_releases_dependency_closure(
+    tmp_path: Path,
+) -> None:
+    dependency = _manifest(
+        "test.release_dependency",
+        "test.release_dependency.resolve",
+        factory="create_dependency_module",
     )
-    activation = asyncio.create_task(runtime.resolve("test.hardening.resolve"))
-    await blocking.activation_started.wait()
-
-    activation.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await activation
-
-    assert runtime.state("test.hardening") is ModuleState.FAILED
-    assert runtime.journal.pending_module_ids() == frozenset()
-    assert runtime.resource_counts().resource_count == 0
-    await runtime.shutdown()
-
-
-def test_activation_journal_serializes_stable_sorted_set(tmp_path: Path) -> None:
-    journal = ActivationJournal(tmp_path / "journal.json")
-    journal.mark_pending("test.zed")
-    journal.mark_pending("test.alpha")
-    document = json.loads(journal.path.read_text(encoding="utf-8"))
-
-    assert document["pending_module_ids"] == ["test.alpha", "test.zed"]
-    journal.clear_pending("test.missing")
-    journal.clear_pending("test.alpha")
-    assert journal.pending_module_ids() == frozenset({"test.zed"})
-
-
-def test_activation_journal_rejects_symlink_file(tmp_path: Path) -> None:
-    external = tmp_path / "external.json"
-    external.write_text(
-        '{"schema_version":1,"pending_module_ids":[]}',
-        encoding="utf-8",
+    target = _manifest(
+        "test.release_target",
+        "test.release_target.resolve",
+        factory="create_fail_once_shutdown_module",
+        requires=("test.release_dependency",),
     )
-    link = tmp_path / "journal.json"
-    link.symlink_to(external)
-    journal = ActivationJournal(link)
+    kernel, _, _ = _kernel(tmp_path, (target, dependency))
+    await kernel.start()
+    root = await _root(kernel)
+    lease = await kernel.acquire_required(
+        "test.release_target.resolve",
+        parent=root,
+        reason="验证失败后继续释放依赖闭包",
+    )
 
-    with pytest.raises(ActivationJournalError, match="符号链接"):
-        journal.pending_module_ids()
-    with pytest.raises(ActivationJournalError, match="符号链接"):
-        journal.mark_pending("test.hardening")
+    with pytest.raises(ModuleShutdownError, match="test.release_target"):
+        await lease.release()
 
-    assert json.loads(external.read_text(encoding="utf-8"))["pending_module_ids"] == []
+    snapshots = {snapshot.module_id: snapshot for snapshot in kernel.snapshots()}
+    assert snapshots["test.release_target"].state is ModuleState.FAILED
+    assert snapshots["test.release_target"].lease_count == 0
+    assert snapshots["test.release_dependency"].state is ModuleState.INACTIVE
+    assert snapshots["test.release_dependency"].lease_count == 0
+    assert fake_modules.lifecycle_events[-2:] == [
+        "shutdown:fail_once_shutdown",
+        "shutdown:dependency",
+    ]
+
+    await kernel.shutdown()
+    assert kernel.resource_counts().resource_count == 0

@@ -1,10 +1,12 @@
-"""对 Provider、LSP、磁盘、进程和 Trace 执行确定性故障注入。"""
+"""对最终内核、Provider、进程和 NDJSON Trace 执行离线故障注入。"""
 
 from __future__ import annotations
 
 import errno
 import sys
 import tempfile
+from collections.abc import Mapping
+from contextlib import suppress
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,31 +15,31 @@ from unittest.mock import patch
 
 import httpx
 
-from rivet.context.lsp_manifest import LspServerManifest
-from rivet.context.lsp_models import LspPosition
-from rivet.context.lsp_sidecar import LspRestartLimitError, LspSidecar
 from rivet.contracts.events import TraceEventEnvelope
 from rivet.contracts.messages import UserMessage
+from rivet.contracts.modules import ModuleManifest
 from rivet.contracts.provider import ModelRequest
+from rivet.kernel.application import RivetKernel
+from rivet.kernel.capability_demand import DemandContext, InMemoryDemandJournal
+from rivet.kernel.errors import DemandJournalError
+from rivet.kernel.module_api import ModuleActivationContext
+from rivet.kernel.module_events import InMemoryModuleLifecycleSink
 from rivet.kernel.resources import ResourceScope
 from rivet.providers.deepseek import DeepSeekProvider
 from rivet.providers.errors import ProviderUnavailableError
 from rivet.providers.models import DeepSeekConfig
 from rivet.tools.paths import WorkspaceBoundary
 from rivet.tools.process import ProcessRunner
-from rivet.trace.artifacts import TraceArtifactStore
 from rivet.trace.errors import TraceWriteError
 from rivet.trace.paths import RuntimePaths
-from rivet.trace.redaction import SecretRedactor
 from rivet.trace.store import TraceStore
 
 FIXED_NOW = datetime(2026, 8, 28, tzinfo=UTC)
+_activation_count = 0
 
 
 @dataclass(frozen=True, slots=True)
 class FaultResult:
-    """保存单项故障的分类、耗时与资源归零事实。"""
-
     fault_id: str
     expected_code: str
     actual_code: str
@@ -46,22 +48,43 @@ class FaultResult:
     resource_count_after: int
 
 
+class _FaultModule:
+    async def activate(
+        self,
+        context: ModuleActivationContext,
+        scope: ResourceScope,
+    ) -> Mapping[str, object]:
+        del scope
+        global _activation_count
+        _activation_count += 1
+        return {capability: self for capability in context.declared_capabilities}
+
+    async def sleep(self) -> None:
+        return None
+
+    async def shutdown(self) -> None:
+        return None
+
+
+def create_fault_module() -> _FaultModule:
+    return _FaultModule()
+
+
 async def run_fault_benchmark() -> dict[str, object]:
-    """运行五种故障并要求全部分类且资源归零。"""
+    """运行五种最终架构故障并要求分类稳定、资源归零。"""
     with tempfile.TemporaryDirectory(prefix="rivet-fault-benchmark-") as raw_root:
         root = Path(raw_root)
         probes = (
+            await _demand_journal_failure(root / "demand"),
             await _provider_disconnect(),
-            await _lsp_crash(root / "lsp"),
-            _disk_full(root / "disk"),
+            await _trace_fsync_failure(root / "fsync"),
             await _process_timeout(root / "process"),
-            await _trace_tail_corruption(root / "trace"),
+            await _trace_tail_corruption(root / "tail"),
         )
-    passed = all(result.passed for result in probes)
     return {
         "schema_version": 1,
         "suite": "faults",
-        "passed": passed,
+        "passed": all(result.passed for result in probes),
         "case_count": len(probes),
         "passed_count": sum(result.passed for result in probes),
         "resource_leak_count": sum(
@@ -71,18 +94,66 @@ async def run_fault_benchmark() -> dict[str, object]:
     }
 
 
+async def _demand_journal_failure(root: Path) -> FaultResult:
+    started_at = perf_counter()
+    root.mkdir(parents=True)
+    global _activation_count
+    _activation_count = 0
+    kernel = RivetKernel.from_manifests(
+        (
+            ModuleManifest(
+                module_id="fault.demand",
+                factory="scripts.fault_benchmark:create_fault_module",
+                provides=("fault.capability",),
+            ),
+        ),
+        demand_journal=InMemoryDemandJournal(fail_after=1),
+        lifecycle_sink=InMemoryModuleLifecycleSink(),
+        activation_context=ModuleActivationContext(repository=root),
+    )
+    await kernel.start()
+    parent = await kernel.begin_user_demand(
+        "fault-test",
+        reason="故障测试根需求",
+        context=DemandContext(
+            run_id="run_fault_demand",
+            session_id="session_fault_demand",
+        ),
+    )
+    actual_code = "fault.unexpected_success"
+    try:
+        await kernel.acquire_required(
+            "fault.capability",
+            parent=parent,
+            reason="必须先耐久记录的能力需求",
+        )
+    except DemandJournalError:
+        actual_code = "demand.journal_write_failed"
+    await kernel.shutdown()
+    resources = kernel.resource_counts().resource_count
+    expected_code = "demand.journal_write_failed"
+    return FaultResult(
+        fault_id="demand_journal_failure",
+        expected_code=expected_code,
+        actual_code=actual_code,
+        passed=(
+            actual_code == expected_code and _activation_count == 0 and resources == 0
+        ),
+        duration_ms=round((perf_counter() - started_at) * 1_000, 3),
+        resource_count_after=resources,
+    )
+
+
 async def _provider_disconnect() -> FaultResult:
-    """模拟连续断连并确认有界重试后分类失败。"""
     started_at = perf_counter()
     calls = [0]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        """在任何请求上模拟连接失败。"""
         calls[0] += 1
         raise httpx.ConnectError("fixture disconnect", request=request)
 
     async def no_wait(_delay: float) -> None:
-        """保留重试次数但不引入墙钟等待。"""
+        return None
 
     scope = ResourceScope("fault.provider_disconnect")
     provider = DeepSeekProvider(
@@ -104,109 +175,53 @@ async def _provider_disconnect() -> FaultResult:
         )
     except ProviderUnavailableError as error:
         actual_code = error.code
-    finally:
-        await scope.close()
+    await scope.close()
+    resources = scope.counts().resource_count
     expected_code = "provider.network_unavailable"
     return FaultResult(
-        fault_id="api_disconnect",
+        fault_id="provider_disconnect",
         expected_code=expected_code,
         actual_code=actual_code,
-        passed=actual_code == expected_code
-        and calls[0] == 2
-        and not scope.counts().resource_count,
+        passed=actual_code == expected_code and calls[0] == 2 and resources == 0,
         duration_ms=round((perf_counter() - started_at) * 1_000, 3),
-        resource_count_after=scope.counts().resource_count,
+        resource_count_after=resources,
     )
 
 
-async def _lsp_crash(root: Path) -> FaultResult:
-    """运行真实崩溃 sidecar 并验证只重启一次。"""
+async def _trace_fsync_failure(root: Path) -> FaultResult:
     started_at = perf_counter()
     repository = root / "repository"
     repository.mkdir(parents=True)
-    (repository / "target.py").write_text("symbol = 1\n", encoding="utf-8")
-    server = Path("tests/fixtures/context/lsp_server.py").resolve(strict=True)
-    manifest = LspServerManifest(
-        server_id="fault-fixture",
-        language_ids=("python",),
-        suffixes=(".py",),
-        executable_candidates=(sys.executable,),
-        arguments=(
-            str(server),
-            "--behavior",
-            "crash-always",
-            "--definition-uri",
-            (repository / "target.py").as_uri(),
-        ),
-        initialization_options={},
-        idle_timeout_seconds=300,
-        request_timeout_seconds=1,
-        max_restarts=1,
-    )
-    scope = ResourceScope("fault.lsp_crash")
-    sidecar = LspSidecar(manifest, repository_root=repository, scope=scope)
+    paths = _runtime_paths(repository, root)
+    store = TraceStore(paths)
+    await store.start()
     actual_code = "fault.unexpected_success"
-    try:
-        await sidecar.definition("target.py", LspPosition(0, 1))
-    except LspRestartLimitError:
-        actual_code = "lsp.restart_limit"
-    finally:
-        await sidecar.close()
-        await scope.close()
-    expected_code = "lsp.restart_limit"
+    with patch(
+        "rivet.trace.store.os.fsync",
+        side_effect=OSError(errno.ENOSPC, "fixture disk full"),
+    ):
+        try:
+            await store.emit(_trace_event(1, run_id="run_fault_fsync"))
+        except TraceWriteError:
+            actual_code = "trace.write_failed"
+    with suppress(TraceWriteError):
+        await store.close()
+    expected_code = "trace.write_failed"
     return FaultResult(
-        fault_id="lsp_crash",
+        fault_id="trace_fsync_failure",
         expected_code=expected_code,
         actual_code=actual_code,
         passed=(
             actual_code == expected_code
-            and sidecar.start_count == 2
-            and sidecar.restart_count == 1
-            and not scope.counts().resource_count
+            and store.pending_event_count == 0
+            and not tuple(paths.runtime_root.rglob("*.tmp"))
         ),
         duration_ms=round((perf_counter() - started_at) * 1_000, 3),
-        resource_count_after=scope.counts().resource_count,
-    )
-
-
-def _disk_full(root: Path) -> FaultResult:
-    """注入 ENOSPC 并确认 artifact 不会留下临时文件或伪造引用。"""
-    started_at = perf_counter()
-    root.mkdir(parents=True)
-    paths = RuntimePaths.for_repository(
-        root,
-        environment={"XDG_CACHE_HOME": str(root / "cache")},
-    )
-    store = TraceArtifactStore(paths, SecretRedactor(environment={}))
-    actual_code = "fault.unexpected_success"
-    with patch.object(
-        Path,
-        "write_bytes",
-        side_effect=OSError(errno.ENOSPC, "fixture disk full"),
-    ):
-        try:
-            store.capture(
-                run_id="run_fault_disk",
-                event_id="event_fault_disk",
-                stdout="bounded output",
-                stderr="",
-            )
-        except TraceWriteError:
-            actual_code = "trace.artifact_write_failed"
-    temporary_files = tuple(paths.runtime_root.rglob("*.tmp"))
-    expected_code = "trace.artifact_write_failed"
-    return FaultResult(
-        fault_id="disk_full",
-        expected_code=expected_code,
-        actual_code=actual_code,
-        passed=actual_code == expected_code and not temporary_files,
-        duration_ms=round((perf_counter() - started_at) * 1_000, 3),
-        resource_count_after=0,
+        resource_count_after=store.pending_event_count,
     )
 
 
 async def _process_timeout(root: Path) -> FaultResult:
-    """让真实子进程超时并验证进程组与 drain 任务全部回收。"""
     started_at = perf_counter()
     repository = root / "repository"
     repository.mkdir(parents=True)
@@ -222,6 +237,7 @@ async def _process_timeout(root: Path) -> FaultResult:
         timeout_seconds=0.05,
     )
     await scope.close()
+    resources = scope.counts().resource_count
     actual_code = "process.timeout" if result.timed_out else "fault.unexpected_success"
     expected_code = "process.timeout"
     return FaultResult(
@@ -231,30 +247,27 @@ async def _process_timeout(root: Path) -> FaultResult:
         passed=(
             actual_code == expected_code
             and result.returncode is not None
-            and not scope.counts().resource_count
+            and resources == 0
         ),
         duration_ms=round((perf_counter() - started_at) * 1_000, 3),
-        resource_count_after=scope.counts().resource_count,
+        resource_count_after=resources,
     )
 
 
 async def _trace_tail_corruption(root: Path) -> FaultResult:
-    """追加半条 NDJSON 并确认只截断损坏尾部后继续序号。"""
     started_at = perf_counter()
-    root.mkdir(parents=True)
-    paths = RuntimePaths.for_repository(
-        root,
-        environment={"XDG_CACHE_HOME": str(root / "cache")},
-    )
-    store = TraceStore(paths, redactor=SecretRedactor(environment={}))
+    repository = root / "repository"
+    repository.mkdir(parents=True)
+    paths = _runtime_paths(repository, root)
+    store = TraceStore(paths)
     await store.start()
-    await store.emit(_trace_event(1))
+    await store.emit(_trace_event(1, run_id="run_fault_tail"))
     await store.close()
     with paths.events_path.open("ab") as stream:
         stream.write(b'{"schema_version":1,"sequence":2')
-    recovered = TraceStore(paths, redactor=SecretRedactor(environment={}))
+    recovered = TraceStore(paths)
     await recovered.start()
-    record = await recovered.emit(_trace_event(2))
+    record = await recovered.emit(_trace_event(2, run_id="run_fault_tail"))
     truncated_bytes = recovered.recovery_report.truncated_bytes
     await recovered.close()
     actual_code = (
@@ -273,13 +286,22 @@ async def _trace_tail_corruption(root: Path) -> FaultResult:
     )
 
 
-def _trace_event(sequence: int) -> TraceEventEnvelope:
-    """构造固定 Trace 事件。"""
+def _runtime_paths(repository: Path, root: Path) -> RuntimePaths:
+    return RuntimePaths.for_repository(
+        repository,
+        environment={
+            "XDG_CACHE_HOME": str(root / "cache"),
+            "XDG_STATE_HOME": str(root / "state"),
+        },
+    )
+
+
+def _trace_event(sequence: int, *, run_id: str) -> TraceEventEnvelope:
     return TraceEventEnvelope(
         event_id=f"event_fault_trace_{sequence}",
         event_type="trace.fault_observed",
         timestamp=FIXED_NOW,
-        run_id="run_fault_trace",
+        run_id=run_id,
         session_id="session_fault_trace",
         payload={"sequence": sequence},
     )

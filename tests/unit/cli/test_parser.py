@@ -1,52 +1,53 @@
-"""冻结正式命令、参数和全局运行选项。"""
+"""冻结最终公开命令、参数和隐藏 Worker 入口。"""
 
 from __future__ import annotations
-
-from argparse import Namespace
 
 import pytest
 
 from rivet.cli.parser import OFFICIAL_COMMANDS, build_internal_parser, build_parser
 
+REMOVED_COMMANDS = (
+    "benchmark",
+    "clean",
+    "config",
+    "doctor",
+    "export",
+    "modules",
+    "plan",
+    "read",
+    "resume",
+    "trace",
+)
 
-def test_parser_exposes_every_official_command() -> None:
+
+def test_parser_exposes_exact_public_commands() -> None:
     parser = build_parser()
     help_text = parser.format_help()
 
     assert OFFICIAL_COMMANDS == (
         "init",
         "ask",
-        "read",
-        "plan",
         "fix",
-        "verify",
         "diff",
+        "verify",
         "apply",
         "abort",
-        "trace",
-        "resume",
-        "modules",
-        "doctor",
-        "benchmark",
-        "config",
-        "clean",
-        "export",
     )
     assert all(command in help_text for command in OFFICIAL_COMMANDS)
+    assert all(command not in help_text for command in REMOVED_COMMANDS)
     assert "internal" not in help_text
 
 
 @pytest.mark.parametrize("command", OFFICIAL_COMMANDS)
 def test_every_command_help_returns_success(command: str) -> None:
-    parser = build_parser()
     with pytest.raises(SystemExit) as captured:
-        parser.parse_args((command, "--help"))
+        build_parser().parse_args((command, "--help"))
 
     assert captured.value.code == 0
 
 
-def test_parser_preserves_structured_arguments() -> None:
-    arguments: Namespace = build_parser().parse_args(
+def test_fix_preserves_only_explicit_scope_and_confirmation_arguments() -> None:
+    arguments = build_parser().parse_args(
         (
             "--repository",
             "/repo",
@@ -56,9 +57,16 @@ def test_parser_preserves_structured_arguments() -> None:
             "fix",
             "修复边界",
             "--yes",
-            "--candidate-only",
-            "--dirty-policy",
-            "snapshot",
+            "--allow-read",
+            "tests/test_app.py",
+            "--allow-write",
+            "src/rivet/app.py",
+            "--allow-new",
+            "tests/test_new_app.py",
+            "--acceptance-sha256",
+            "sha256:" + "a" * 64,
+            "--base-commit",
+            "b" * 40,
         )
     )
 
@@ -66,16 +74,39 @@ def test_parser_preserves_structured_arguments() -> None:
     assert arguments.task == "修复边界"
     assert arguments.model == "deepseek-v4-flash"
     assert arguments.yes is True
-    assert arguments.candidate_only is True
-    assert arguments.dirty_policy == "snapshot"
+    assert arguments.allow_read == ["tests/test_app.py"]
+    assert arguments.allow_write == ["src/rivet/app.py"]
+    assert arguments.allow_new == ["tests/test_new_app.py"]
+    assert arguments.acceptance_sha256 == "sha256:" + "a" * 64
+    assert arguments.base_commit == "b" * 40
+    assert not hasattr(arguments, "candidate_only")
+    assert not hasattr(arguments, "dirty_policy")
+    assert not hasattr(arguments, "safe_mode")
+
+
+@pytest.mark.parametrize("flag", ("--candidate-only", "--dirty-policy", "--safe-mode"))
+def test_removed_fix_flag_is_rejected(flag: str) -> None:
+    argv = ["fix", "修复", flag]
+    if flag == "--dirty-policy":
+        argv.append("snapshot")
+
+    with pytest.raises(SystemExit) as captured:
+        build_parser().parse_args(tuple(argv))
+
+    assert captured.value.code == 2
+
+
+@pytest.mark.parametrize("command", REMOVED_COMMANDS)
+def test_removed_command_is_rejected(command: str) -> None:
+    with pytest.raises(SystemExit) as captured:
+        build_parser().parse_args((command,))
+
+    assert captured.value.code == 2
 
 
 def test_init_requires_explicit_yes_only_for_writing() -> None:
-    preview = build_parser().parse_args(("init",))
-    confirmed = build_parser().parse_args(("init", "--yes"))
-
-    assert preview.yes is False
-    assert confirmed.yes is True
+    assert build_parser().parse_args(("init",)).yes is False
+    assert build_parser().parse_args(("init", "--yes")).yes is True
 
 
 def test_apply_requires_transaction_id() -> None:
@@ -83,63 +114,6 @@ def test_apply_requires_transaction_id() -> None:
         build_parser().parse_args(("apply",))
 
     assert captured.value.code == 2
-
-
-def test_read_parser_exposes_bounded_enhancement_options() -> None:
-    arguments = build_parser().parse_args(
-        (
-            "read",
-            "video.mp4",
-            "--ocr",
-            "--transcribe",
-            "--frames",
-            "8",
-            "--max-ocr-pages",
-            "12",
-            "--max-image-pixels",
-            "2000000",
-            "--max-audio-duration",
-            "600",
-            "--max-output-chars",
-            "5000",
-            "--timeout",
-            "15",
-        )
-    )
-
-    assert arguments.ocr is True
-    assert arguments.transcribe is True
-    assert arguments.frames == 8
-    assert arguments.max_ocr_pages == 12
-    assert arguments.max_image_pixels == 2_000_000
-    assert arguments.max_audio_duration == 600
-    assert arguments.max_output_chars == 5_000
-    assert arguments.timeout == 15
-
-
-def test_modules_parser_exposes_lifecycle_operations_and_safety_options() -> None:
-    arguments = build_parser().parse_args(
-        (
-            "modules",
-            "disable",
-            "context.syntax",
-            "--cascade",
-            "--wait",
-            "--timeout",
-            "12",
-            "--yes",
-            "--json",
-        )
-    )
-
-    assert arguments.command == "modules"
-    assert arguments.module_command == "disable"
-    assert arguments.module_id == "context.syntax"
-    assert arguments.cascade is True
-    assert arguments.wait is True
-    assert arguments.timeout == 12
-    assert arguments.yes is True
-    assert arguments.json_output is True
 
 
 def test_internal_worker_uses_separate_hidden_parser() -> None:

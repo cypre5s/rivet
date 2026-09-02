@@ -44,16 +44,22 @@ def _forbidden_loaded_modules() -> list[str]:
 async def _probe_empty_kernel() -> dict[str, object]:
     """在独立进程中启动并关闭无模块 Kernel。"""
     from rivet.kernel.application import RivetKernel
+    from rivet.kernel.capability_demand import InMemoryDemandJournal
+    from rivet.kernel.module_api import ModuleActivationContext
+    from rivet.kernel.module_events import InMemoryModuleLifecycleSink
 
     with tempfile.TemporaryDirectory(prefix="rivet-kernel-probe-") as directory:
         kernel = RivetKernel.from_manifests(
             (),
-            journal_path=Path(directory) / "activation-journal.json",
-            safe_mode=True,
+            demand_journal=InMemoryDemandJournal(),
+            lifecycle_sink=InMemoryModuleLifecycleSink(),
+            activation_context=ModuleActivationContext(
+                repository=Path(directory),
+            ),
         )
         await kernel.start()
         await kernel.shutdown()
-        resource_count = kernel.runtime.resource_counts().resource_count
+        resource_count = kernel.resource_counts().resource_count
     return {
         "peak_rss_mib": round(
             resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
@@ -125,12 +131,9 @@ def _measure_manifest_loading() -> dict[str, object]:
                 "\n".join(
                     (
                         f'module_id = "probe.module_{index}"',
-                        'module_version = "1.0.0"',
-                        'activation = "on_demand"',
                         'factory = "rivet.modules.probe:create_module"',
                         f'provides = ["probe.capability_{index}"]',
                         "requires = []",
-                        "idle_timeout_seconds = 300",
                     )
                 ),
                 encoding="utf-8",

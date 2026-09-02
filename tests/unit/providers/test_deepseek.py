@@ -9,6 +9,7 @@ from typing import cast
 
 import httpx
 import pytest
+from pydantic import ValidationError
 
 from rivet.contracts.messages import AssistantMessage, ProviderOpaqueState, ToolMessage
 from rivet.contracts.provider import ModelFinishReason
@@ -31,7 +32,7 @@ from tests.fixtures.providers.factories import (
 from tests.fixtures.providers.http_stream import RecordedByteStream
 
 FIXTURE_DIRECTORY = Path("tests/fixtures/providers")
-DEEPSEEK_TOOL_NAME_PATTERN = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
+DEEPSEEK_TOOL_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 LOCAL_TOOL_CALL_ID_PATTERN = re.compile(r"^call_[a-z0-9][a-z0-9_-]{0,62}$")
 
 
@@ -41,7 +42,7 @@ def test_default_timeout_allows_reasoning_tool_turns() -> None:
 
 
 def _tool_definition(name: str) -> ToolDefinition:
-    """构造带点分本地名称的最小工具契约。"""
+    """构造使用原样 snake_case 名称的最小工具契约。"""
     return ToolDefinition(
         name=name,
         description=f"调用 {name}",
@@ -103,7 +104,7 @@ async def test_streaming_and_non_streaming_fixtures_are_equivalent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_tool_arguments_split_into_twenty_chunks_are_aggregated() -> None:
+async def test_streaming_tool_name_is_unchanged_and_arguments_are_aggregated() -> None:
     arguments = json.dumps({"text": "split-value"}, separators=(",", ":"))
     fragment_count = 20
     fragments = [
@@ -168,72 +169,53 @@ async def test_tool_arguments_split_into_twenty_chunks_are_aggregated() -> None:
     )
 
     request = model_request(stream=True).model_copy(
-        update={"tools": (_tool_definition("test.echo"),)}
+        update={"tools": (_tool_definition("test_echo"),)}
     )
 
     completion = await provider.complete(request)
 
     assert completion.message.tool_calls[0].arguments == {"text": "split-value"}
-    assert completion.message.tool_calls[0].tool_name == "test.echo"
+    assert completion.message.tool_calls[0].tool_name == "test_echo"
     assert LOCAL_TOOL_CALL_ID_PATTERN.fullmatch(
         completion.message.tool_calls[0].tool_call_id
     )
     await scope.close()
 
 
-def test_request_body_encodes_dotted_names_without_changing_local_contract() -> None:
+def test_request_body_preserves_declared_tool_names_exactly() -> None:
     provider = DeepSeekProvider(
         DeepSeekConfig(),
-        scope=ResourceScope("provider.tool_alias.body"),
+        scope=ResourceScope("provider.tool_identity.body"),
         environment={"DEEPSEEK_API_KEY": fake_api_key()},
     )
     definitions = (
-        _tool_definition("workspace.info"),
-        _tool_definition("file.read_text"),
+        _tool_definition("workspace_info"),
+        _tool_definition("file_read"),
     )
     request = model_request(stream=False).model_copy(update={"tools": definitions})
 
     body = provider.build_request_body(request)
 
     tools = cast(list[dict[str, object]], body["tools"])
-    wire_names = [cast(dict[str, object], tool["function"])["name"] for tool in tools]
-    assert wire_names == ["workspace_info", "file_read_text"]
-    assert all(
-        isinstance(name, str) and DEEPSEEK_TOOL_NAME_PATTERN.fullmatch(name)
-        for name in wire_names
-    )
-    assert [definition.name for definition in definitions] == [
-        "workspace.info",
-        "file.read_text",
+    request_names = [
+        cast(dict[str, object], tool["function"])["name"] for tool in tools
     ]
-
-
-def test_request_body_disambiguates_colliding_and_overlong_tool_aliases() -> None:
-    provider = DeepSeekProvider(
-        DeepSeekConfig(),
-        scope=ResourceScope("provider.tool_alias.collision"),
-        environment={"DEEPSEEK_API_KEY": fake_api_key()},
-    )
-    definitions = (
-        _tool_definition("alpha.beta_gamma"),
-        _tool_definition("alpha_beta.gamma"),
-        _tool_definition(f"repository.{('very_long_segment_' * 8).rstrip('_')}"),
-    )
-    request = model_request(stream=False).model_copy(update={"tools": definitions})
-
-    body = provider.build_request_body(request)
-
-    tools = cast(list[dict[str, object]], body["tools"])
-    wire_names = [cast(dict[str, object], tool["function"])["name"] for tool in tools]
-    assert len(wire_names) == len(set(wire_names)) == 3
+    assert request_names == ["workspace_info", "file_read"]
     assert all(
         isinstance(name, str) and DEEPSEEK_TOOL_NAME_PATTERN.fullmatch(name)
-        for name in wire_names
+        for name in request_names
     )
+    assert request_names == [definition.name for definition in definitions]
+
+
+@pytest.mark.parametrize("name", ("workspace.info", "a" * 65))
+def test_tool_name_contract_rejects_dotted_or_overlong_names(name: str) -> None:
+    with pytest.raises(ValidationError, match="name"):
+        _tool_definition(name)
 
 
 @pytest.mark.asyncio
-async def test_non_streaming_tool_alias_is_restored_to_local_name() -> None:
+async def test_non_streaming_tool_name_is_returned_unchanged() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         request_body = json.loads(request.content)
         tools = cast(list[dict[str, object]], request_body["tools"])
@@ -242,7 +224,7 @@ async def test_non_streaming_tool_alias_is_restored_to_local_name() -> None:
         return httpx.Response(
             200,
             json={
-                "id": "tool_alias_non_stream",
+                "id": "tool_identity_non_stream",
                 "model": "deepseek-v4-pro",
                 "choices": [
                     {
@@ -273,7 +255,7 @@ async def test_non_streaming_tool_alias_is_restored_to_local_name() -> None:
             request=request,
         )
 
-    scope = ResourceScope("provider.tool_alias.non_stream")
+    scope = ResourceScope("provider.tool_identity.non_stream")
     provider = DeepSeekProvider(
         DeepSeekConfig(),
         scope=scope,
@@ -282,12 +264,12 @@ async def test_non_streaming_tool_alias_is_restored_to_local_name() -> None:
         clock=lambda: FIXED_NOW,
     )
     request = model_request(stream=False).model_copy(
-        update={"tools": (_tool_definition("workspace.info"),)}
+        update={"tools": (_tool_definition("workspace_info"),)}
     )
 
     completion = await provider.complete(request)
 
-    assert completion.message.tool_calls[0].tool_name == "workspace.info"
+    assert completion.message.tool_calls[0].tool_name == "workspace_info"
     assert LOCAL_TOOL_CALL_ID_PATTERN.fullmatch(
         completion.message.tool_calls[0].tool_call_id
     )
@@ -295,9 +277,9 @@ async def test_non_streaming_tool_alias_is_restored_to_local_name() -> None:
 
 
 @pytest.mark.asyncio
-async def test_unknown_wire_tool_alias_fails_closed() -> None:
+async def test_non_streaming_unknown_tool_name_fails_closed() -> None:
     document = {
-        "id": "unknown_tool_alias",
+        "id": "unknown_tool_name",
         "model": "deepseek-v4-pro",
         "choices": [
             {
@@ -308,10 +290,10 @@ async def test_unknown_wire_tool_alias_fails_closed() -> None:
                     "content": "",
                     "tool_calls": [
                         {
-                            "id": "call_alias_unknown",
+                            "id": "call_name_unknown",
                             "type": "function",
                             "function": {
-                                "name": "unknown_alias",
+                                "name": "unknown_tool",
                                 "arguments": "{}",
                             },
                         }
@@ -321,7 +303,7 @@ async def test_unknown_wire_tool_alias_fails_closed() -> None:
         ],
         "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
     }
-    scope = ResourceScope("provider.tool_alias.unknown")
+    scope = ResourceScope("provider.tool_identity.unknown")
     provider = DeepSeekProvider(
         DeepSeekConfig(),
         scope=scope,
@@ -332,11 +314,12 @@ async def test_unknown_wire_tool_alias_fails_closed() -> None:
         clock=lambda: FIXED_NOW,
     )
     request = model_request(stream=False).model_copy(
-        update={"tools": (_tool_definition("workspace.info"),)}
+        update={"tools": (_tool_definition("workspace_info"),)}
     )
 
-    with pytest.raises(ProviderProtocolError, match="Tool Call"):
+    with pytest.raises(ProviderProtocolError, match="Tool Call") as captured:
         await provider.complete(request)
+    assert captured.value.code == "provider.tool_name_unknown"
 
     await scope.close()
 
@@ -352,7 +335,7 @@ def test_request_body_preserves_reasoning_content_for_tool_turn() -> None:
         tool_calls=(
             ToolCall(
                 tool_call_id="call_reasoning_1",
-                tool_name="test.echo",
+                tool_name="test_echo",
                 arguments={"text": "hello"},
             ),
         ),
@@ -375,7 +358,7 @@ def test_request_body_preserves_reasoning_content_for_tool_turn() -> None:
                 assistant,
                 tool_message,
             ),
-            "tools": (_tool_definition("test.echo"),),
+            "tools": (_tool_definition("test_echo"),),
         }
     )
 
@@ -394,7 +377,7 @@ def test_request_body_preserves_reasoning_content_for_tool_turn() -> None:
 def test_history_tool_name_missing_from_current_definitions_fails_closed() -> None:
     provider = DeepSeekProvider(
         DeepSeekConfig(),
-        scope=ResourceScope("provider.tool_alias.history_missing"),
+        scope=ResourceScope("provider.tool_identity.history_missing"),
         environment={"DEEPSEEK_API_KEY": fake_api_key()},
     )
     assistant = AssistantMessage(
@@ -402,7 +385,7 @@ def test_history_tool_name_missing_from_current_definitions_fails_closed() -> No
         tool_calls=(
             ToolCall(
                 tool_call_id="call_history_missing",
-                tool_name="test.echo",
+                tool_name="test_echo",
                 arguments={},
             ),
         ),
@@ -412,8 +395,9 @@ def test_history_tool_name_missing_from_current_definitions_fails_closed() -> No
         update={"messages": (*model_request(stream=False).messages, assistant)}
     )
 
-    with pytest.raises(ProviderRequestError, match="当前工具定义"):
+    with pytest.raises(ProviderRequestError, match="当前工具定义") as captured:
         provider.build_request_body(request)
+    assert captured.value.code == "provider.tool_name_unknown"
 
 
 @pytest.mark.asyncio

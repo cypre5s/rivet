@@ -40,6 +40,25 @@ def test_reader_rejects_binary_and_oversized_files(tmp_path: Path) -> None:
         reader.read_text("large.txt")
 
 
+@pytest.mark.parametrize(
+    "content",
+    (
+        "中文旧编码".encode("gb18030"),
+        "utf16 text".encode("utf-16"),
+    ),
+)
+def test_reader_rejects_non_utf8_text_encodings(
+    tmp_path: Path,
+    content: bytes,
+) -> None:
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    (repository / "legacy.txt").write_bytes(content)
+
+    with pytest.raises(WorkspaceToolError, match="UTF-8|二进制"):
+        FileReader(WorkspaceBoundary(repository)).read_text("legacy.txt")
+
+
 def test_transaction_writer_is_atomic_and_never_changes_main_root(
     tmp_path: Path,
 ) -> None:

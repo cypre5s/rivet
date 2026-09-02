@@ -18,19 +18,21 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import cast
 
+from rivet.trace.audit import audit_demand_trace, load_trace
+from rivet.trace.paths import RuntimePaths
+
 DEMO_TASK = (
     "修复 calculator.py：total_with_tax 应计算 subtotal * (1 + rate)，"
     "保留两位小数，并保持零金额和零税率行为"
 )
 RECORDED_TOOL_NAMES = (
-    "workspace.info",
-    "search.files",
-    "file.read_text",
-    "file.read_text",
-    "process.run",
-    "file.replace_transaction",
-    "process.run",
-    "git.diff",
+    "workspace_info",
+    "context_search",
+    "file_read",
+    "file_read",
+    "file_read",
+    "file_replace",
+    "git_diff",
 )
 ROOT = Path(__file__).parents[1]
 FIXTURE_ROOT = ROOT / "demo" / "calculator-fix"
@@ -129,6 +131,7 @@ def materialize_demo_repository(destination: Path) -> Path:
         "--",
         ".gitignore",
         ".rivet/project.toml",
+        "acceptance_calculator.py",
         "calculator.py",
         "test_calculator.py",
     )
@@ -162,37 +165,48 @@ def run_release_demo(*, bwrap_path: Path) -> dict[str, object]:
         )
         if baseline.returncode != 1 or "FAIL" not in baseline.stdout:
             raise DemoError("固定演示基线没有稳定复现")
-        modules = _run_cli(repository, environment, "modules")
         with _recorded_provider() as provider:
             environment["RIVET_BASE_URL"] = provider.base_url
+            proposal = _run_cli(
+                repository,
+                environment,
+                "fix",
+                DEMO_TASK,
+                "--allow-read",
+                "test_calculator.py",
+                "--allow-write",
+                "calculator.py",
+                timeout=180,
+            )
+            if proposal.get("transaction_created") is not False:
+                raise DemoError("只读 Proposal 错误地创建了事务")
+            acceptance_hash = _required_text(proposal, "acceptance_sha256")
+            base_commit = _required_text(proposal, "base_commit")
             fix = _run_cli(
                 repository,
                 environment,
                 "fix",
                 DEMO_TASK,
+                "--allow-read",
+                "test_calculator.py",
+                "--allow-write",
+                "calculator.py",
                 "--yes",
+                "--acceptance-sha256",
+                acceptance_hash,
+                "--base-commit",
+                base_commit,
                 timeout=180,
             )
-        if provider.request_count != len(RECORDED_TOOL_NAMES) + 1:
+        if provider.request_count != len(RECORDED_TOOL_NAMES) + 2:
             raise DemoError("录制 Provider 请求轮数不符合冻结脚本")
         transaction_id = _required_text(fix, "transaction_id")
-        if fix.get("status") != "PASSED" or fix.get("apply_required") is not True:
+        if fix.get("status") != "PASSED" or fix.get("apply_eligible") is not True:
             raise DemoError("固定演示补丁没有通过确定性验证")
         diff_result = _run_cli(repository, environment, "diff", transaction_id)
         patch = _required_text(diff_result, "diff")
         if OLD_IMPLEMENTATION not in patch or NEW_IMPLEMENTATION not in patch:
             raise DemoError("演示 Diff 不包含冻结修复")
-        trace_index = _run_cli(repository, environment, "trace")
-        raw_run_ids = trace_index.get("run_ids")
-        if not isinstance(raw_run_ids, list):
-            raise DemoError("演示 Trace 缺少唯一 run_id")
-        run_ids = cast(list[object], raw_run_ids)
-        if len(run_ids) != 1:
-            raise DemoError("演示 Trace 缺少唯一 run_id")
-        run_id = run_ids[0]
-        if not isinstance(run_id, str):
-            raise DemoError("演示 Trace run_id 无效")
-        trace_replay = _run_cli(repository, environment, "trace", run_id)
         apply_result = _run_cli(repository, environment, "apply", transaction_id)
         final_test = _run_command(
             ("/usr/bin/python3", "test_calculator.py"),
@@ -209,6 +223,14 @@ def run_release_demo(*, bwrap_path: Path) -> dict[str, object]:
             cwd=repository,
             environment=environment,
         )
+        runtime_paths = RuntimePaths.for_repository(repository, environment=environment)
+        trace_audit = audit_demand_trace(load_trace(runtime_paths.events_path))
+        if (
+            not trace_audit.passed
+            or trace_audit.orphan_activation_count != 0
+            or trace_audit.demand_traceability_percent != 100.0
+        ):
+            raise DemoError("演示 Trace 未满足 Demand 因果门禁")
         return {
             "schema_version": 1,
             "mode": "offline_recorded_provider",
@@ -220,22 +242,30 @@ def run_release_demo(*, bwrap_path: Path) -> dict[str, object]:
                 "summary": baseline.stdout.strip(),
             },
             "agent": {
-                "answer": _required_text(fix, "answer"),
+                "answer": _required_text(fix, "assistant_summary"),
                 "evidence_id": _required_text(fix, "evidence_id"),
                 "provider_request_count": provider.request_count,
                 "status": fix["status"],
                 "tool_sequence": list(RECORDED_TOOL_NAMES),
                 "transaction_id": transaction_id,
             },
-            "modules": modules,
+            "evidence": fix,
             "patch": patch,
-            "trace": trace_replay,
             "apply": apply_result,
             "final_test": {
                 "exit_code": final_test.returncode,
                 "summary": final_test.stdout.strip(),
             },
             "main_worktree_status": status.stdout.splitlines(),
+            "trace_audit": {
+                "activation_count": trace_audit.activation_count,
+                "demand_count": trace_audit.demand_count,
+                "demand_traceability_percent": (
+                    trace_audit.demand_traceability_percent
+                ),
+                "orphan_activation_count": trace_audit.orphan_activation_count,
+                "passed": trace_audit.passed,
+            },
         }
 
 
@@ -262,22 +292,17 @@ def _recorded_provider() -> Generator[_RecordedServer]:
 
 
 def _recorded_responses() -> tuple[bytes, ...]:
-    """返回上下文、基线、补丁、验证、Diff 和最终回答的固定轮次。"""
-    calls: tuple[tuple[str, dict[str, object]], ...] = (
-        ("workspace.info", {}),
-        ("search.files", {"glob": "*.py", "max_results": 20}),
-        ("file.read_text", {"path": "calculator.py"}),
-        ("file.read_text", {"path": "test_calculator.py"}),
+    """返回只读调查和已确认候选修改两个独立 Agent 调用序列。"""
+    investigation_calls: tuple[tuple[str, dict[str, object]], ...] = (
+        ("workspace_info", {}),
+        ("context_search", {"query": "calculator total_with_tax", "max_results": 20}),
+        ("file_read", {"path": "calculator.py"}),
+        ("file_read", {"path": "test_calculator.py"}),
+    )
+    fix_calls: tuple[tuple[str, dict[str, object]], ...] = (
+        ("file_read", {"path": "calculator.py"}),
         (
-            "process.run",
-            {
-                "argv": ["/usr/bin/python3", "test_calculator.py"],
-                "cwd": ".",
-                "timeout_seconds": 10.0,
-            },
-        ),
-        (
-            "file.replace_transaction",
+            "file_replace",
             {
                 "path": "calculator.py",
                 "old_text": OLD_IMPLEMENTATION,
@@ -285,21 +310,38 @@ def _recorded_responses() -> tuple[bytes, ...]:
                 "expected_count": 1,
             },
         ),
-        (
-            "process.run",
-            {
-                "argv": ["/usr/bin/python3", "test_calculator.py"],
-                "cwd": ".",
-                "timeout_seconds": 10.0,
-            },
-        ),
-        ("git.diff", {}),
+        ("git_diff", {}),
     )
-    responses = tuple(
+    investigation = tuple(
         _tool_sse(index, name, arguments)
-        for index, (name, arguments) in enumerate(calls, start=1)
+        for index, (name, arguments) in enumerate(investigation_calls, start=1)
     )
-    return (*responses, _final_sse(len(responses) + 1))
+    offset = len(investigation) + 1
+    fix = tuple(
+        _tool_sse(index, name, arguments)
+        for index, (name, arguments) in enumerate(fix_calls, start=offset + 1)
+    )
+    return (
+        *investigation,
+        _investigation_final_sse(offset),
+        *fix,
+        _final_sse(offset + len(fix) + 1),
+    )
+
+
+def _investigation_final_sse(index: int) -> bytes:
+    """结束只读调查，不声称已生成候选补丁。"""
+    return _sse_bytes(
+        f"release-demo-{index}",
+        delta={
+            "role": "assistant",
+            "content": (
+                "根因是 total_with_tax 把税率直接相加；最小写范围是 calculator.py，"
+                "独立 acceptance_calculator.py 足以验收目标行为。"
+            ),
+        },
+        finish_reason="stop",
+    )
 
 
 def _tool_sse(index: int, name: str, arguments: Mapping[str, object]) -> bytes:
@@ -314,7 +356,7 @@ def _tool_sse(index: int, name: str, arguments: Mapping[str, object]) -> bytes:
                 "id": f"call_release_demo_{index}",
                 "type": "function",
                 "function": {
-                    "name": name.replace(".", "_"),
+                    "name": name,
                     "arguments": json.dumps(
                         arguments,
                         ensure_ascii=False,

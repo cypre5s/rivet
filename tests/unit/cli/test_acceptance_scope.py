@@ -1,34 +1,16 @@
-"""验证 fix 的候选写范围来自任务而不是仓库顶层清单。"""
+"""验证 FIX 只接受用户显式确认的最小写范围。"""
 
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 import pytest
 
-from rivet.cli.errors import CliConfigurationError
-from rivet.cli.model_commands import (
-    _authorizer,  # pyright: ignore[reportPrivateUsage]
-    resolve_task_acceptance_scope,
-)
+from rivet.cli.config import load_config
+from rivet.cli.errors import CliSecurityError
+from rivet.cli.model_commands import build_acceptance_spec
 from rivet.cli.parser import build_parser
-from rivet.contracts.guard import (
-    AuthorizationStatus,
-    Permission,
-    PermissionRequest,
-    PermissionScope,
-)
-from rivet.guard.permissions import GuardPolicy
-
-
-def _git(repository: Path, *arguments: str) -> None:
-    subprocess.run(
-        ("git", *arguments),
-        cwd=repository,
-        check=True,
-        capture_output=True,
-    )
+from rivet.verify.detector import ProjectDetection, ProjectDetector
 
 
 @pytest.fixture
@@ -36,109 +18,90 @@ def repository(tmp_path: Path) -> Path:
     root = tmp_path / "repository"
     (root / "src" / "auth").mkdir(parents=True)
     (root / "tests").mkdir()
-    for relative in (
-        "src/auth/login.py",
-        "src/auth/unrelated.py",
-        "tests/test_login.py",
-        "README.md",
-    ):
-        (root / relative).write_text(f"{relative}\n", encoding="utf-8")
-    _git(root, "init", "-q", "-b", "main")
-    _git(root, "add", "--", ".")
-    _git(
-        root,
-        "-c",
-        "user.name=Fixture",
-        "-c",
-        "user.email=fixture@example.invalid",
-        "commit",
-        "-qm",
-        "initial",
+    (root / ".rivet").mkdir()
+    (root / "src" / "auth" / "login.py").write_text(
+        "def login():\n    return False\n",
+        encoding="utf-8",
+    )
+    (root / "tests" / "acceptance.py").write_text(
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    (root / ".rivet" / "project.toml").write_text(
+        """schema_version = 1
+
+[rivet]
+model = "deepseek-v4-flash"
+
+[verification]
+acceptance = [["python", "tests/acceptance.py"]]
+regression = []
+static = []
+""",
+        encoding="utf-8",
     )
     return root
 
 
-def test_task_scope_selects_named_target_and_corresponding_test(
-    repository: Path,
-) -> None:
-    scope = resolve_task_acceptance_scope(
+def _detection(repository: Path) -> ProjectDetection:
+    return ProjectDetector().detect(repository)
+
+
+def _build(repository: Path, paths: tuple[str, ...]):
+    return build_acceptance_spec(
         repository,
-        "修复 src/auth/login.py 的登录问题",
-        explicit_paths=(),
+        "修复登录行为",
+        detection=_detection(repository),
+        explicit_paths=paths,
+        config=load_config(repository, environment={}),
     )
 
-    assert scope.write_scope == ("src/auth/login.py", "tests/test_login.py")
-    assert scope.allowed_new_paths == ()
-    assert "src/auth/unrelated.py" not in scope.write_scope
-    assert "README.md" not in scope.write_scope
 
-
-def test_task_scope_honors_exclusive_write_wording_and_preserves_named_test(
+def test_explicit_scope_is_frozen_without_repository_wide_expansion(
     repository: Path,
 ) -> None:
-    scope = resolve_task_acceptance_scope(
-        repository,
-        (
-            "修复 src/auth/login.py 中的登录问题，只允许修改 "
-            "src/auth/login.py，保留 tests/test_login.py 和现有公开接口。"
-        ),
-        explicit_paths=(),
-    )
+    specification = _build(repository, ("src/auth/login.py",))
 
-    assert scope.write_scope == ("src/auth/login.py",)
-    assert scope.allowed_new_paths == ()
-    assert scope.reason == "用户在任务文本中明确限定的独占写范围"
+    assert specification.write_scope == ("src/auth/login.py",)
+    assert specification.allowed_paths == ("src/auth/login.py",)
+    assert specification.read_scope == ("src/auth/login.py",)
+    assert specification.allowed_new_paths == ()
+    assert specification.scope_source == "explicit"
+    assert specification.preserved_behaviors == ()
+    assert "tests/acceptance.py" in specification.forbidden_paths
+    assert ".rivet/project.toml" in specification.forbidden_paths
 
 
-def test_explicit_scope_can_allow_one_new_test_but_not_its_directory(
+def test_scope_cannot_cover_independent_acceptance_or_project_config(
     repository: Path,
 ) -> None:
-    scope = resolve_task_acceptance_scope(
-        repository,
-        "补充回归测试",
-        explicit_paths=("tests/test_login_regression.py",),
-    )
+    for path in ("tests", ".rivet/project.toml"):
+        with pytest.raises(CliSecurityError) as captured:
+            _build(repository, (path,))
 
-    assert scope.write_scope == ("tests/test_login_regression.py",)
-    assert scope.allowed_new_paths == ("tests/test_login_regression.py",)
-    assert "tests" not in scope.write_scope
+        assert captured.value.code in {
+            "acceptance.oracle_overlap",
+            "acceptance.write_scope_invalid",
+        }
 
 
 @pytest.mark.parametrize(
     "path",
-    (
-        ".git/config",
-        ".env",
-        "credentials.json",
-        "src/auth/link.py",
-        "../outside.py",
-    ),
+    (".git/config", ".env", "credentials.json", "../outside.py"),
 )
-def test_explicit_scope_rejects_protected_or_escaping_paths(
+def test_scope_rejects_protected_or_escaping_paths(
     repository: Path,
-    tmp_path: Path,
     path: str,
 ) -> None:
-    (tmp_path / "outside.py").write_text("outside\n", encoding="utf-8")
-    (repository / "src" / "auth" / "link.py").symlink_to(tmp_path / "outside.py")
-
-    with pytest.raises(CliConfigurationError) as captured:
-        resolve_task_acceptance_scope(
-            repository,
-            "修改显式文件",
-            explicit_paths=(path,),
-        )
+    with pytest.raises(CliSecurityError) as captured:
+        _build(repository, (path,))
 
     assert captured.value.code == "acceptance.write_scope_invalid"
 
 
-def test_headless_fix_without_task_paths_fails_closed(repository: Path) -> None:
-    with pytest.raises(CliConfigurationError) as captured:
-        resolve_task_acceptance_scope(
-            repository,
-            "修复登录行为但没有声明文件",
-            explicit_paths=(),
-        )
+def test_headless_fix_without_explicit_scope_fails_closed(repository: Path) -> None:
+    with pytest.raises(CliSecurityError) as captured:
+        _build(repository, ())
 
     assert captured.value.code == "acceptance.write_scope_required"
 
@@ -153,32 +116,34 @@ def test_fix_parser_accepts_repeatable_explicit_write_scope() -> None:
             "src/auth/login.py",
             "--allow-write",
             "tests/test_login.py",
+            "--allow-read",
+            "tests/acceptance.py",
+            "--allow-new",
+            "src/auth/generated.py",
         )
     )
 
     assert arguments.allow_write == ["src/auth/login.py", "tests/test_login.py"]
+    assert arguments.allow_read == ["tests/acceptance.py"]
+    assert arguments.allow_new == ["src/auth/generated.py"]
 
 
-@pytest.mark.parametrize(
-    "path",
-    ("src/auth/unrelated.py", "README.md", "tests/arbitrary.py"),
-)
-def test_guard_denies_every_path_outside_frozen_file_scope(path: str) -> None:
-    authorize = _authorizer(
-        GuardPolicy(headless=True),
-        approved=True,
-        allowed_paths=("src/auth/login.py", "tests/test_login.py"),
-    )
-    request = PermissionRequest(
-        permission=Permission.WRITE,
-        scope=PermissionScope.SPECIFIC_PATHS,
-        reason="执行冻结任务",
-        run_id="run_scope",
-        transaction_id="tx_scope",
-        paths=(path,),
+def test_new_only_fix_requires_explicit_read_and_new_scopes(repository: Path) -> None:
+    specification = build_acceptance_spec(
+        repository,
+        "新增登录审计模块",
+        detection=_detection(repository),
+        explicit_paths=(),
+        explicit_read_paths=("src/auth/login.py",),
+        explicit_new_paths=("src/auth/audit.py",),
+        config=load_config(repository, environment={}),
     )
 
-    decision = authorize(request)
+    assert specification.write_scope == ("src/auth/audit.py",)
+    assert specification.allowed_paths == ("src/auth/audit.py",)
+    assert specification.allowed_new_paths == ("src/auth/audit.py",)
+    assert specification.read_scope == ("src/auth/login.py",)
 
-    assert decision.status is AuthorizationStatus.DENIED
-    assert decision.code == "guard.acceptance_scope_denied"
+    with pytest.raises(CliSecurityError) as captured:
+        _build(repository, ("src/auth/missing.py",))
+    assert captured.value.code == "acceptance.write_scope_invalid"

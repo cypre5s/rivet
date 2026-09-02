@@ -1,18 +1,16 @@
-"""用八类真实补丁验证 V0-V10 最终判定。"""
+"""用八类真实补丁验证七类 Evidence 最终判定。"""
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
-from rivet.contracts.transactions import TransactionState
+from rivet.contracts.transactions import AcceptanceSpec, TransactionState
 from rivet.contracts.verification import VerificationKind, VerificationStatus
 from rivet.kernel.resources import ResourceScope
 from rivet.tools.files import TransactionFileWriter
-from rivet.transaction.errors import TransactionError
-from rivet.verify.detector import ProjectConfiguration
 from rivet.verify.service import VerificationService
 from tests.fixtures.verification.cases import (
     VERIFICATION_CASES,
@@ -23,7 +21,7 @@ from tests.transaction_helpers import (
     initialize_repository,
     make_manager,
 )
-from tests.verification_helpers import run_verification_case
+from tests.verification_helpers import fixture_executor, run_verification_case
 
 
 @pytest.mark.asyncio
@@ -67,16 +65,14 @@ async def test_correct_fix_records_failed_baseline_and_passed_patched_checks(
     baseline = next(
         result for result in results if result.step.kind is VerificationKind.BASELINE
     )
-    reproduction = next(
-        result
-        for result in results
-        if result.step.kind is VerificationKind.REPRODUCTION
+    behavior = next(
+        result for result in results if result.step.kind is VerificationKind.BEHAVIOR
     )
 
     assert baseline.status is VerificationStatus.PASSED
     assert baseline.exit_code == 1
-    assert reproduction.status is VerificationStatus.PASSED
-    assert reproduction.exit_code == 0
+    assert behavior.status is VerificationStatus.PASSED
+    assert behavior.exit_code == 0
 
     await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
     prepared.scope.assert_empty()
@@ -106,18 +102,23 @@ async def test_missing_required_tool_produces_blocked_verdict(
     prepared = await run_verification_case(
         tmp_path,
         VERIFICATION_CASES[0],
-        project_configuration=ProjectConfiguration(
-            regression=(("rivet-command-that-does-not-exist",),),
-        ),
+        verification_commands=(("rivet-command-that-does-not-exist",),),
     )
 
     assert prepared.outcome.verdict.status is VerificationStatus.BLOCKED
-    environment = next(
+    regression = next(
         result
         for result in prepared.outcome.verdict.results
-        if result.step.kind is VerificationKind.ENVIRONMENT
+        if result.step.kind is VerificationKind.REGRESSION
     )
-    assert environment.status is VerificationStatus.BLOCKED
+    assert regression.status is VerificationStatus.BLOCKED
+    assert "缺少可执行文件" in regression.stderr_summary
+    resource = next(
+        result
+        for result in prepared.outcome.verdict.results
+        if result.step.kind is VerificationKind.RESOURCE
+    )
+    assert resource.status is VerificationStatus.BLOCKED
     assert prepared.outcome.transaction.state is TransactionState.BLOCKED
 
     await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
@@ -126,13 +127,36 @@ async def test_missing_required_tool_produces_blocked_verdict(
 
 
 @pytest.mark.asyncio
-async def test_v7_rejects_new_file_not_declared_in_allowed_new_paths(
+async def test_preserved_behavior_without_regression_evidence_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    prepared = await run_verification_case(
+        tmp_path,
+        VERIFICATION_CASES[0],
+        verification_commands=(),
+    )
+    binding = next(
+        result
+        for result in prepared.outcome.verdict.results
+        if result.step.kind is VerificationKind.BINDING
+    )
+
+    assert binding.status is VerificationStatus.INCONCLUSIVE
+    assert prepared.outcome.verdict.status is VerificationStatus.INCONCLUSIVE
+    assert prepared.outcome.transaction.state is TransactionState.INCONCLUSIVE
+
+    await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
+    prepared.scope.assert_empty()
+    await prepared.scope.close()
+
+
+@pytest.mark.asyncio
+async def test_scope_rejects_new_file_not_declared_in_allowed_new_paths(
     tmp_path: Path,
 ) -> None:
     repository = initialize_repository(tmp_path)
     scope = ResourceScope("verify.scope.new-file")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_scope_new_file")
     specification = acceptance_spec(
         acceptance_id="acceptance_scope_new_file"
     ).model_copy(
@@ -142,19 +166,21 @@ async def test_v7_rejects_new_file_not_declared_in_allowed_new_paths(
             "allowed_new_paths": (),
         }
     )
-    await manager.freeze_acceptance(
-        record.transaction_id,
+    record = await manager.create(
         specification,
         confirmed=True,
+        transaction_id="tx_scope_new_file",
     )
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))
     writer.create("unexpected.py", "print('unexpected')\n")
     await manager.record_patch_set(record.transaction_id, patch_id="patch_scope_new")
     await manager.begin_verification(record.transaction_id)
 
-    outcome = await VerificationService(manager, scope=scope).verify(
-        record.transaction_id
-    )
+    outcome = await VerificationService(
+        manager,
+        scope=scope,
+        executor_factory=fixture_executor,
+    ).verify(record.transaction_id)
     scope_result = next(
         result
         for result in outcome.verdict.results
@@ -169,42 +195,12 @@ async def test_v7_rejects_new_file_not_declared_in_allowed_new_paths(
     await scope.close()
 
 
-@pytest.mark.asyncio
-async def test_old_test_only_cannot_release_hardcoded_patch(tmp_path: Path) -> None:
-    case = VerificationFixtureCase(
-        case_id="old_test_trap",
-        implementation="def transform(value: int) -> int:\n    return 4\n",
-        expected_status=VerificationStatus.INCONCLUSIVE,
-        baseline_script="check_target.py",
-        targeted_script="check_target.py",
-    )
-    python_command = (sys.executable, "check_target.py")
-    prepared = await run_verification_case(
-        tmp_path,
-        case,
-        behavior_verification_commands=(),
-        project_configuration=ProjectConfiguration(
-            related=(python_command,),
-            regression=(python_command,),
-            static=((sys.executable, "-m", "compileall", "-q", "app.py"),),
-        ),
-    )
+def test_acceptance_requires_an_independent_behavior_verifier() -> None:
+    payload = acceptance_spec().model_dump(mode="json")
+    payload["behavior_verification_commands"] = []
 
-    acceptance = next(
-        result
-        for result in prepared.outcome.verdict.results
-        if result.step.kind is VerificationKind.ACCEPTANCE
-    )
-    assert prepared.outcome.verdict.status is VerificationStatus.INCONCLUSIVE
-    assert prepared.outcome.verdict.passed is False
-    assert acceptance.status is VerificationStatus.INCONCLUSIVE
-    assert prepared.outcome.transaction.state is TransactionState.INCONCLUSIVE
-    with pytest.raises(TransactionError, match="只有 VERIFIED"):
-        await prepared.manager.apply(prepared.outcome.transaction.transaction_id)
-
-    await prepared.manager.abort(prepared.outcome.transaction.transaction_id)
-    prepared.scope.assert_empty()
-    await prepared.scope.close()
+    with pytest.raises(ValidationError, match="behavior_verification_commands"):
+        AcceptanceSpec.model_validate(payload)
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-"""验证 IPC 失败关闭、Worker 请求关联和取消回收。"""
+"""验证 IPC 编解码、关联、取消、背压和最小 Worker 生命周期。"""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from typing import cast
 import pytest
 from pydantic import JsonValue
 
-from rivet.contracts.ipc import IpcCancel, IpcRequest
-from rivet.ipc.codec import IpcProtocolError, decode_ipc_line
+from rivet.contracts.ipc import IPC_APPLICATION_METHODS, IpcCancel, IpcRequest
+from rivet.ipc.codec import MAX_IPC_LINE_BYTES, IpcProtocolError, decode_ipc_line
 from rivet.ipc.worker import (
     BaseWorkerApplication,
     EmitEvent,
@@ -21,20 +21,23 @@ from rivet.ipc.worker import (
 )
 
 
-def _request(request_id: str, method: str) -> bytes:
-    """生成一条合法请求。"""
+def _request(
+    request_id: str,
+    method: str,
+    params: dict[str, JsonValue] | None = None,
+) -> bytes:
     return (
-        IpcRequest(request_id=request_id, method=method).model_dump_json() + "\n"
+        IpcRequest(
+            request_id=request_id,
+            method=method,
+            params=params or {},
+        ).model_dump_json()
+        + "\n"
     ).encode()
 
 
 def _messages(lines: list[str]) -> list[dict[str, object]]:
-    """解析测试 writer 捕获的协议行。"""
     return [cast(dict[str, object], json.loads(line)) for line in lines]
-
-
-async def _discard_event(_event_type: str, _payload: dict[str, JsonValue]) -> None:
-    """为直接应用测试提供无副作用事件接收器。"""
 
 
 @pytest.mark.parametrize(
@@ -51,7 +54,8 @@ async def _discard_event(_event_type: str, _payload: dict[str, JsonValue]) -> No
     ],
 )
 def test_codec_rejects_invalid_lines_without_echoing_input(
-    line: bytes, code: str
+    line: bytes,
+    code: str,
 ) -> None:
     with pytest.raises(IpcProtocolError) as captured:
         decode_ipc_line(line)
@@ -63,7 +67,7 @@ def test_codec_rejects_invalid_lines_without_echoing_input(
 
 def test_codec_rejects_oversized_and_invalid_contract() -> None:
     with pytest.raises(IpcProtocolError, match="超过上限"):
-        decode_ipc_line(b"x" * (1024 * 1024 + 1))
+        decode_ipc_line(b"x" * (MAX_IPC_LINE_BYTES + 1))
     with pytest.raises(IpcProtocolError) as captured:
         decode_ipc_line(
             b'{"schema_version":1,"message_type":"request",'
@@ -75,60 +79,108 @@ def test_codec_rejects_oversized_and_invalid_contract() -> None:
 
 def test_bounded_reader_discards_oversized_line_tail() -> None:
     valid = _request("request_after_large", "worker.handshake")
-    stream = io.BytesIO(b"x" * (1024 * 1024 + 100) + b"\n" + valid)
+    stream = io.BytesIO(b"x" * (MAX_IPC_LINE_BYTES + 100) + b"\n" + valid)
 
     oversized = read_bounded_ipc_line(stream)
     following = read_bounded_ipc_line(stream)
 
-    assert len(oversized) == 1024 * 1024 + 1
+    assert len(oversized) == MAX_IPC_LINE_BYTES + 1
     assert following == valid
 
 
 @pytest.mark.asyncio
-async def test_worker_handshake_ping_snapshot_duplicate_and_shutdown(
+async def test_worker_handshake_advertises_exact_surface_and_shutdown(
     tmp_path: Path,
 ) -> None:
     lines: list[str] = []
 
     async def write(message: str) -> None:
-        """捕获完整协议行。"""
         lines.append(message)
 
     session = WorkerSession(tmp_path, write_message=write)
-    await session.receive(_request("request_handshake", "worker.handshake"))
-    await session.receive(_request("request_handshake_again", "worker.handshake"))
-    await session.receive(_request("request_ping", "worker.ping"))
-    await session.receive(_request("request_snapshot", "worker.snapshot"))
+    await session.receive(
+        _request(
+            "request_handshake",
+            "worker.handshake",
+            {"client": "rivet-tui"},
+        )
+    )
+    await session.receive(_request("request_removed_ping", "worker.ping"))
     await asyncio.sleep(0)
-    await session.receive(_request("request_handshake", "worker.handshake"))
     await session.receive(_request("request_shutdown", "worker.shutdown"))
     await session.close()
 
     messages = _messages(lines)
+    handshake = next(
+        message
+        for message in messages
+        if message.get("request_id") == "request_handshake"
+    )
+    result = cast(dict[str, object], handshake["result"])
+    assert result["methods"] == list(IPC_APPLICATION_METHODS)
+    assert "snapshot" not in cast(list[str], result["capabilities"])
     assert session.shutdown_requested is True
     assert any(message.get("event_type") == "worker.ready" for message in messages)
     assert any(message.get("event_type") == "worker.stopping" for message in messages)
-    errors = [
-        cast(dict[str, object], message["error"])
+    removed = next(
+        message
         for message in messages
-        if message.get("ok") is False
-    ]
-    assert any(error["code"] == "ipc.request_duplicate" for error in errors)
+        if message.get("request_id") == "request_removed_ping"
+    )
+    error = cast(dict[str, object], removed["error"])
+    assert error["code"] == "ipc.method_unknown"
 
 
 @pytest.mark.asyncio
-async def test_worker_ready_uses_read_only_branch_and_boolean_credential_state(
+async def test_worker_requires_valid_handshake_and_empty_shutdown_params(
+    tmp_path: Path,
+) -> None:
+    lines: list[str] = []
+
+    async def write(message: str) -> None:
+        lines.append(message)
+
+    session = WorkerSession(tmp_path, write_message=write)
+    await session.receive(_request("request_early", "command.ask", {"query": "x"}))
+    await session.receive(
+        _request(
+            "request_bad_handshake",
+            "worker.handshake",
+            {"unexpected": True},
+        )
+    )
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.receive(
+        _request("request_bad_shutdown", "worker.shutdown", {"now": True})
+    )
+    await session.close()
+
+    errors = {
+        cast(str, message["request_id"]): cast(dict[str, object], message["error"])[
+            "code"
+        ]
+        for message in _messages(lines)
+        if message.get("ok") is False
+    }
+    assert errors == {
+        "request_early": "ipc.handshake_required",
+        "request_bad_handshake": "ipc.params_invalid",
+        "request_bad_shutdown": "ipc.params_invalid",
+    }
+
+
+@pytest.mark.asyncio
+async def test_worker_ready_uses_read_only_branch_and_never_exposes_credentials(
     tmp_path: Path,
 ) -> None:
     lines: list[str] = []
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "HEAD").write_text(
-        "ref: refs/heads/feature/tui\n",
+        "ref: refs/heads/feature/minimal-ipc\n",
         encoding="utf-8",
     )
 
     async def write(message: str) -> None:
-        """捕获完整协议行。"""
         lines.append(message)
 
     session = WorkerSession(tmp_path, write_message=write)
@@ -141,13 +193,11 @@ async def test_worker_ready_uses_read_only_branch_and_boolean_credential_state(
         if message.get("event_type") == "worker.ready"
     )
     payload = cast(dict[str, object], ready["payload"])
-    assert payload["branch"] == "feature/tui"
-    assert payload["credential_configured"] is False
-    assert set(payload) == {
-        "branch",
-        "credential_configured",
-        "model",
-        "repository",
+    assert payload == {
+        "branch": "feature/minimal-ipc",
+        "credential_configured": False,
+        "model": "未配置",
+        "repository": str(tmp_path),
     }
 
 
@@ -158,12 +208,9 @@ async def test_worker_rejects_unknown_method_and_sanitizes_internal_error(
     lines: list[str] = []
 
     async def write(message: str) -> None:
-        """捕获完整协议行。"""
         lines.append(message)
 
     class FailingApplication:
-        """模拟包含敏感细节的未分类业务异常。"""
-
         async def handle(
             self,
             request: IpcRequest,
@@ -171,42 +218,35 @@ async def test_worker_rejects_unknown_method_and_sanitizes_internal_error(
             emit: EmitEvent,
             cancel_event: asyncio.Event,
         ) -> JsonValue:
-            """抛出不得跨越 Worker 边界的原始异常。"""
+            del request, emit, cancel_event
             raise RuntimeError("private-detail")
 
-    base = WorkerSession(tmp_path, write_message=write)
-    await base.receive(_request("request_handshake_one", "worker.handshake"))
-    await base.receive(_request("request_unknown", "command.unknown"))
-    await asyncio.sleep(0)
-    await base.close()
     failing = WorkerSession(
         tmp_path,
         write_message=write,
         application=FailingApplication(),
     )
-    await failing.receive(_request("request_handshake_two", "worker.handshake"))
-    await failing.receive(_request("request_failing", "command.failing"))
+    await failing.receive(_request("request_handshake", "worker.handshake"))
+    await failing.receive(_request("request_failing", "command.ask"))
     await asyncio.sleep(0)
     await failing.close()
 
     serialized = "".join(lines)
-    assert "ipc.method_unknown" in serialized
     assert "ipc.worker_internal" in serialized
     assert "private-detail" not in serialized
 
 
 @pytest.mark.asyncio
-async def test_worker_cancel_reaches_inflight_request(tmp_path: Path) -> None:
+async def test_worker_cancel_is_correlated_and_cancel_id_cannot_be_reused(
+    tmp_path: Path,
+) -> None:
     lines: list[str] = []
     started = asyncio.Event()
 
     async def write(message: str) -> None:
-        """捕获完整协议行。"""
         lines.append(message)
 
     class WaitingApplication:
-        """等待取消的长业务请求。"""
-
         async def handle(
             self,
             request: IpcRequest,
@@ -214,7 +254,7 @@ async def test_worker_cancel_reaches_inflight_request(tmp_path: Path) -> None:
             emit: EmitEvent,
             cancel_event: asyncio.Event,
         ) -> JsonValue:
-            """暴露启动边界后等待取消标记。"""
+            del request, emit
             started.set()
             await cancel_event.wait()
             return {"cancelled": True}
@@ -233,25 +273,34 @@ async def test_worker_cancel_reaches_inflight_request(tmp_path: Path) -> None:
     )
     await session.receive((cancellation.model_dump_json() + "\n").encode())
     await asyncio.sleep(0)
+    await session.receive(_request("request_cancel", "command.ask"))
     await session.close()
 
-    serialized = "".join(lines)
-    assert "ipc.request_cancelled" in serialized
-    assert '"request_id":"request_cancel"' in serialized
+    messages = _messages(lines)
+    target = next(
+        message
+        for message in messages
+        if message.get("request_id") == "request_running"
+    )
+    assert cast(dict[str, object], target["error"])["code"] == ("ipc.request_cancelled")
+    duplicate = [
+        message
+        for message in messages
+        if message.get("request_id") == "request_cancel" and message.get("ok") is False
+    ]
+    assert cast(dict[str, object], duplicate[0]["error"])["code"] == (
+        "ipc.request_duplicate"
+    )
 
 
 @pytest.mark.asyncio
-async def test_worker_reports_missing_cancel_target_and_invalid_request(
-    tmp_path: Path,
-) -> None:
+async def test_worker_reports_missing_cancel_target(tmp_path: Path) -> None:
     lines: list[str] = []
 
     async def write(message: str) -> None:
-        """捕获完整协议行。"""
         lines.append(message)
 
     session = WorkerSession(tmp_path, write_message=write)
-    await session.receive(b"not-json\n")
     await session.receive(_request("request_handshake", "worker.handshake"))
     cancellation = IpcCancel(
         request_id="request_cancel",
@@ -264,21 +313,205 @@ async def test_worker_reports_missing_cancel_target_and_invalid_request(
 
 
 @pytest.mark.asyncio
-async def test_base_application_snapshot_is_read_only(tmp_path: Path) -> None:
-    application = BaseWorkerApplication(tmp_path)
-    result = await application.handle(
-        IpcRequest(request_id="request_snapshot", method="worker.snapshot"),
-        emit=_discard_event,
-        cancel_event=asyncio.Event(),
-    )
+async def test_worker_applies_pending_request_backpressure(tmp_path: Path) -> None:
+    lines: list[str] = []
+    started = asyncio.Event()
 
-    assert isinstance(result, dict)
-    assert result["repository"] == str(tmp_path)
-    assert result["inspector_tabs"] == [
-        "Plan",
-        "Context",
-        "Diff",
-        "Verify",
-        "Evidence",
-        "Modules",
+    async def write(message: str) -> None:
+        lines.append(message)
+
+    class WaitingApplication:
+        async def handle(
+            self,
+            request: IpcRequest,
+            *,
+            emit: EmitEvent,
+            cancel_event: asyncio.Event,
+        ) -> JsonValue:
+            del request, emit
+            started.set()
+            await cancel_event.wait()
+            return None
+
+    session = WorkerSession(
+        tmp_path,
+        write_message=write,
+        application=WaitingApplication(),
+        max_pending_requests=1,
+    )
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.receive(_request("request_first", "command.ask"))
+    await started.wait()
+    await session.receive(_request("request_second", "command.diff"))
+    await session.close()
+
+    response = next(
+        message
+        for message in _messages(lines)
+        if message.get("request_id") == "request_second"
+    )
+    error = cast(dict[str, object], response["error"])
+    assert error["code"] == "ipc.backpressure"
+    assert error["retryable"] is True
+
+
+@pytest.mark.asyncio
+async def test_worker_bounds_request_id_history_per_connection(tmp_path: Path) -> None:
+    lines: list[str] = []
+
+    async def write(message: str) -> None:
+        lines.append(message)
+
+    session = WorkerSession(
+        tmp_path,
+        write_message=write,
+        max_request_ids=2,
+    )
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.receive(_request("request_unknown", "worker.ping"))
+    await asyncio.sleep(0)
+    await session.receive(_request("request_limit", "worker.shutdown"))
+    await session.close()
+
+    response = next(
+        message
+        for message in _messages(lines)
+        if message.get("request_id") == "request_limit"
+    )
+    assert cast(dict[str, object], response["error"])["code"] == (
+        "ipc.connection_request_limit"
+    )
+    assert session.shutdown_requested is True
+
+
+@pytest.mark.asyncio
+async def test_concurrent_events_are_serialized_with_monotonic_sequence(
+    tmp_path: Path,
+) -> None:
+    lines: list[str] = []
+    writers = 0
+    peak_writers = 0
+
+    async def write(message: str) -> None:
+        nonlocal writers, peak_writers
+        writers += 1
+        peak_writers = max(peak_writers, writers)
+        await asyncio.sleep(0)
+        lines.append(message)
+        writers -= 1
+
+    class StreamingApplication:
+        async def handle(
+            self,
+            request: IpcRequest,
+            *,
+            emit: EmitEvent,
+            cancel_event: asyncio.Event,
+        ) -> JsonValue:
+            del request, cancel_event
+            await asyncio.gather(
+                *(emit("agent.output.delta", {"index": index}) for index in range(20))
+            )
+            return {"status": "done"}
+
+    session = WorkerSession(
+        tmp_path,
+        write_message=write,
+        application=StreamingApplication(),
+    )
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.receive(_request("request_stream", "command.ask"))
+    for _ in range(100):
+        if any(
+            message.get("request_id") == "request_stream"
+            for message in _messages(lines)
+        ):
+            break
+        await asyncio.sleep(0)
+    await session.close()
+
+    events = [
+        message
+        for message in _messages(lines)
+        if message.get("message_type") == "event"
     ]
+    sequences = [cast(int, event["sequence"]) for event in events]
+    assert peak_writers == 1
+    assert sequences == list(range(len(sequences)))
+    assert len(set(cast(str, event["event_id"]) for event in events)) == len(events)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("oversized_kind", ["event", "response"])
+async def test_worker_bounds_every_outbound_message(
+    tmp_path: Path,
+    oversized_kind: str,
+) -> None:
+    lines: list[str] = []
+
+    async def write(message: str) -> None:
+        lines.append(message)
+
+    class OversizedApplication:
+        async def handle(
+            self,
+            request: IpcRequest,
+            *,
+            emit: EmitEvent,
+            cancel_event: asyncio.Event,
+        ) -> JsonValue:
+            del request, cancel_event
+            huge = "x" * (MAX_IPC_LINE_BYTES + 1)
+            if oversized_kind == "event":
+                await emit("agent.output.delta", {"summary": huge})
+                return {"status": "unreachable"}
+            return {"value": huge}
+
+    session = WorkerSession(
+        tmp_path,
+        write_message=write,
+        application=OversizedApplication(),
+    )
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.receive(_request("request_large", "command.ask"))
+    for _ in range(100):
+        if any(
+            message.get("request_id") == "request_large" for message in _messages(lines)
+        ):
+            break
+        await asyncio.sleep(0)
+    await session.close()
+
+    response = next(
+        message
+        for message in _messages(lines)
+        if message.get("request_id") == "request_large"
+    )
+    error = cast(dict[str, object], response["error"])
+    assert error["code"] == (
+        "ipc.event_too_large" if oversized_kind == "event" else "ipc.response_too_large"
+    )
+    assert all(len(line.encode()) <= MAX_IPC_LINE_BYTES for line in lines)
+
+
+@pytest.mark.asyncio
+async def test_worker_close_releases_closable_application(tmp_path: Path) -> None:
+    closed = False
+
+    async def write(_message: str) -> None:
+        return None
+
+    class ClosableApplication(BaseWorkerApplication):
+        async def close(self) -> None:
+            nonlocal closed
+            closed = True
+
+    session = WorkerSession(
+        tmp_path,
+        write_message=write,
+        application=ClosableApplication(tmp_path),
+    )
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.close()
+
+    assert closed is True

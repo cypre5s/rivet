@@ -9,7 +9,6 @@ import pytest
 from rivet.kernel.resources import ResourceScope
 from rivet.tools.files import TransactionFileWriter
 from rivet.transaction.errors import TransactionError
-from rivet.verify.detector import ProjectConfiguration
 from rivet.verify.evidence import EvidenceBundleWriter
 from rivet.verify.service import VerificationService
 from tests.fixtures.verification.cases import VERIFICATION_CASES
@@ -26,9 +25,10 @@ async def test_acceptance_hash_tamper_stops_before_commands(tmp_path: Path) -> N
     repository = initialize_repository(tmp_path)
     scope = ResourceScope("verify.acceptance.tamper")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_acceptance_tamper")
-    await manager.freeze_acceptance(
-        record.transaction_id, acceptance_spec(), confirmed=True
+    record = await manager.create(
+        acceptance_spec(),
+        confirmed=True,
+        transaction_id="tx_acceptance_tamper",
     )
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))
     writer.write("tracked.txt", "patched\n")
@@ -45,12 +45,7 @@ async def test_acceptance_hash_tamper_stops_before_commands(tmp_path: Path) -> N
     )
     acceptance_path.chmod(0o600)
     acceptance_path.write_text("{}\n", encoding="utf-8")
-    service = VerificationService(
-        manager,
-        scope=scope,
-        project_configuration=ProjectConfiguration(),
-        configuration_confirmed=True,
-    )
+    service = VerificationService(manager, scope=scope)
 
     with pytest.raises(TransactionError) as captured:
         await service.verify(record.transaction_id)
@@ -91,11 +86,10 @@ async def test_patch_hash_tamper_stops_before_evidence(tmp_path: Path) -> None:
     repository = initialize_repository(tmp_path)
     scope = ResourceScope("verify.patch.tamper")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_patch_tamper")
-    await manager.freeze_acceptance(
-        record.transaction_id,
+    record = await manager.create(
         acceptance_spec(),
         confirmed=True,
+        transaction_id="tx_patch_tamper",
     )
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))
     writer.write("tracked.txt", "patched\n")

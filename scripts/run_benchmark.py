@@ -1,446 +1,27 @@
-"""运行可重复的 Rivet 小型基准套件并执行硬阈值门禁。"""
+"""运行不进入产品 CLI 的最小开发验证套件。"""
 
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
-import sys
-import tempfile
 from collections.abc import Sequence
-from datetime import UTC, datetime, timedelta
-from math import ceil
+from datetime import UTC, datetime
 from pathlib import Path
-from time import perf_counter
 from typing import cast
 
-from context_fixtures import (
-    load_context_cases,
-    materialize_context_case,
-)
 from environment_fingerprint import collect_environment_fingerprint
 from fault_benchmark import run_fault_benchmark
 from functional_benchmark import run_functional_benchmark
 from performance_benchmark import run_performance_benchmark
 from verify_licenses import inspect_licenses
 
-from rivet.context.engine import ProgressiveContext
-from rivet.context.inventory import RepositoryInventoryBuilder
-from rivet.context.lsp_manifest import LspManifestRegistry
-from rivet.context.lsp_models import LspPosition
-from rivet.context.semantic import (
-    SemanticContextRetriever,
-    SemanticOperation,
-    SemanticRequest,
-    SemanticRetrievalStatus,
-)
-from rivet.contracts.context import ContextBudget, ContextSelection
-from rivet.contracts.guard import (
-    AuthorizationStatus,
-    Permission,
-    PermissionRequest,
-    PermissionScope,
-    TaintSource,
-)
-from rivet.guard.command_policy import CommandPolicy
-from rivet.guard.permissions import GuardPolicy
-from rivet.kernel.resources import ResourceScope
-from rivet.tools.errors import ProcessToolError
-from rivet.tools.paths import WorkspaceBoundary
-from rivet.tools.process import ProcessRunner
-
-CONTEXT_BUDGET = ContextBudget(
-    total_tokens=8_000,
-    required_tokens=1_000,
-    working_tokens=6_000,
-    history_tokens=1_000,
-)
-FIXED_NOW = datetime(2026, 8, 28, tzinfo=UTC)
-
-
-def _percentile(values: list[float], percentile: float) -> float:
-    """以最近秩方法计算不插值百分位。"""
-    if not values:
-        raise ValueError("百分位样本不得为空")
-    ordered = sorted(values)
-    index = max(0, ceil(percentile * len(ordered)) - 1)
-    return ordered[index]
-
-
-def _tree_sitter_import_count() -> int:
-    """统计已经进入解释器的 Tree-sitter binding 与 grammar。"""
-    return sum(
-        name == "tree_sitter" or name.startswith("tree_sitter_") for name in sys.modules
-    )
-
-
-async def _measure_inventory(root: Path) -> tuple[float, int, int]:
-    """创建 10,000 文件仓库并只测清单建立耗时。"""
-    repository = root / "inventory-10k"
-    repository.mkdir()
-    for directory_index in range(100):
-        directory = repository / f"package_{directory_index:03d}"
-        directory.mkdir()
-        for file_index in range(100):
-            (directory / f"module_{file_index:03d}.py").write_text(
-                "VALUE = 1\n", encoding="utf-8"
-            )
-    ignored = repository / "ignored"
-    ignored.mkdir()
-    (ignored / "not-listed.py").write_text("SECRET = True\n", encoding="utf-8")
-    (repository / ".gitignore").write_text("ignored/\n", encoding="utf-8")
-    boundary = WorkspaceBoundary(repository)
-    scope = ResourceScope("context.benchmark.inventory")
-    runner = ProcessRunner(
-        boundary,
-        scope=scope,
-        max_capture_bytes=16 * 1024 * 1024,
-        root_kind="repository_read_only",
-    )
-    builder = RepositoryInventoryBuilder(boundary, runner=runner)
-    started_at = perf_counter()
-    snapshot = await builder.build()
-    duration_ms = (perf_counter() - started_at) * 1_000
-    ignored_count = sum(entry.path.startswith("ignored/") for entry in snapshot.entries)
-    await scope.close()
-    scope.assert_empty()
-    return duration_ms, len(snapshot.entries), ignored_count
-
-
-async def run_context_smoke() -> dict[str, object]:
-    """测量十二个 Gold 样本、词法延迟、延迟导入与 10k 清单。"""
-    with tempfile.TemporaryDirectory(prefix="rivet-context-benchmark-") as directory:
-        root = Path(directory)
-        cases_root = root / "cases"
-        cases_root.mkdir()
-        covered = 0
-        gold_count = 0
-        lexical_durations_ms: list[float] = []
-        selected_by_case: dict[str, list[str]] = {}
-        imports_before_lexical = _tree_sitter_import_count()
-        imports_after_first_lexical = imports_before_lexical
-        for case_index, case in enumerate(load_context_cases()[:12]):
-            repository = materialize_context_case(case, cases_root)
-            scope = ResourceScope(f"context.benchmark.{case.case_id.replace('-', '_')}")
-            engine = ProgressiveContext(
-                repository, scope=scope, clock=lambda: FIXED_NOW
-            )
-            started_at = perf_counter()
-            lexical_result = await engine.retrieve(
-                case.task,
-                budget=CONTEXT_BUDGET,
-                include_syntax=False,
-            )
-            lexical_durations_ms.append((perf_counter() - started_at) * 1_000)
-            if case_index == 0:
-                imports_after_first_lexical = _tree_sitter_import_count()
-            result = lexical_result
-            if case.include_syntax:
-                result = await engine.retrieve(
-                    case.task,
-                    budget=CONTEXT_BUDGET,
-                    include_syntax=True,
-                )
-            selected_paths = sorted(
-                {item.repository_path for item in result.selection.items}
-            )
-            selected_by_case[case.case_id] = selected_paths
-            covered += len(set(selected_paths).intersection(case.gold_files))
-            gold_count += len(case.gold_files)
-            await scope.close()
-            scope.assert_empty()
-        inventory_ms, inventory_file_count, ignored_count = await _measure_inventory(
-            root
-        )
-        coverage = covered / gold_count
-        lexical_p95_ms = _percentile(lexical_durations_ms, 0.95)
-        lazy_import_delta = imports_after_first_lexical - imports_before_lexical
-        passed = (
-            coverage >= 0.70
-            and inventory_ms <= 1_000.0
-            and lexical_p95_ms <= 300.0
-            and lazy_import_delta == 0
-            and inventory_file_count == 10_001
-            and ignored_count == 0
-        )
-        return {
-            "schema_version": 1,
-            "suite": "context-smoke",
-            "passed": passed,
-            "case_count": len(selected_by_case),
-            "gold_file_count": gold_count,
-            "covered_gold_file_count": covered,
-            "gold_coverage": round(coverage, 6),
-            "lexical_p95_ms": round(lexical_p95_ms, 3),
-            "lexical_sample_count": len(lexical_durations_ms),
-            "inventory_10k_ms": round(inventory_ms, 3),
-            "inventory_file_count": inventory_file_count,
-            "ignored_file_count": ignored_count,
-            "tree_sitter_import_delta_without_syntax": lazy_import_delta,
-            "tree_sitter_import_count_after_suite": _tree_sitter_import_count(),
-            "selected_by_case": selected_by_case,
-            "thresholds": {
-                "gold_coverage_minimum": 0.70,
-                "inventory_10k_ms_maximum": 1_000.0,
-                "lexical_p95_ms_maximum": 300.0,
-                "tree_sitter_import_delta_without_syntax_maximum": 0,
-            },
-        }
-
-
-def _selection_metrics(
-    selection: ContextSelection,
-    *,
-    gold_files: tuple[str, ...],
-    relevant_files: tuple[str, ...],
-) -> tuple[int, int, int, list[str]]:
-    """统计前十条目的 Gold 命中与无关 token。"""
-    top_items = selection.items[:10]
-    selected_paths = list(dict.fromkeys(item.repository_path for item in top_items))
-    gold_hits = len(set(selected_paths).intersection(gold_files))
-    relevant = set(relevant_files)
-    total_tokens = sum(item.token_estimate for item in top_items)
-    irrelevant_tokens = sum(
-        item.token_estimate
-        for item in top_items
-        if item.repository_path not in relevant
-    )
-    return gold_hits, total_tokens, irrelevant_tokens, selected_paths
-
-
-async def run_context_full() -> dict[str, object]:
-    """运行二十项 Level 0-3 基准并执行 Recall 与噪声门禁。"""
-    project_root = Path(__file__).parents[1]
-    registry = LspManifestRegistry.load_builtin(repository_root=project_root)
-    semantic_success_statuses = {
-        SemanticRetrievalStatus.COMPLETED,
-        SemanticRetrievalStatus.NO_MARGINAL_GAIN,
-    }
-    with tempfile.TemporaryDirectory(prefix="rivet-context-full-") as directory:
-        root = Path(directory)
-        cases_root = root / "cases"
-        cases_root.mkdir()
-        gold_hit_count = 0
-        gold_file_count = 0
-        total_tokens = 0
-        irrelevant_tokens = 0
-        semantic_case_count = 0
-        semantic_success_count = 0
-        selected_by_case: dict[str, list[str]] = {}
-        semantic_status_by_case: dict[str, str] = {}
-        for case in load_context_cases():
-            repository = materialize_context_case(case, cases_root)
-            scope = ResourceScope(f"context.full.{case.case_id.replace('-', '_')}")
-            if case.semantic is None:
-                engine = ProgressiveContext(
-                    repository,
-                    scope=scope,
-                    clock=lambda: FIXED_NOW,
-                )
-                result = await engine.retrieve(
-                    case.task,
-                    budget=CONTEXT_BUDGET,
-                    include_syntax=case.include_syntax,
-                )
-                selection = result.selection
-            else:
-                semantic_case_count += 1
-                retriever = SemanticContextRetriever(
-                    repository,
-                    scope=scope,
-                    registry=registry,
-                    clock=lambda: FIXED_NOW,
-                )
-                try:
-                    result = await retriever.retrieve(
-                        case.task,
-                        budget=CONTEXT_BUDGET,
-                        semantic_request=SemanticRequest(
-                            path=case.semantic.document_path,
-                            position=LspPosition(
-                                case.semantic.line,
-                                case.semantic.character,
-                            ),
-                            operation=SemanticOperation(case.semantic.operation),
-                        ),
-                    )
-                finally:
-                    await retriever.close()
-                selection = result.selection
-                semantic_status_by_case[case.case_id] = result.status.value
-                semantic_success_count += int(
-                    result.status in semantic_success_statuses and result.lsp_started
-                )
-            (
-                case_hits,
-                case_tokens,
-                case_irrelevant_tokens,
-                selected_paths,
-            ) = _selection_metrics(
-                selection,
-                gold_files=case.gold_files,
-                relevant_files=case.relevant_files,
-            )
-            selected_by_case[case.case_id] = selected_paths
-            gold_hit_count += case_hits
-            gold_file_count += len(case.gold_files)
-            total_tokens += case_tokens
-            irrelevant_tokens += case_irrelevant_tokens
-            await scope.close()
-            scope.assert_empty()
-        recall_at_10 = gold_hit_count / gold_file_count
-        irrelevant_token_ratio = (
-            irrelevant_tokens / total_tokens if total_tokens else 0.0
-        )
-        case_count = len(selected_by_case)
-        passed = (
-            case_count == 20
-            and recall_at_10 >= 0.80
-            and irrelevant_token_ratio <= 0.40
-            and semantic_case_count == 8
-            and semantic_success_count == semantic_case_count
-        )
-        return {
-            "schema_version": 1,
-            "suite": "context-full",
-            "passed": passed,
-            "case_count": case_count,
-            "gold_file_count": gold_file_count,
-            "gold_hit_count_at_10": gold_hit_count,
-            "recall_at_10": round(recall_at_10, 6),
-            "selected_token_count_at_10": total_tokens,
-            "irrelevant_token_count_at_10": irrelevant_tokens,
-            "irrelevant_token_ratio": round(irrelevant_token_ratio, 6),
-            "semantic_case_count": semantic_case_count,
-            "semantic_success_count": semantic_success_count,
-            "semantic_status_by_case": semantic_status_by_case,
-            "selected_by_case": selected_by_case,
-            "thresholds": {
-                "case_count": 20,
-                "recall_at_10_minimum": 0.80,
-                "irrelevant_token_ratio_maximum": 0.40,
-                "semantic_success_ratio_minimum": 1.0,
-            },
-        }
-
-
-def run_security() -> dict[str, object]:
-    """运行三十项权限、提示注入、命令和秘密环境拒绝任务。"""
-    fixture_path = Path(__file__).parents[1] / "tests/fixtures/security/tasks.json"
-    raw_cases = cast(list[dict[str, object]], json.loads(fixture_path.read_text()))
-    results: list[dict[str, object]] = []
-    for raw_case in raw_cases:
-        case_id = cast(str, raw_case["id"])
-        expected_code = cast(str, raw_case["expected_code"])
-        actual_code = _evaluate_security_case(raw_case)
-        results.append(
-            {
-                "case_id": case_id,
-                "expected_code": expected_code,
-                "actual_code": actual_code,
-                "passed": actual_code == expected_code,
-            }
-        )
-    passed_count = sum(bool(result["passed"]) for result in results)
-    return {
-        "schema_version": 1,
-        "suite": "security",
-        "passed": len(results) == 30 and passed_count == 30,
-        "case_count": len(results),
-        "passed_count": passed_count,
-        "blocked_count": passed_count,
-        "results": results,
-    }
-
-
-def _evaluate_security_case(raw_case: dict[str, object]) -> str:
-    """按任务类型返回稳定拒绝码，不执行任何 fixture 文本。"""
-    kind = cast(str, raw_case["kind"])
-    command_policy = CommandPolicy()
-    if kind == "command":
-        try:
-            command_policy.validate(tuple(cast(list[str], raw_case["argv"])))
-        except ProcessToolError as error:
-            return error.code
-        return "security.unexpected_allow"
-    if kind == "environment":
-        try:
-            command_policy.validate_environment(
-                cast(dict[str, str], raw_case["environment"])
-            )
-        except ProcessToolError as error:
-            return error.code
-        return "security.unexpected_allow"
-    current = [FIXED_NOW]
-    interactive = cast(bool, raw_case.get("interactive", False))
-    policy = GuardPolicy(headless=not interactive, clock=lambda: current[0])
-    request = _security_request(raw_case, target=False)
-    if (
-        raw_case.get("lease")
-        or raw_case.get("lease_paths")
-        or raw_case.get("lease_domains")
-    ):
-        expires_after = cast(int, raw_case.get("expires_after_seconds", 60))
-        policy.issue_lease(
-            request,
-            approved_by_user=True,
-            expires_at=FIXED_NOW + timedelta(seconds=expires_after),
-            max_uses=1,
-        )
-        if raw_case.get("preconsume"):
-            policy.authorize(request)
-    current[0] = FIXED_NOW + timedelta(
-        seconds=cast(int, raw_case.get("advance_seconds", 0))
-    )
-    decision = policy.authorize(_security_request(raw_case, target=True))
-    if decision.status is AuthorizationStatus.ALLOWED:
-        return "security.unexpected_allow"
-    return decision.code
-
-
-def _security_request(
-    raw_case: dict[str, object], *, target: bool
-) -> PermissionRequest:
-    """把固定 JSON 字段转换成严格权限请求。"""
-    paths_key = "paths" if target else "lease_paths"
-    domains_key = "domains" if target else "lease_domains"
-    paths = cast(list[str], raw_case.get(paths_key, raw_case.get("paths", [])))
-    domains = cast(list[str], raw_case.get(domains_key, raw_case.get("domains", [])))
-    taint_value = cast(str, raw_case.get("taint", "user_instruction"))
-    run_id = cast(
-        str,
-        raw_case.get("target_run", "run_security") if target else "run_security",
-    )
-    transaction_id = cast(
-        str,
-        raw_case.get("target_transaction", "tx_security") if target else "tx_security",
-    )
-    return PermissionRequest(
-        permission=Permission(cast(str, raw_case["permission"])),
-        scope=PermissionScope(cast(str, raw_case["scope"])),
-        reason="执行安全基准动作",
-        run_id=run_id,
-        transaction_id=transaction_id,
-        paths=tuple(paths),
-        domains=tuple(domains),
-        taint_sources=(TaintSource(taint_value),),
-    )
-
 
 def _build_parser() -> argparse.ArgumentParser:
-    """构造基准套件与可选结果文件参数。"""
-    parser = argparse.ArgumentParser(description="运行 Rivet 可重复基准")
+    parser = argparse.ArgumentParser(description="运行 Rivet 开发期离线验证")
     parser.add_argument(
         "--suite",
-        choices=(
-            "context-smoke",
-            "context-full",
-            "security",
-            "functional",
-            "faults",
-            "performance",
-            "all",
-        ),
+        choices=("functional", "faults", "performance", "licenses", "all"),
         required=True,
     )
     parser.add_argument("--output", type=Path)
@@ -448,164 +29,51 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """运行选定套件，输出 JSON，并以阈值结果决定退出码。"""
     arguments = _build_parser().parse_args(argv)
     suite = cast(str, arguments.suite)
     output_path = cast(Path | None, arguments.output)
-    if suite == "context-smoke":
-        result = asyncio.run(run_context_smoke())
-    elif suite == "context-full":
-        result = asyncio.run(run_context_full())
-    elif suite == "security":
-        result = run_security()
-    elif suite == "functional":
+    if suite == "functional":
         result = asyncio.run(run_functional_benchmark())
     elif suite == "faults":
         result = asyncio.run(run_fault_benchmark())
     elif suite == "performance":
         result = run_performance_benchmark()
+    elif suite == "licenses":
+        result = inspect_licenses(Path(__file__).parents[1])
     elif suite == "all":
         result = _run_all()
     else:
-        raise AssertionError("参数解析器不得产生未知套件")
+        raise AssertionError("参数解析器不得产生未知 suite")
+
     serialized = json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True)
-    if suite == "all" and output_path is None:
-        output_path = (
-            Path(__file__).parents[1] / "benchmarks" / "reports" / "final.json"
-        )
     if output_path is None:
         print(serialized)
     else:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(f"{serialized}\n", encoding="utf-8")
-        if suite == "all":
-            markdown_path = output_path.with_suffix(".md")
-            markdown_path.write_text(_render_final_report(result), encoding="utf-8")
-            print(f"全量评测结果已写入 {output_path} 和 {markdown_path}")
-        else:
-            print(f"基准结果已写入 {output_path}")
+        print(f"开发验证结果已写入 {output_path}")
     return 0 if cast(bool, result["passed"]) else 1
 
 
 def _run_all() -> dict[str, object]:
-    """顺序运行全部套件并生成同一环境下的最终事实。"""
-    context = asyncio.run(run_context_full())
-    security = run_security()
-    functional = asyncio.run(run_functional_benchmark())
-    faults = asyncio.run(run_fault_benchmark())
-    performance = run_performance_benchmark()
-    licenses = inspect_licenses(Path(__file__).parents[1])
     components = {
-        "context": context,
-        "faults": faults,
-        "functional": functional,
-        "licenses": licenses,
-        "performance": performance,
-        "security": security,
+        "faults": asyncio.run(run_fault_benchmark()),
+        "functional": asyncio.run(run_functional_benchmark()),
+        "licenses": inspect_licenses(Path(__file__).parents[1]),
+        "performance": run_performance_benchmark(),
     }
     return {
         "schema_version": 1,
         "suite": "all",
-        "passed": all(cast(bool, result["passed"]) for result in components.values()),
+        "passed": all(cast(bool, item["passed"]) for item in components.values()),
         "recorded_at": datetime.now(UTC).isoformat(),
         "environment": collect_environment_fingerprint(),
         "components": components,
         "limitations": [
-            "功能任务使用明确标注的离线录制提案，不代表真实模型泛化能力",
-            "聊天中披露过的凭据未确认轮换，因此未执行 live Provider 评测",
-            "非交互环境未把测试渲染耗时冒充真实 TUI 首帧或空闲 RSS",
+            "离线固定提案不代表真实模型泛化能力",
+            "benchmark 仅存在于 scripts/tests，不是 Rivet 产品命令",
         ],
     }
-
-
-def _render_final_report(result: dict[str, object]) -> str:
-    """从最终 JSON 的同一事实生成简洁 Markdown 报告。"""
-    raw_components = result.get("components")
-    if not isinstance(raw_components, dict):
-        raise ValueError("最终报告缺少 components")
-    components = cast(dict[str, object], raw_components)
-    functional = _result_mapping(components, "functional")
-    context = _result_mapping(components, "context")
-    security = _result_mapping(components, "security")
-    faults = _result_mapping(components, "faults")
-    licenses = _result_mapping(components, "licenses")
-    performance = _result_mapping(components, "performance")
-    metrics = _result_mapping(functional, "metrics_by_group")
-    b4 = _result_mapping(metrics, "B4")
-    performance_startup = _result_mapping(performance, "startup")
-    cold_start = _result_mapping(performance_startup, "help_cold_start_ms")
-    kernel = _result_mapping(performance, "kernel")
-    empty_kernel = _result_mapping(kernel, "empty_kernel")
-    return "\n".join(
-        (
-            "# Rivet Phase 14 最终评测",
-            "",
-            f"- 总状态：{'PASSED' if result['passed'] else 'FAILED'}",
-            f"- 记录时间：{result['recorded_at']}",
-            "- 模型模式：离线录制提案（未使用真实凭据或网络）",
-            "",
-            "## 核心指标",
-            "",
-            "| 指标 | 结果 | 目标 |",
-            "|---|---:|---:|",
-            f"| 功能任务数 | {functional['task_count']} | 24 |",
-            "| 每任务运行次数 | 2 | >= 2 |",
-            f"| B4 Task Resolve Rate | {_percentage(b4, 'task_resolve_rate')} | >= 65% |",
-            f"| B4 错误补丁误放行率 | {_percentage(b4, 'false_allow_rate')} | <= 2% |",
-            f"| Gold File Recall@10 | {_percentage(b4, 'gold_file_recall_at_10')} | >= 80% |",
-            f"| 上下文无关 token 比例 | {_percentage(context, 'irrelevant_token_ratio')} | <= 40% |",
-            f"| 安全任务通过 | {security['passed_count']}/{security['case_count']} | 30/30 |",
-            f"| 故障注入通过 | {faults['passed_count']}/{faults['case_count']} | 5/5 |",
-            f"| B4 Guard 租约 | {b4['guard_authorized_count']} | 48 |",
-            f"| B4 EvidenceBundle | {b4['evidence_bundle_count']} | 48 |",
-            f"| B4 Kernel/Module 激活 | {b4['kernel_activation_count']} | 48 |",
-            f"| 许可证证据 | {licenses['record_count']} 项 | 全部有证据 |",
-            f"| help 冷启动 p95 | {_number(cold_start, 'p95'):.3f} ms | <= 300 ms |",
-            f"| Headless Kernel RSS | {_number(empty_kernel, 'peak_rss_mib'):.3f} MiB | <= 80 MiB |",
-            "",
-            "## 对照结论",
-            "",
-            "- B0-B2 会直接污染各自临时 fixture 的主工作树；B3/B4 的真实 Git Worktree 事务污染为 0。",
-            "- B0-B3 的弱交付条件会放行固定错误提案；B4 独立 verifier 的误放行为 0。",
-            "- B4 渐进式上下文相对 B0 全量注入显著减少估算 token，原始选择与每次运行均保存在 final.json。",
-            "",
-            "## 诚实限制",
-            "",
-            "- 此处 Resolve Rate 衡量固定离线提案穿过完整本地闭环的结果，不外推为真实模型泛化率。",
-            "- 已披露凭据未确认轮换，live DeepSeek 任务没有执行；费用为 0，usage 是明确标注的本地估算。",
-            "- TUI 首帧和 TUI+Kernel 空闲 RSS 在非交互环境标为 INCONCLUSIVE，保留发布阶段真实 PTY 人工检查。",
-            "",
-            "## 可复现命令",
-            "",
-            "```bash",
-            "uv run python scripts/run_benchmark.py --suite all",
-            "uv run python scripts/verify_secrets.py --worktree --history",
-            "uv run python scripts/verify_licenses.py",
-            "```",
-            "",
-        )
-    )
-
-
-def _result_mapping(payload: dict[str, object], key: str) -> dict[str, object]:
-    """读取最终报告的嵌套映射。"""
-    value = payload[key]
-    if not isinstance(value, dict):
-        raise ValueError(f"最终报告字段 {key} 无效")
-    return cast(dict[str, object], value)
-
-
-def _number(payload: dict[str, object], key: str) -> float:
-    """读取最终报告中的非布尔数值。"""
-    value = payload[key]
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"最终报告指标 {key} 无效")
-    return float(value)
-
-
-def _percentage(payload: dict[str, object], key: str) -> str:
-    """把零到一指标渲染为百分比。"""
-    return f"{_number(payload, key):.1%}"
 
 
 if __name__ == "__main__":

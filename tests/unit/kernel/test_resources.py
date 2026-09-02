@@ -9,7 +9,6 @@ from pathlib import Path
 
 import pytest
 
-from rivet.contracts.modules import ResourceKind
 from rivet.kernel.errors import (
     ResourceCleanupError,
     ResourceLeakError,
@@ -112,7 +111,7 @@ async def test_scope_releases_only_removed_worktree(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_scope_releases_only_finished_tasks_and_waited_processes() -> None:
-    scope = ResourceScope("context.lsp.release")
+    scope = ResourceScope("process.release")
     task = scope.create_task(asyncio.sleep(3_600), description="测试读取任务")
     with pytest.raises(ResourceCleanupError, match="活动任务"):
         scope.release_task(task)
@@ -189,23 +188,10 @@ async def test_worktree_transfer_requires_registered_existing_directory(
 
 
 @pytest.mark.asyncio
-async def test_process_kind_and_missing_worktree_directory_are_rejected(
+async def test_missing_worktree_directory_is_rejected(
     tmp_path: Path,
 ) -> None:
     scope = ResourceScope("test.invalid_resources")
-    process = await asyncio.create_subprocess_exec(
-        sys.executable,
-        "-c",
-        "pass",
-    )
-    await process.wait()
-    with pytest.raises(ValueError, match="process 或 sidecar"):
-        scope.register_process(
-            process,
-            description="错误类型",
-            kind=ResourceKind.CLIENT,
-        )
-
     worktree = tmp_path / "worktree"
     worktree.mkdir()
 

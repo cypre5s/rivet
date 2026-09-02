@@ -16,7 +16,6 @@ async def test_ten_thousand_events_are_ordered_bounded_and_fast() -> None:
     assert measurement["event_count"] == 10_000
     assert measurement["first_sequence"] == 1
     assert measurement["last_sequence"] == 10_000
-    assert measurement["database_event_count"] == 10_000
     assert cast(int, measurement["queue_peak_size"]) <= cast(
         int, measurement["queue_capacity"]
     )

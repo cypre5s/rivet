@@ -19,5 +19,5 @@ def test_module_help_returns_success() -> None:
     )
 
     assert completed.returncode == 0
-    assert "可靠、可审计的本地编程智能体" in completed.stdout
+    assert "Demand-driven、Evidence-gated 的本地 Coding Agent" in completed.stdout
     assert completed.stderr == ""

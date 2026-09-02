@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from rivet.contracts.transactions import AcceptanceSpec, TransactionRecord
+from rivet.guard.sandbox import BubblewrapSandbox
 from rivet.kernel.resources import ResourceScope
 from rivet.tools.files import TransactionFileWriter
 from rivet.tools.paths import WorkspaceBoundary
 from rivet.tools.process import ProcessExecutor, ProcessRunner
 from rivet.transaction.manager import TransactionManager
-from rivet.verify.detector import ProjectConfiguration
 from rivet.verify.service import VerificationOutcome, VerificationService
 from tests.fixtures.verification.cases import VerificationFixtureCase
 from tests.transaction_helpers import initialize_repository, make_manager, run_git
@@ -31,7 +31,7 @@ class PreparedVerification:
     runtime_secret: str | None
 
 
-def _fixture_executor(
+def fixture_executor(
     boundary: WorkspaceBoundary,
     scope: ResourceScope,
     environment: Mapping[str, str],
@@ -45,6 +45,30 @@ def _fixture_executor(
         environment_allowlist=allowlist,
         root_kind="transaction",
     )
+
+
+def _sandbox_executor(
+    executable: Path | None,
+) -> Callable[
+    [WorkspaceBoundary, ResourceScope, Mapping[str, str], frozenset[str]],
+    ProcessExecutor,
+]:
+    def create(
+        boundary: WorkspaceBoundary,
+        scope: ResourceScope,
+        environment: Mapping[str, str],
+        allowlist: frozenset[str],
+    ) -> ProcessExecutor:
+        del allowlist
+        return BubblewrapSandbox(
+            boundary,
+            scope=scope,
+            executable=executable,
+            environment=environment,
+            max_capture_bytes=1024 * 1024,
+        )
+
+    return create
 
 
 def _write_base_project(repository: Path) -> None:
@@ -85,6 +109,7 @@ def _acceptance(
     case: VerificationFixtureCase,
     *,
     behavior_verification_commands: tuple[tuple[str, ...], ...] | None = None,
+    verification_commands: tuple[tuple[str, ...], ...] | None = None,
 ) -> AcceptanceSpec:
     """将每个 fixture 转为冻结命令、范围和预算。"""
     return AcceptanceSpec(
@@ -95,7 +120,20 @@ def _acceptance(
         forbidden_paths=("forbidden.txt",),
         expected_behaviors=("transform 对任意整数返回两倍值",),
         preserved_behaviors=("零值行为与 stable.txt 保持不变",),
-        verification_commands=((sys.executable, case.targeted_script),),
+        verification_commands=(
+            (
+                (sys.executable, case.targeted_script),
+                (sys.executable, "check_regression.py"),
+                (
+                    sys.executable,
+                    "-c",
+                    "compile(open('app.py', encoding='utf-8').read(), "
+                    "'app.py', 'exec')",
+                ),
+            )
+            if verification_commands is None
+            else verification_commands
+        ),
         behavior_verification_commands=(
             ((sys.executable, "check_general.py"),)
             if behavior_verification_commands is None
@@ -114,7 +152,7 @@ async def run_verification_case(
     case: VerificationFixtureCase,
     *,
     cancelled: Callable[[], bool] | None = None,
-    project_configuration: ProjectConfiguration | None = None,
+    verification_commands: tuple[tuple[str, ...], ...] | None = None,
     use_production_sandbox: bool = False,
     sandbox_executable: Path | None = None,
     behavior_verification_commands: tuple[tuple[str, ...], ...] | None = None,
@@ -125,14 +163,14 @@ async def run_verification_case(
     _write_base_project(repository)
     scope = ResourceScope(f"verify.{case.case_id}")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id=f"tx_{case.case_id}")
-    await manager.freeze_acceptance(
-        record.transaction_id,
+    record = await manager.create(
         _acceptance(
             case,
             behavior_verification_commands=behavior_verification_commands,
+            verification_commands=verification_commands,
         ),
         confirmed=True,
+        transaction_id=f"tx_{case.case_id}",
     )
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))
     writer.write("app.py", case.implementation)
@@ -150,25 +188,15 @@ async def run_verification_case(
         patch_id=f"patch_{case.case_id}",
     )
     verifying = await manager.begin_verification(record.transaction_id)
-    configuration = project_configuration or ProjectConfiguration(
-        related=((sys.executable, "check_target.py"),),
-        regression=((sys.executable, "check_regression.py"),),
-        static=(
-            (
-                sys.executable,
-                "-c",
-                "compile(open('app.py', encoding='utf-8').read(), 'app.py', 'exec')",
-            ),
-        ),
-    )
     service = VerificationService(
         manager,
         scope=verification_scope or scope,
-        project_configuration=configuration,
-        configuration_confirmed=True,
         cancelled=cancelled,
-        executor_factory=None if use_production_sandbox else _fixture_executor,
-        sandbox_executable=sandbox_executable,
+        executor_factory=(
+            _sandbox_executor(sandbox_executable)
+            if use_production_sandbox
+            else fixture_executor
+        ),
     )
     outcome = await service.verify(record.transaction_id)
     return PreparedVerification(

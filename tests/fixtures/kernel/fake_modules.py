@@ -74,6 +74,21 @@ class ResourceModule(RecordingModule):
         return capabilities
 
 
+class FailOnceShutdownModule(RecordingModule):
+    """首次关闭失败、第二次可由 Kernel shutdown 完成回收。"""
+
+    def __init__(self) -> None:
+        super().__init__("fail_once_shutdown")
+        self.shutdown_count = 0
+
+    async def shutdown(self) -> None:
+        """记录每次关闭，并只在第一次制造确定性故障。"""
+        self.shutdown_count += 1
+        lifecycle_events.append("shutdown:fail_once_shutdown")
+        if self.shutdown_count == 1:
+            raise RuntimeError("可控首次关闭失败")
+
+
 def reset_observations() -> None:
     """清空跨测试共享的计数和事件。"""
     factory_calls.clear()
@@ -92,18 +107,6 @@ def create_dependency_module() -> RecordingModule:
     return RecordingModule("dependency")
 
 
-def create_required_module() -> RecordingModule:
-    """创建 Safe Mode 必需模块。"""
-    factory_calls["required"] += 1
-    return RecordingModule("required")
-
-
-def create_optional_module() -> RecordingModule:
-    """创建不应被 Safe Mode 激活的可选模块。"""
-    factory_calls["optional"] += 1
-    return RecordingModule("optional")
-
-
 def create_failing_module() -> RecordingModule:
     """创建激活时失败的模块。"""
     factory_calls["failing"] += 1
@@ -114,3 +117,9 @@ def create_resource_module() -> ResourceModule:
     """创建会申请真实资源的模块。"""
     factory_calls["resource"] += 1
     return ResourceModule()
+
+
+def create_fail_once_shutdown_module() -> FailOnceShutdownModule:
+    """创建用于验证 Lease 失败后继续清理依赖的模块。"""
+    factory_calls["fail_once_shutdown"] += 1
+    return FailOnceShutdownModule()

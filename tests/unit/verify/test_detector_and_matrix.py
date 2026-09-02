@@ -1,4 +1,4 @@
-"""验证项目检测只给候选，确认后才进入 V0-V10 矩阵。"""
+"""验证项目配置只用于冻结前 readiness，Verify 只消费冻结 Spec。"""
 
 from __future__ import annotations
 
@@ -64,8 +64,6 @@ def test_project_configuration_is_parsed_but_requires_explicit_confirmation(
 schema_version = 1
 [verification]
 acceptance = [["python", "acceptance.py"]]
-targeted = [["python", "target.py"]]
-related = [["python", "related.py"]]
 regression = [["python", "regression.py"]]
 static = [["python", "-m", "compileall", "src"]]
 """.strip()
@@ -73,23 +71,26 @@ static = [["python", "-m", "compileall", "src"]]
         encoding="utf-8",
     )
     detection = ProjectDetector().detect(tmp_path)
-    specification = acceptance_spec()
-
-    unconfirmed = build_verification_matrix(
-        specification,
-        project_configuration=detection.configuration,
-        configuration_confirmed=False,
+    assert detection.configuration is not None
+    specification = acceptance_spec().model_copy(
+        update={
+            "behavior_verification_commands": detection.configuration.acceptance,
+            "verification_commands": (
+                *detection.configuration.regression,
+                *detection.configuration.static,
+            ),
+        }
     )
-    confirmed = build_verification_matrix(
-        specification,
-        project_configuration=detection.configuration,
-        configuration_confirmed=True,
+    frozen = build_verification_matrix(specification)
+    (configuration_directory / "project.toml").write_text(
+        "schema_version = 1\n[verification]\nacceptance = []\n",
+        encoding="utf-8",
     )
 
-    assert not any(step.command[-1] == "regression.py" for step in unconfirmed.steps)
-    assert any(step.command[-1] == "regression.py" for step in confirmed.steps)
-    assert any(step.command[-1] == "acceptance.py" for step in confirmed.steps)
-    assert {step.kind for step in confirmed.steps} == set(VerificationKind)
+    assert any(step.command[-1] == "regression.py" for step in frozen.steps)
+    assert any(step.command[-1] == "acceptance.py" for step in frozen.steps)
+    assert {step.kind for step in frozen.steps} == set(VerificationKind)
+    assert build_verification_matrix(specification) == frozen
     readiness = evidence_readiness(detection)
     assert readiness.ready is True
     assert readiness.acceptance_commands == (("python", "acceptance.py"),)
@@ -108,6 +109,8 @@ def test_empty_acceptance_is_not_evidence_ready(tmp_path: Path) -> None:
     assert readiness.ready is False
     assert readiness.reason == "verification.acceptance 为空"
     assert "candidate-only" not in readiness.next_action
+    assert "rivet init" not in readiness.next_action
+    assert ".rivet/project.toml" in readiness.next_action
 
 
 def test_broken_project_configuration_symlink_is_rejected(tmp_path: Path) -> None:
@@ -138,9 +141,11 @@ def test_verdict_fails_closed_for_required_failure_or_inconclusive() -> None:
 
     passed = compute_verdict(
         transaction_id="tx_matrix",
+        base_commit="a" * 40,
         acceptance_sha256="sha256:" + ("a" * 64),
+        patch_sha256="sha256:" + ("b" * 64),
         evidence_id="evidence_matrix",
-        evidence_manifest_path="evidence/attempt_0001/manifest.json",
+        evidence_manifest_path="tx_matrix/attempt_0001/manifest.json",
         results=passed_results,
         decided_at=decided_at,
     )
@@ -153,9 +158,11 @@ def test_verdict_fails_closed_for_required_failure_or_inconclusive() -> None:
     )
     failed = compute_verdict(
         transaction_id="tx_matrix",
+        base_commit="a" * 40,
         acceptance_sha256="sha256:" + ("a" * 64),
+        patch_sha256="sha256:" + ("b" * 64),
         evidence_id="evidence_matrix",
-        evidence_manifest_path="evidence/attempt_0001/manifest.json",
+        evidence_manifest_path="tx_matrix/attempt_0001/manifest.json",
         results=tuple(failed_results),
         decided_at=decided_at,
     )
@@ -165,9 +172,11 @@ def test_verdict_fails_closed_for_required_failure_or_inconclusive() -> None:
     )
     inconclusive = compute_verdict(
         transaction_id="tx_matrix",
+        base_commit="a" * 40,
         acceptance_sha256="sha256:" + ("a" * 64),
+        patch_sha256="sha256:" + ("b" * 64),
         evidence_id="evidence_matrix",
-        evidence_manifest_path="evidence/attempt_0001/manifest.json",
+        evidence_manifest_path="tx_matrix/attempt_0001/manifest.json",
         results=tuple(inconclusive_results),
         decided_at=decided_at,
     )

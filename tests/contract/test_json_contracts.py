@@ -10,7 +10,6 @@ from rivet.contracts import CONTRACT_MODELS
 from rivet.contracts.events import TraceEventEnvelope
 from rivet.contracts.ipc import IpcRequest
 from rivet.contracts.messages import SystemMessage
-from rivet.contracts.tools import ToolResult
 from scripts.verify_ipc_contracts import verify_ipc_contracts
 
 GOLDEN_FIXTURE_PATH = Path("tests/fixtures/contracts/golden_v1.json")
@@ -30,7 +29,6 @@ def test_golden_json_roundtrips_without_semantic_change() -> None:
     )
     model_types: dict[str, type[BaseModel]] = {
         "system_message": SystemMessage,
-        "tool_result": ToolResult,
         "trace_event": TraceEventEnvelope,
         "ipc_request": IpcRequest,
     }

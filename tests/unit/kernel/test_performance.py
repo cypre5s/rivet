@@ -1,20 +1,32 @@
-"""验证 Phase 2 空 Kernel 的 RSS 与惰性导入门禁。"""
+"""验证静态 Kernel 与五模块目录不会偷跑重型实现。"""
 
 from __future__ import annotations
 
-from typing import cast
+import os
+import subprocess
+import sys
 
-from scripts.measure_kernel import collect_kernel_baseline
 
+def test_kernel_and_catalog_import_without_heavy_factories() -> None:
+    probe = (
+        "import sys; "
+        "import rivet.kernel.application; import rivet.modules.catalog; "
+        "blocked=('rivet.modules.factories','rivet.providers.deepseek',"
+        "'rivet.context.engine','rivet.transaction.manager','rivet.verify.service'); "
+        "raise SystemExit(1 if any(name in sys.modules for name in blocked) else 0)"
+    )
 
-def test_empty_kernel_rss_and_help_imports_meet_limits() -> None:
-    baseline = collect_kernel_baseline()
-    empty_kernel = cast(dict[str, object], baseline["empty_kernel"])
-    help_entrypoint = cast(dict[str, object], baseline["help_entrypoint"])
-    manifest_loading = cast(dict[str, object], baseline["manifest_loading"])
+    completed = subprocess.run(
+        (sys.executable, "-c", probe),
+        check=False,
+        capture_output=True,
+        env={
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+        },
+        timeout=10,
+    )
 
-    assert cast(float, empty_kernel["peak_rss_mib"]) <= 80
-    assert empty_kernel["resource_count"] == 0
-    assert empty_kernel["forbidden_loaded_modules"] == []
-    assert help_entrypoint["forbidden_loaded_modules"] == []
-    assert cast(float, manifest_loading["p95_ms"]) <= 30
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")

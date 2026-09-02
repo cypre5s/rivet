@@ -17,7 +17,7 @@ from rivet.contracts.verification import (
     VerificationStep,
 )
 from rivet.kernel.resources import ResourceScope
-from rivet.transaction.hashing import canonical_json_bytes
+from rivet.transaction.hashing import canonical_json_bytes, sha256_digest
 from rivet.transaction.manager import TransactionManager
 from rivet.verify.evidence import MANDATORY_EVIDENCE_FILES, EvidenceBundleWriter
 
@@ -66,6 +66,7 @@ def make_manager(
         scope=scope,
         cache_root=root / "cache" / "rivet",
         state_root=root / "state" / "transactions",
+        evidence_root=root / "state" / "evidence",
         clock=lambda: datetime(2026, 8, 28, tzinfo=UTC),
     )
 
@@ -100,8 +101,13 @@ def passed_verdict(
     manager: TransactionManager,
 ) -> Verdict:
     """为事务层集成测试构造带最小完整证据的通过 Verdict。"""
-    if record.acceptance_sha256 is None:
-        raise AssertionError("事务尚未冻结 AcceptanceSpec")
+    if record.current_patch_id is None:
+        raise AssertionError("事务尚未记录 PatchSet")
+    patch_content = manager.patch_path(
+        record.transaction_id,
+        record.current_patch_id,
+    ).read_bytes()
+    patch_sha256 = sha256_digest(patch_content)
     attempt_name = EvidenceBundleWriter(
         manager.evidence_root(record.transaction_id)
     ).next_attempt_name()
@@ -122,26 +128,30 @@ def passed_verdict(
     )
     verdict = Verdict(
         transaction_id=record.transaction_id,
+        base_commit=record.base_commit,
         acceptance_sha256=record.acceptance_sha256,
+        patch_sha256=patch_sha256,
         evidence_id=evidence_id,
-        evidence_manifest_path=f"evidence/{attempt_name}/manifest.json",
+        evidence_manifest_path=(
+            f"{record.transaction_id}/{attempt_name}/manifest.json"
+        ),
         status=VerificationStatus.PASSED,
         passed=True,
         results=(result,),
         decided_at=datetime(2026, 8, 28, tzinfo=UTC),
     )
     payloads = {name: f"fixture:{name}\n".encode() for name in MANDATORY_EVIDENCE_FILES}
+    acceptance_path = manager.store().acceptance_path(record.transaction_id)
+    payloads["acceptance_spec.json"] = acceptance_path.read_bytes()
+    payloads["patch.diff"] = patch_content
     payloads["verdict.json"] = (
         canonical_json_bytes(verdict.model_dump(mode="json")) + b"\n"
     )
-    if record.current_patch_id is not None:
-        payloads["patch.diff"] = manager.patch_path(
-            record.transaction_id,
-            record.current_patch_id,
-        ).read_bytes()
     EvidenceBundleWriter(manager.evidence_root(record.transaction_id)).write(
         transaction_id=record.transaction_id,
+        base_commit=record.base_commit,
         acceptance_sha256=record.acceptance_sha256,
+        patch_sha256=patch_sha256,
         files=payloads,
         evidence_id=evidence_id,
         attempt_name=attempt_name,

@@ -12,7 +12,9 @@ from rivet.kernel.resources import ResourceScope
 from rivet.tools.files import TransactionFileWriter
 from rivet.transaction.errors import TransactionError
 from rivet.transaction.git_backend import GitBackend
+from rivet.transaction.hashing import acceptance_sha256
 from rivet.transaction.manager import TransactionManager
+from rivet.transaction.store import TransactionStore
 from tests.transaction_helpers import (
     acceptance_spec,
     initialize_repository,
@@ -33,42 +35,38 @@ async def test_clean_repository_patch_apply_isolated_and_idempotent(
     main_before = worktree_digest(repository)
 
     snapshot = await manager.inspect_repository()
-    record = await manager.create(transaction_id="tx_clean")
+    specification = acceptance_spec()
+    with pytest.raises(TransactionError, match="确认"):
+        await manager.create(
+            specification,
+            confirmed=False,
+            transaction_id="tx_clean",
+        )
+    assert not (tmp_path / "state" / "transactions" / "tx_clean").exists()
+    assert not tuple((tmp_path / "cache").rglob("tx_clean"))
+
+    record = await manager.create(
+        specification,
+        confirmed=True,
+        transaction_id="tx_clean",
+    )
     transaction_path = manager.worktree_path(record.transaction_id)
 
     assert snapshot.repository_root == repository.resolve()
     assert snapshot.branch == "main"
     assert snapshot.dirty is False
-    assert record.state is TransactionState.BASELINED
+    assert record.state is TransactionState.ACCEPTANCE_FROZEN
     assert record.base_commit == record.head_commit
+    assert record.acceptance_sha256 == acceptance_sha256(specification)
     assert transaction_path.is_relative_to((tmp_path / "cache").resolve())
     assert not transaction_path.is_relative_to(repository.resolve())
-
-    specification = acceptance_spec()
-    with pytest.raises(TransactionError, match="确认"):
-        await manager.freeze_acceptance(
-            record.transaction_id,
-            specification,
-            confirmed=False,
-        )
-    acceptance_hash = await manager.freeze_acceptance(
-        record.transaction_id,
-        specification,
-        confirmed=True,
-    )
-    assert (
-        await manager.freeze_acceptance(
-            record.transaction_id,
-            specification,
-            confirmed=True,
-        )
-        == acceptance_hash
-    )
-    with pytest.raises(TransactionError, match="冻结"):
-        await manager.freeze_acceptance(
-            record.transaction_id,
+    assert transaction_path.is_dir()
+    assert await manager.load_acceptance_spec(record.transaction_id) == specification
+    with pytest.raises(TransactionError, match="已存在"):
+        await manager.create(
             acceptance_spec(expected_behavior="不同的行为"),
             confirmed=True,
+            transaction_id=record.transaction_id,
         )
 
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))
@@ -113,7 +111,11 @@ async def test_detached_head_is_recorded_and_abort_is_idempotent(
     scope = ResourceScope("transaction.detached")
     manager = make_manager(repository, tmp_path, scope)
 
-    record = await manager.create(transaction_id="tx_detached")
+    record = await manager.create(
+        acceptance_spec(acceptance_id="acceptance_detached"),
+        confirmed=True,
+        transaction_id="tx_detached",
+    )
     aborted = await manager.abort(record.transaction_id)
     aborted_again = await manager.abort(record.transaction_id)
 
@@ -122,90 +124,6 @@ async def test_detached_head_is_recorded_and_abort_is_idempotent(
     assert aborted.state is TransactionState.ABORTED
     assert aborted_again == aborted
     assert not manager.worktree_path(record.transaction_id).exists()
-    scope.assert_empty()
-    await scope.close()
-
-
-@pytest.mark.asyncio
-async def test_candidate_adopts_only_confirmed_project_verification_config(
-    tmp_path: Path,
-) -> None:
-    repository = initialize_repository(tmp_path)
-    scope = ResourceScope("transaction.configuration-adoption")
-    manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_configuration_adoption")
-    await manager.freeze_acceptance(
-        record.transaction_id,
-        acceptance_spec(),
-        confirmed=True,
-    )
-    TransactionFileWriter(manager.transaction_boundary(record.transaction_id)).write(
-        "tracked.txt", "candidate\n"
-    )
-    await manager.record_patch_set(record.transaction_id)
-    manager.suspend(record.transaction_id)
-
-    runtime = repository / ".rivet"
-    runtime.mkdir()
-    (runtime / "project.toml").write_text(
-        """schema_version = 1
-[rivet]
-safe_mode = false
-[verification]
-acceptance = [["python", "-c", "raise SystemExit(0)"]]
-targeted = []
-related = []
-regression = []
-static = []
-""",
-        encoding="utf-8",
-    )
-    await manager.recover(record.transaction_id)
-    adopted = await manager.adopt_project_verification_configuration(
-        record.transaction_id
-    )
-
-    assert adopted.repository_fingerprint != record.repository_fingerprint
-    assert adopted.dirty is True
-    assert (await manager.begin_verification(record.transaction_id)).state is (
-        TransactionState.VERIFYING
-    )
-    await manager.abort(record.transaction_id)
-    scope.assert_empty()
-    await scope.close()
-
-
-@pytest.mark.asyncio
-async def test_candidate_rejects_config_adoption_with_unrelated_repository_drift(
-    tmp_path: Path,
-) -> None:
-    repository = initialize_repository(tmp_path)
-    scope = ResourceScope("transaction.configuration-drift")
-    manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_configuration_drift")
-    await manager.freeze_acceptance(
-        record.transaction_id,
-        acceptance_spec(),
-        confirmed=True,
-    )
-    TransactionFileWriter(manager.transaction_boundary(record.transaction_id)).write(
-        "tracked.txt", "candidate\n"
-    )
-    await manager.record_patch_set(record.transaction_id)
-    manager.suspend(record.transaction_id)
-    (repository / ".rivet").mkdir()
-    (repository / ".rivet" / "project.toml").write_text(
-        'schema_version = 1\n[verification]\nacceptance = [["pytest", "-q"]]\n',
-        encoding="utf-8",
-    )
-    (repository / "second.txt").write_text("unrelated drift\n", encoding="utf-8")
-    await manager.recover(record.transaction_id)
-
-    with pytest.raises(TransactionError) as captured:
-        await manager.adopt_project_verification_configuration(record.transaction_id)
-
-    assert captured.value.code == "transaction.verification_repository_drift"
-    await manager.abort(record.transaction_id)
     scope.assert_empty()
     await scope.close()
 
@@ -235,7 +153,11 @@ async def test_repository_with_submodule_records_status_without_initializing_it(
     scope = ResourceScope("transaction.submodule")
     manager = make_manager(repository, parent_root, scope)
 
-    record = await manager.create(transaction_id="tx_submodule")
+    record = await manager.create(
+        acceptance_spec(acceptance_id="acceptance_submodule"),
+        confirmed=True,
+        transaction_id="tx_submodule",
+    )
 
     assert record.has_submodules is True
     assert record.submodule_status_sha256.startswith("sha256:")
@@ -249,12 +171,11 @@ async def test_frozen_acceptance_tampering_blocks_patch_record(tmp_path: Path) -
     repository = initialize_repository(tmp_path)
     scope = ResourceScope("transaction.acceptance.tamper")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_acceptance_tamper")
     specification = acceptance_spec()
-    await manager.freeze_acceptance(
-        record.transaction_id,
+    record = await manager.create(
         specification,
         confirmed=True,
+        transaction_id="tx_acceptance_tamper",
     )
     writer = TransactionFileWriter(manager.transaction_boundary(record.transaction_id))
     writer.write("tracked.txt", "patched\n")
@@ -291,14 +212,24 @@ async def test_default_worktree_uses_xdg_cache_home(
 ) -> None:
     repository = initialize_repository(tmp_path)
     xdg_cache_home = tmp_path / "xdg-cache"
+    xdg_state_home = tmp_path / "xdg-state"
     monkeypatch.setenv("XDG_CACHE_HOME", str(xdg_cache_home))
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg_state_home))
     scope = ResourceScope("transaction.xdg")
     manager = TransactionManager(repository, scope=scope)
 
-    record = await manager.create(transaction_id="tx_xdg")
+    record = await manager.create(
+        acceptance_spec(acceptance_id="acceptance_xdg"),
+        confirmed=True,
+        transaction_id="tx_xdg",
+    )
     worktree = manager.worktree_path(record.transaction_id)
 
     assert worktree.is_relative_to(xdg_cache_home / "rivet" / "worktrees")
+    assert worktree.is_dir()
+    state_records = tuple((xdg_state_home / "rivet").rglob("tx_xdg/record.json"))
+    assert len(state_records) == 1
+    assert not (repository / ".rivet").exists()
     await manager.abort(record.transaction_id)
     scope.assert_empty()
     await scope.close()
@@ -330,8 +261,17 @@ async def test_partial_worktree_creation_failure_is_fully_cleaned(
     monkeypatch.setattr(GitBackend, "add_worktree", fail_after_directory)
 
     with pytest.raises(TransactionError, match="注入"):
-        await manager.create(transaction_id="tx_partial_failure")
+        await manager.create(
+            acceptance_spec(),
+            confirmed=True,
+            transaction_id="tx_partial_failure",
+        )
 
+    persisted = TransactionStore(tmp_path / "state" / "transactions").load_record(
+        "tx_partial_failure"
+    )
+    assert persisted.state is TransactionState.ACCEPTANCE_FROZEN
+    assert persisted.acceptance_sha256 is not None
     assert worktree_digest(repository) == digest_before
     assert not tuple((tmp_path / "cache").rglob("tx_partial_failure"))
     assert "tx_partial_failure" not in run_git(

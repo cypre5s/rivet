@@ -1,190 +1,83 @@
-"""用脚本 Provider 验证 CLI 模型命令的离线编排。"""
+"""验证最小 ASK/FIX CLI 的提案、Demand 与 Evidence 闭环。"""
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from argparse import Namespace
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-import rivet.cli.model_commands as model_commands
-import rivet.kernel.module_availability as module_availability
-import rivet.modules.factories as module_factories
 from rivet.cli.config import ResolvedConfig
-from rivet.cli.errors import CliProviderError, CliVerificationError
-from rivet.cli.exit_codes import ExitCode
-from rivet.contracts.messages import (
-    AssistantMessage,
-    ProviderOpaqueState,
-    SystemMessage,
-    UserMessage,
-)
+from rivet.cli.errors import CliSecurityError, CliVerificationError
+from rivet.cli.model_commands import build_acceptance_spec, run_model_command
+from rivet.cli.transaction_commands import run_transaction_command
+from rivet.contracts.messages import AssistantMessage
 from rivet.contracts.provider import (
     ModelFinishReason,
-    ModelProviderError,
     ModelRequest,
     ModelResponse,
     TokenUsage,
 )
 from rivet.contracts.tools import ToolCall
+from rivet.contracts.transactions import TransactionState
+from rivet.kernel.module_api import ModuleActivationContext
 from rivet.kernel.resources import ResourceScope
-from rivet.storage.sessions import (
-    SessionCheckpoint,
-    SessionStage,
-    SessionStatus,
-    SessionStore,
-)
-from rivet.tools.files import TransactionFileWriter
-from rivet.transaction.manager import TransactionManager
+from rivet.trace.paths import RuntimePaths
+from rivet.transaction.hashing import acceptance_sha256
 from rivet.transaction.store import TransactionStore
+from rivet.verify.detector import ProjectDetector
 
-NOW = datetime(2026, 8, 28, tzinfo=UTC)
-
-
-def _git(repository: Path, *arguments: str) -> None:
-    """运行固定测试 Git 命令。"""
-    subprocess.run(
-        ("git", *arguments),
-        cwd=repository,
-        check=True,
-        capture_output=True,
-        env={
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        },
-    )
+NOW = datetime(2026, 9, 2, tzinfo=UTC)
 
 
-def _repository(tmp_path: Path) -> Path:
-    """创建一个干净且可形成补丁的 Git 仓库。"""
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    _git(repository, "init", "-q", "-b", "main")
-    _git(repository, "config", "user.name", "Fixture")
-    _git(repository, "config", "user.email", "fixture@example.invalid")
-    (repository / "tracked.txt").write_text("base\n", encoding="utf-8")
-    _git(repository, "add", "--", "tracked.txt")
-    _git(repository, "commit", "-qm", "initial")
-    return repository
+class ScriptedProvider:
+    def __init__(self, responses: Sequence[ModelResponse]) -> None:
+        self._responses = list(responses)
+        self.requests: list[ModelRequest] = []
+
+    async def complete(
+        self,
+        request: ModelRequest,
+        *,
+        on_text_delta: Callable[[str], Awaitable[None]] | None = None,
+    ) -> ModelResponse:
+        self.requests.append(request)
+        response = self._responses.pop(0)
+        if on_text_delta is not None and response.message.content:
+            await on_text_delta(response.message.content)
+        return response
 
 
-def _configure_independent_acceptance(repository: Path) -> None:
-    """提交一个独立、固定 argv 行为验收，使 FIX Evidence 预检就绪。"""
-    runtime = repository / ".rivet"
-    runtime.mkdir(exist_ok=True)
-    (runtime / "project.toml").write_text(
-        """schema_version = 1
+def _provider_factory(
+    provider: ScriptedProvider,
+) -> Callable[[ModuleActivationContext, ResourceScope], ScriptedProvider]:
+    def create(
+        context: ModuleActivationContext,
+        scope: ResourceScope,
+    ) -> ScriptedProvider:
+        del context, scope
+        return provider
 
-[rivet]
-safe_mode = false
-
-[verification]
-acceptance = [["python", "-c", "raise SystemExit(0)"]]
-targeted = []
-related = []
-regression = []
-static = []
-""",
-        encoding="utf-8",
-    )
-    _git(repository, "add", "--", ".rivet/project.toml")
-    _git(repository, "commit", "-qm", "configure independent acceptance")
-
-
-def _config() -> ResolvedConfig:
-    """返回不携带凭据值的已解析配置。"""
-    return ResolvedConfig(
-        model="deepseek-v4-pro",
-        models=("deepseek-v4-pro", "deepseek-v4-flash"),
-        base_url="https://api.deepseek.com",
-        max_rounds=5,
-        max_total_tokens=4_000,
-        max_cost_usd=None,
-        safe_mode=False,
-        credential_configured=True,
-        sources={
-            "base_url": "default",
-            "max_cost_usd": "default",
-            "max_rounds": "default",
-            "max_total_tokens": "default",
-            "model": "default",
-            "models": "default",
-            "safe_mode": "default",
-        },
-    )
-
-
-def test_behavior_verifier_files_are_frozen_out_of_patch_scope(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repository"
-    (repository / ".rivet").mkdir(parents=True)
-    (repository / ".rivet" / "project.toml").write_text(
-        "schema_version = 1\n",
-        encoding="utf-8",
-    )
-    (repository / "check_behavior.py").write_text(
-        "raise SystemExit(0)\n",
-        encoding="utf-8",
-    )
-    (repository / "acceptance").mkdir()
-    (repository / "acceptance" / "cases.json").write_text(
-        "{}\n",
-        encoding="utf-8",
-    )
-    executable = repository / "verify-behavior"
-    executable.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
-    (repository / "verify-link").symlink_to("verify-behavior")
-    (repository / "acceptance_module.py").write_text(
-        "raise SystemExit(0)\n",
-        encoding="utf-8",
-    )
-
-    protected = model_commands.resolve_behavior_verifier_paths(
-        repository,
-        (
-            ("python", "check_behavior.py", "acceptance"),
-            ("./verify-behavior",),
-            ("./verify-link",),
-            ("python", "-m", "acceptance_module"),
-            ("python", "-c", "print('ok')"),
-        ),
-    )
-
-    assert protected == (
-        ".rivet/project.toml",
-        "acceptance",
-        "acceptance_module.py",
-        "check_behavior.py",
-        "verify-behavior",
-        "verify-link",
-    )
+    return create
 
 
 def _response(
-    content: str,
     *,
+    content: str = "",
     tool_calls: tuple[ToolCall, ...] = (),
     finish_reason: ModelFinishReason = ModelFinishReason.STOP,
 ) -> ModelResponse:
-    """构造带 opaque 状态且 usage 自洽的响应。"""
     return ModelResponse(
         provider_id="deepseek",
-        model="deepseek-v4-pro",
+        model="deepseek-v4-flash",
         message=AssistantMessage(
             content=content,
             tool_calls=tool_calls,
-            opaque_state=ProviderOpaqueState(
-                provider_id="deepseek",
-                provider_version="1.0.0",
-                payload={"reasoning_content": "opaque"},
-            ),
             created_at=NOW,
         ),
         finish_reason=finish_reason,
@@ -192,545 +85,489 @@ def _response(
             prompt_tokens=1,
             completion_tokens=1,
             total_tokens=2,
+            cost_usd=Decimal("0.001"),
         ),
     )
 
 
-def _install_provider(
-    monkeypatch: pytest.MonkeyPatch,
-    responses: list[ModelResponse],
-) -> list[ModelRequest]:
-    """注入只返回本地录制响应的 Provider 原语。"""
-    requests: list[ModelRequest] = []
-
-    class ScriptedProvider:
-        """按顺序消费响应，不创建客户端或访问网络。"""
-
-        def __init__(self, *_args: object, **_kwargs: object) -> None:
-            self.requests: list[ModelRequest] = []
-
-        async def complete(
-            self,
-            request: ModelRequest,
-            *,
-            on_text_delta: Callable[[str], Awaitable[None]] | None = None,
-        ) -> ModelResponse:
-            """记录请求并返回下一个响应。"""
-            self.requests.append(request)
-            requests.append(request)
-            response = responses.pop(0)
-            if on_text_delta is not None and response.message.content:
-                await on_text_delta(response.message.content)
-            return response
-
-    def create_provider(*_args: object, **_kwargs: object) -> ScriptedProvider:
-        """在正式惰性 Provider 边界注入录制原语。"""
-        return ScriptedProvider()
-
-    monkeypatch.setattr(
-        module_factories,
-        "_create_deepseek_provider",
-        create_provider,
+def _investigation_provider() -> ScriptedProvider:
+    return ScriptedProvider(
+        (
+            _response(
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_context_search",
+                        tool_name="context_search",
+                        arguments={"query": "answer", "max_results": 4},
+                    ),
+                ),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            ),
+            _response(content="根因位于 calc.py，建议只修改该文件。"),
+        )
     )
-    return requests
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("command", ["ask", "plan"])
-async def test_read_only_model_commands_persist_trace_and_checkpoint(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    command: str,
-) -> None:
-    repository = _repository(tmp_path)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    _install_provider(monkeypatch, [_response("离线回答")])
-
-    exit_code = await model_commands.run_model_command(
-        Namespace(command=command, query="解释仓库"),
-        repository=repository,
-        config=_config(),
-        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
-        json_output=True,
-    )
-    payload = json.loads(capsys.readouterr().out)
-    checkpoint = SessionStore(repository).load(payload["session_id"])
-
-    assert exit_code == 0
-    assert payload["answer"] == "离线回答"
-    assert checkpoint.status is (
-        SessionStatus.ANSWERED if command == "ask" else SessionStatus.PLANNED
-    )
-    assert checkpoint.provider_state == {"reasoning_content": "opaque"}
-    trace_path = repository / ".rivet" / "trace" / "events.ndjson"
-    assert trace_path.is_file()
-    trace_text = trace_path.read_text(encoding="utf-8")
-    assert '"event_type":"agent.output.delta"' in trace_text
-    assert '"response_id":"response_' in trace_text
-    events = [json.loads(line)["event"] for line in trace_text.splitlines()]
-    event_types = [event["event_type"] for event in events]
-    assert "module.requested" in event_types
-    assert "module.activated" in event_types
-    assert "module.released" in event_types
-    model_stage_releases = [
-        event
-        for event in events
-        if event["event_type"] == "module.released"
-        and event["payload"].get("reason") == "model_stage_complete"
-    ]
-    assert {event["payload"]["module_id"] for event in model_stage_releases} == {
-        "guard.sandbox",
-        "provider.deepseek",
+def _environment(tmp_path: Path) -> dict[str, str]:
+    return {
+        "DEEPSEEK_API_KEY": "test-key-not-real",
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "XDG_CACHE_HOME": str(tmp_path / "cache"),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
     }
-    assert all(
-        event["payload"]["state"] == "INACTIVE" for event in model_stage_releases
+
+
+def _config(*, credential: bool = True) -> ResolvedConfig:
+    return ResolvedConfig(
+        model="deepseek-v4-flash",
+        models=("deepseek-v4-flash",),
+        base_url="https://api.deepseek.com",
+        max_rounds=8,
+        max_total_tokens=16_000,
+        max_cost_usd=Decimal("1"),
+        credential_configured=credential,
+        sources={"model": "test"},
     )
-    assert all(
-        event["payload"]["resource_count"] == 0 for event in model_stage_releases
+
+
+def _repository(tmp_path: Path) -> Path:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    subprocess.run(("git", "init", "-q"), cwd=repository, check=True)
+    subprocess.run(
+        ("git", "config", "user.email", "test@example.invalid"),
+        cwd=repository,
+        check=True,
+    )
+    subprocess.run(
+        ("git", "config", "user.name", "Rivet Test"),
+        cwd=repository,
+        check=True,
+    )
+    (repository / "calc.py").write_text(
+        "def answer():\n    return 1\n", encoding="utf-8"
+    )
+    config = repository / ".rivet" / "project.toml"
+    config.parent.mkdir()
+    config.write_text(
+        """schema_version = 1
+[rivet]
+model = "deepseek-v4-flash"
+[verification]
+acceptance = [["python", "-c", "from calc import answer; assert answer() == 2"]]
+regression = []
+static = []
+""",
+        encoding="utf-8",
+    )
+    subprocess.run(("git", "add", "."), cwd=repository, check=True)
+    subprocess.run(("git", "commit", "-qm", "baseline"), cwd=repository, check=True)
+    return repository
+
+
+def _fix_arguments(
+    *,
+    yes: bool,
+    allow_write: list[str],
+    allow_read: list[str] | None = None,
+    allow_new: list[str] | None = None,
+    acceptance_hash: str | None = None,
+    base_commit: str | None = None,
+) -> Namespace:
+    return Namespace(
+        acceptance_sha256=acceptance_hash,
+        base_commit=base_commit,
+        command="fix",
+        task="让 answer 返回 2",
+        yes=yes,
+        allow_read=allow_read or [],
+        allow_write=allow_write,
+        allow_new=allow_new or [],
     )
 
 
 @pytest.mark.asyncio
-async def test_core_profile_ask_degrades_when_syntax_extra_is_missing(
+async def test_unconfirmed_fix_without_scope_is_in_memory_only(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """缺 Tree-sitter 不得阻止 ASK 使用 lexical fallback 完成。"""
     repository = _repository(tmp_path)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    _install_provider(monkeypatch, [_response("基础能力回答")])
-    original_find_spec = module_availability.importlib.util.find_spec
-
-    def without_syntax(name: str) -> object:
-        if name.startswith("tree_sitter"):
-            return None
-        return original_find_spec(name)
+    environment = _environment(tmp_path)
+    detection = ProjectDetector().detect(repository)
+    provider = _investigation_provider()
+    from rivet.modules import factories
 
     monkeypatch.setattr(
-        module_availability.importlib.util,
-        "find_spec",
-        without_syntax,
+        factories,
+        "_create_deepseek_provider",
+        _provider_factory(provider),
     )
 
-    exit_code = await model_commands.run_model_command(
-        Namespace(command="ask", query="解释仓库"),
+    code = await run_model_command(
+        _fix_arguments(yes=False, allow_write=[]),
         repository=repository,
         config=_config(),
-        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
+        environment=environment,
         json_output=True,
+        preflight_detection=detection,
     )
 
+    assert code == 0
     payload = json.loads(capsys.readouterr().out)
-    trace_text = (repository / ".rivet" / "trace" / "events.ndjson").read_text(
-        encoding="utf-8"
-    )
-    assert exit_code == 0
-    assert payload["answer"] == "基础能力回答"
-    assert '"event_type":"module.activation_failed"' in trace_text
-    assert '"availability":"MISSING_DEPENDENCY"' in trace_text
-    assert '"event_type":"run.completed"' in trace_text
+    assert payload["transaction_created"] is False
+    assert payload["scope"] == []
+    assert "calc.py" in payload["investigation"]
+    assert len(provider.requests) == 2
+    paths = RuntimePaths.for_repository(repository, environment=environment)
+    assert paths.events_path.is_file()
+    assert not paths.transactions_root.exists()
+    assert not paths.worktrees_root.exists()
+    assert {definition.name for definition in provider.requests[0].tools} == {
+        "workspace_info",
+        "context_search",
+        "file_read",
+    }
 
 
 @pytest.mark.asyncio
-async def test_fix_without_independent_acceptance_fails_before_kernel_or_cost(
+async def test_unconfirmed_complete_proposal_has_no_transaction(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository(tmp_path)
+    environment = _environment(tmp_path)
+    detection = ProjectDetector().detect(repository)
+    provider = _investigation_provider()
+    from rivet.modules import factories
+
+    monkeypatch.setattr(
+        factories,
+        "_create_deepseek_provider",
+        _provider_factory(provider),
+    )
+
+    code = await run_model_command(
+        _fix_arguments(yes=False, allow_write=["calc.py"]),
+        repository=repository,
+        config=_config(),
+        environment=environment,
+        json_output=True,
+        preflight_detection=detection,
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["confirmed"] is False
+    assert payload["transaction_created"] is False
+    assert payload["acceptance"]["write_scope"] == ["calc.py"]
+    assert set(payload) == {
+        "acceptance",
+        "acceptance_sha256",
+        "base_commit",
+        "confirmed",
+        "investigation",
+        "next_action",
+        "run_id",
+        "transaction_created",
+    }
+    assert payload["acceptance_sha256"] == acceptance_sha256(
+        build_acceptance_spec(
+            repository,
+            "让 answer 返回 2",
+            detection=detection,
+            explicit_paths=("calc.py",),
+            config=_config(),
+        )
+    )
+    paths = RuntimePaths.for_repository(repository, environment=environment)
+    assert not paths.transactions_root.exists()
+    assert not paths.evidence_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_unconfirmed_fix_requires_actual_read_tool_before_proposal(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     repository = _repository(tmp_path)
+    environment = _environment(tmp_path)
+    provider = ScriptedProvider((_response(content="我猜问题位于 calc.py"),))
+    from rivet.modules import factories
 
-    def forbidden_kernel(*_args: object, **_kwargs: object) -> object:
-        raise AssertionError("Evidence 预检失败时不得创建 Kernel 或 Provider")
+    monkeypatch.setattr(
+        factories,
+        "_create_deepseek_provider",
+        _provider_factory(provider),
+    )
 
-    monkeypatch.setattr(model_commands, "create_cli_kernel", forbidden_kernel)
+    with pytest.raises(CliVerificationError, match="只读仓库调查"):
+        await run_model_command(
+            _fix_arguments(yes=False, allow_write=["calc.py"]),
+            repository=repository,
+            config=_config(),
+            environment=environment,
+            json_output=True,
+            preflight_detection=ProjectDetector().detect(repository),
+        )
 
-    with pytest.raises(CliVerificationError) as captured:
-        await model_commands.run_model_command(
-            Namespace(
-                command="fix",
-                dirty_policy="reject",
-                task="修改 tracked.txt",
+    paths = RuntimePaths.for_repository(repository, environment=environment)
+    assert not paths.transactions_root.exists()
+    assert not paths.worktrees_root.exists()
+    assert len(provider.requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_confirmed_fix_rejects_unbound_acceptance_before_transaction(
+    tmp_path: Path,
+) -> None:
+    repository = _repository(tmp_path)
+    environment = _environment(tmp_path)
+
+    with pytest.raises(CliSecurityError, match="确认令牌"):
+        await run_model_command(
+            _fix_arguments(
                 yes=True,
+                allow_write=["calc.py"],
+                acceptance_hash="sha256:" + "0" * 64,
+                base_commit="0" * 40,
             ),
             repository=repository,
             config=_config(),
-            environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
+            environment=environment,
             json_output=True,
+            preflight_detection=ProjectDetector().detect(repository),
         )
 
-    assert captured.value.code == "verification.acceptance_not_ready"
-    assert not (repository / ".rivet" / "sessions").exists()
+    paths = RuntimePaths.for_repository(repository, environment=environment)
+    assert not paths.transactions_root.exists()
+    assert not paths.worktrees_root.exists()
 
 
 @pytest.mark.asyncio
-async def test_candidate_only_records_patch_without_verify_or_evidence(
+async def test_confirmed_fix_rejects_proposal_base_drift_without_transaction(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
 ) -> None:
     repository = _repository(tmp_path)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    _install_provider(
-        monkeypatch,
-        [
+    environment = _environment(tmp_path)
+    detection = ProjectDetector().detect(repository)
+    specification = build_acceptance_spec(
+        repository,
+        "让 answer 返回 2",
+        detection=detection,
+        explicit_paths=("calc.py",),
+        config=_config(),
+    )
+
+    with pytest.raises(CliSecurityError, match="Git 基线"):
+        await run_model_command(
+            _fix_arguments(
+                yes=True,
+                allow_write=["calc.py"],
+                acceptance_hash=acceptance_sha256(specification),
+                base_commit="0" * 40,
+            ),
+            repository=repository,
+            config=_config(),
+            environment=environment,
+            json_output=True,
+            preflight_detection=detection,
+        )
+
+    paths = RuntimePaths.for_repository(repository, environment=environment)
+    assert not paths.transactions_root.exists()
+    assert not paths.worktrees_root.exists()
+
+
+def test_acceptance_rejects_write_scope_covering_oracle(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    detection = ProjectDetector().detect(repository)
+    with pytest.raises(CliSecurityError, match="验收文件"):
+        build_acceptance_spec(
+            repository,
+            "修改测试和实现",
+            detection=detection,
+            explicit_paths=(".rivet",),
+            config=_config(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_confirmed_fix_requires_explicit_scope(tmp_path: Path) -> None:
+    repository = _repository(tmp_path)
+    with pytest.raises(CliSecurityError, match="最小写范围"):
+        await run_model_command(
+            _fix_arguments(yes=True, allow_write=[]),
+            repository=repository,
+            config=_config(),
+            environment=_environment(tmp_path),
+            json_output=True,
+            preflight_detection=ProjectDetector().detect(repository),
+        )
+
+
+@pytest.mark.asyncio
+async def test_ask_activates_provider_only_after_user_demand(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository(tmp_path)
+    environment = _environment(tmp_path)
+    provider = ScriptedProvider((_response(content="这是一个示例仓库"),))
+    from rivet.modules import factories
+
+    monkeypatch.setattr(
+        factories,
+        "_create_deepseek_provider",
+        _provider_factory(provider),
+    )
+    code = await run_model_command(
+        Namespace(command="ask", query="这是什么项目？"),
+        repository=repository,
+        config=_config(),
+        environment=environment,
+        json_output=True,
+    )
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["answer"] == "这是一个示例仓库"
+    assert provider.requests[0].tools
+    paths = RuntimePaths.for_repository(repository, environment=environment)
+    events = [json.loads(line) for line in paths.events_path.read_text().splitlines()]
+    demand_sources = [
+        item["event"]["payload"]["demand_source"]
+        for item in events
+        if item["event"]["event_type"] == "demand.created"
+    ]
+    assert demand_sources == ["USER_EXPLICIT", "KERNEL_REQUIRED"]
+    assert not paths.transactions_root.exists()
+
+
+@pytest.mark.asyncio
+async def test_fix_verifies_then_explicit_apply_changes_main_workspace(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repository = _repository(tmp_path)
+    environment = _environment(tmp_path)
+    provider = ScriptedProvider(
+        (
             _response(
-                "",
                 tool_calls=(
                     ToolCall(
-                        tool_call_id="call_candidate_write",
-                        tool_name="file.write_transaction",
-                        arguments={"content": "candidate\n", "path": "tracked.txt"},
+                        tool_call_id="call_replace",
+                        tool_name="file_replace",
+                        arguments={
+                            "path": "calc.py",
+                            "old_text": "return 1",
+                            "new_text": "return 2",
+                            "expected_count": 1,
+                        },
                     ),
                 ),
                 finish_reason=ModelFinishReason.TOOL_CALLS,
             ),
-            _response("候选修改已完成"),
-        ],
+            _response(content="候选补丁已生成，等待独立验证。"),
+        )
     )
+    from rivet.modules import factories
 
-    exit_code = await model_commands.run_model_command(
-        Namespace(
-            candidate_only=True,
-            command="fix",
-            dirty_policy="reject",
-            task="修改 tracked.txt",
+    monkeypatch.setattr(
+        factories,
+        "_create_deepseek_provider",
+        _provider_factory(provider),
+    )
+    detection = ProjectDetector().detect(repository)
+    specification = build_acceptance_spec(
+        repository,
+        "让 answer 返回 2",
+        detection=detection,
+        explicit_paths=("calc.py",),
+        config=_config(),
+    )
+    base_commit = subprocess.run(
+        ("git", "rev-parse", "HEAD"),
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    code = await run_model_command(
+        _fix_arguments(
             yes=True,
+            allow_write=["calc.py"],
+            acceptance_hash=acceptance_sha256(specification),
+            base_commit=base_commit,
         ),
         repository=repository,
         config=_config(),
-        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
+        environment=environment,
         json_output=True,
+        preflight_detection=detection,
     )
+
     payload = json.loads(capsys.readouterr().out)
-    record = TransactionStore(repository / ".rivet" / "transactions").load_record(
-        payload["transaction_id"]
-    )
-    checkpoint = SessionStore(repository).load(payload["session_id"])
-    trace = (repository / ".rivet" / "trace" / "events.ndjson").read_text(
-        encoding="utf-8"
-    )
-
-    assert exit_code == int(ExitCode.SUCCESS)
-    assert payload["status"] == "CANDIDATE_ONLY"
-    assert payload["apply_eligible"] is False
-    assert payload["evidence_id"] is None
-    assert record.state.value == "PATCHING"
-    assert record.evidence_id is None
-    assert checkpoint.status is SessionStatus.READY_FOR_VERIFICATION
-    assert checkpoint.candidate_only is True
-    assert '"event_type":"candidate.ready"' in trace
-    assert '"event_type":"verification.started"' not in trace
-    assert (repository / "tracked.txt").read_text(encoding="utf-8") == "base\n"
-
-
-@pytest.mark.asyncio
-async def test_fix_records_patch_and_fails_closed_when_verification_cannot_pass(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    repository = _repository(tmp_path)
-    _configure_independent_acceptance(repository)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    _install_provider(
-        monkeypatch,
-        [
-            _response(
-                "",
-                tool_calls=(
-                    ToolCall(
-                        tool_call_id="call_fix_write",
-                        tool_name="file.write_transaction",
-                        arguments={"content": "patched\n", "path": "tracked.txt"},
-                    ),
-                ),
-                finish_reason=ModelFinishReason.TOOL_CALLS,
-            ),
-            _response("修改已完成"),
-        ],
-    )
-
-    exit_code = await model_commands.run_model_command(
-        Namespace(
-            command="fix",
-            dirty_policy="reject",
-            task="修改 tracked.txt",
-            yes=True,
-        ),
-        repository=repository,
-        config=_config(),
-        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
-        json_output=True,
-    )
-    payload = json.loads(capsys.readouterr().out)
-    store = TransactionStore(repository / ".rivet" / "transactions")
-    record = store.load_record(payload["transaction_id"])
-    checkpoint_paths = tuple((repository / ".rivet" / "sessions").glob("*.json"))
-    checkpoint = SessionStore(repository).load(checkpoint_paths[0].stem)
-
-    assert exit_code == 4
-    assert payload["status"] != "PASSED"
-    assert payload["run_id"].startswith("run_")
-    assert payload["session_id"].startswith("session_")
-    assert record.current_patch_id is not None
-    assert record.state.value == "REJECTED"
-    assert checkpoint.status is SessionStatus.REJECTED
-    assert (repository / "tracked.txt").read_text(encoding="utf-8") == "base\n"
+    assert code == 0
+    assert payload["state"] == "VERIFIED"
+    assert payload["evidence_verified"] is True
+    assert "return 1" in (repository / "calc.py").read_text(encoding="utf-8")
+    transaction_id = payload["transaction_id"]
+    runtime_paths = RuntimePaths.for_repository(repository, environment=environment)
     trace_events = [
         json.loads(line)["event"]
-        for line in (repository / ".rivet" / "trace" / "events.ndjson")
-        .read_text(encoding="utf-8")
-        .splitlines()
+        for line in runtime_paths.events_path.read_text(encoding="utf-8").splitlines()
     ]
-    verification_index = next(
-        index
-        for index, event in enumerate(trace_events)
-        if event["event_type"] == "verification.started"
+    verification_started = next(
+        event for event in trace_events if event["event_type"] == "verification.started"
     )
-    for module_id in ("guard.sandbox", "provider.deepseek"):
-        release_index = next(
-            index
-            for index, event in enumerate(trace_events)
-            if event["event_type"] == "module.released"
-            and event["payload"].get("module_id") == module_id
-            and event["payload"].get("reason") == "model_stage_complete"
-        )
-        assert release_index < verification_index
-
-
-@pytest.mark.asyncio
-async def test_formal_agent_uses_context_reader_and_semantic_modules(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    repository = _repository(tmp_path)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    requests = _install_provider(monkeypatch, [_response("上下文回答")])
-
-    exit_code = await model_commands.run_model_command(
-        Namespace(command="ask", query="解释 tracked.txt"),
-        repository=repository,
-        config=_config(),
-        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
-        json_output=True,
+    verification_completed = next(
+        event
+        for event in trace_events
+        if event["event_type"] == "verification.completed"
     )
-    capsys.readouterr()
-
-    assert exit_code == 0
-    assert {tool.name for tool in requests[0].tools} >= {
-        "reader.read",
-        "context.search.semantic",
+    verification_demand = next(
+        event
+        for event in trace_events
+        if event["event_id"] == verification_started["parent_event_id"]
+    )
+    assert verification_demand["event_type"] == "demand.created"
+    assert verification_demand["payload"]["demand_source"] == "KERNEL_REQUIRED"
+    assert verification_demand["payload"]["capability_id"] == "verify.deterministic"
+    assert verification_completed["parent_event_id"] == verification_started["event_id"]
+    assert verification_completed["payload"]["passed"] is True
+    assert {
+        result["kind"] for result in verification_completed["payload"]["results"]
+    } == {
+        "BASELINE",
+        "BEHAVIOR",
+        "SCOPE",
+        "SECRET",
+        "BINDING",
+        "RESOURCE",
     }
     assert any(
-        message.role == "user"
-        and "tracked.txt" in message.content
-        and "不可信数据" in message.content
-        for message in requests[0].messages
+        event["event_type"] == "module.activated"
+        and event["payload"]["module_id"] == "guard.sandbox"
+        and event["parent_event_id"] == verification_demand["event_id"]
+        for event in trace_events
     )
-    checkpoint_path = next((repository / ".rivet" / "sessions").glob("*.json"))
-    checkpoint = SessionStore(repository).load(checkpoint_path.stem)
-    assert not any(
-        "RIVET_UNTRUSTED_REPOSITORY_CONTEXT" in message.content
-        for message in checkpoint.messages
+    store = TransactionStore(
+        runtime_paths.transactions_root,
+        evidence_root=runtime_paths.evidence_root,
     )
-    trace_lines = (repository / ".rivet" / "trace" / "events.ndjson").read_text(
-        encoding="utf-8"
-    )
-    assert '"event_type":"context.selected"' in trace_lines
-    assert '"module_id":"context.syntax"' in trace_lines
+    assert store.load_record(transaction_id).state is TransactionState.VERIFIED
 
-
-@pytest.mark.asyncio
-async def test_resume_continues_saved_history_and_preserves_budget_counts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    repository = _repository(tmp_path)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    requests = _install_provider(monkeypatch, [_response("续跑完成")])
-    checkpoint = SessionCheckpoint(
-        session_id="session_model_resume",
-        run_id="run_model_resume",
-        command="ask",
-        query="继续解释 tracked.txt",
-        status=SessionStatus.INTERRUPTED,
-        stage=SessionStage.AGENT_LOOP,
-        model="deepseek-v4-pro",
-        messages=(
-            SystemMessage(content="保持只读", created_at=NOW),
-            UserMessage(content="继续解释 tracked.txt", created_at=NOW),
-        ),
-        round_count=2,
-        prompt_tokens=10,
-        completion_tokens=5,
-    )
-    SessionStore(repository).save(checkpoint)
-
-    exit_code = await model_commands.run_model_command(
-        Namespace(command="resume", session_id=checkpoint.session_id, yes=False),
+    apply_code = await run_transaction_command(
+        Namespace(command="apply", transaction_id=transaction_id),
         repository=repository,
-        config=_config(),
-        environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
+        environment=environment,
         json_output=True,
-        resume_checkpoint=checkpoint,
     )
-    payload = json.loads(capsys.readouterr().out)
-    resumed = SessionStore(repository).load(checkpoint.session_id)
-
-    assert exit_code == 0
-    assert payload["resumed"] is True
-    assert payload["run_id"] == checkpoint.run_id
-    assert requests[0].messages[0] == checkpoint.messages[0]
-    assert resumed.status is SessionStatus.ANSWERED
-    assert resumed.stage is SessionStage.TERMINAL
-    assert resumed.round_count == 3
-    assert resumed.prompt_tokens == 11
-    assert resumed.completion_tokens == 6
-    assert resumed.messages[-1].role == "assistant"
-
-
-@pytest.mark.asyncio
-async def test_provider_failure_checkpoint_remains_agent_resumable(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    repository = _repository(tmp_path)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-
-    class FailingProvider:
-        """稳定模拟一次可恢复 Provider 故障。"""
-
-        async def complete(
-            self,
-            _request: ModelRequest,
-            *,
-            on_text_delta: Callable[[str], Awaitable[None]] | None = None,
-        ) -> ModelResponse:
-            """在任何网络接触前返回 Kernel 可识别错误。"""
-            del on_text_delta
-            raise ModelProviderError("fixture unavailable")
-
-    def create_failing_provider(*_args: object, **_kwargs: object) -> FailingProvider:
-        """在惰性 Provider 边界返回稳定失败原语。"""
-        return FailingProvider()
-
-    monkeypatch.setattr(
-        module_factories,
-        "_create_deepseek_provider",
-        create_failing_provider,
-    )
-
-    with pytest.raises(CliProviderError):
-        await model_commands.run_model_command(
-            Namespace(command="ask", query="解释 tracked.txt"),
-            repository=repository,
-            config=_config(),
-            environment={"DEEPSEEK_API_KEY": "fixture-provider-value"},
-            json_output=True,
-        )
-
-    checkpoint_path = next((repository / ".rivet" / "sessions").glob("*.json"))
-    checkpoint = SessionStore(repository).load(checkpoint_path.stem)
-    assert checkpoint.status is SessionStatus.FAILED
-    assert checkpoint.stage is SessionStage.AGENT_LOOP
-    assert checkpoint.messages
-    assert checkpoint.termination_reason == "provider_failed"
-
-
-@pytest.mark.asyncio
-async def test_patch_finalization_resume_skips_provider_and_finishes_verification(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    repository = _repository(tmp_path)
-    _configure_independent_acceptance(repository)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    prepare_scope = ResourceScope("resume.patch.prepare")
-    prepare_manager = TransactionManager(repository, scope=prepare_scope)
-    record = await prepare_manager.create(transaction_id="tx_resume_patch")
-    specification = prepare_manager.draft_acceptance(
-        acceptance_id="acceptance_resume_patch",
-        user_goal="修改 tracked.txt",
-        baseline_reproduction=(("git", "status", "--short"),),
-        allowed_paths=("tracked.txt",),
-        expected_behaviors=("tracked.txt 已修改",),
-        preserved_behaviors=("主工作区不变",),
-        verification_commands=(("git", "diff", "--check"),),
-        behavior_verification_commands=(("rivet-missing-behavior-verifier",),),
-        max_wall_seconds=60,
-        max_tokens=2_000,
-        max_tool_calls=10,
-    )
-    await prepare_manager.freeze_acceptance(
-        record.transaction_id,
-        specification,
-        confirmed=True,
-    )
-    TransactionFileWriter(
-        prepare_manager.transaction_boundary(record.transaction_id)
-    ).write("tracked.txt", "resumed patch\n")
-    prepare_manager.suspend(record.transaction_id)
-    prepare_scope.assert_empty()
-    await prepare_scope.close()
-    checkpoint = SessionCheckpoint(
-        session_id="session_resume_patch",
-        run_id="run_resume_patch",
-        transaction_id=record.transaction_id,
-        command="fix",
-        query="修改 tracked.txt",
-        status=SessionStatus.INTERRUPTED,
-        stage=SessionStage.PATCH_FINALIZATION,
-        model="deepseek-v4-pro",
-        messages=(
-            UserMessage(content="修改 tracked.txt", created_at=NOW),
-            AssistantMessage(content="隔离修改已完成", created_at=NOW),
-        ),
-        round_count=2,
-        tool_call_count=1,
-    )
-    SessionStore(repository).save(checkpoint)
-
-    def forbidden_provider(*_args: object, **_kwargs: object) -> object:
-        """证明模型阶段完成后恢复不会再次产生 API 调用。"""
-        raise AssertionError("PATCH_FINALIZATION 不得创建 Provider")
-
-    monkeypatch.setattr(
-        module_factories,
-        "_create_deepseek_provider",
-        forbidden_provider,
-    )
-
-    exit_code = await model_commands.run_model_command(
-        Namespace(command="resume", session_id=checkpoint.session_id),
-        repository=repository,
-        config=_config(),
-        environment={},
-        json_output=True,
-        resume_checkpoint=checkpoint,
-    )
-    capsys.readouterr()
-    resumed = SessionStore(repository).load(checkpoint.session_id)
-    transaction = TransactionStore(repository / ".rivet" / "transactions").load_record(
-        record.transaction_id
-    )
-    trace = (repository / ".rivet" / "trace" / "events.ndjson").read_text(
-        encoding="utf-8"
-    )
-
-    assert exit_code == int(ExitCode.VERIFICATION_FAILED)
-    assert resumed.stage is SessionStage.TERMINAL
-    assert resumed.status is SessionStatus.BLOCKED
-    assert transaction.state.value == "BLOCKED"
-    assert transaction.current_patch_id is not None
-    assert '"module_id":"provider.deepseek"' not in trace
-
-    cleanup_scope = ResourceScope("resume.patch.cleanup")
-    await TransactionManager(repository, scope=cleanup_scope).abort(
-        record.transaction_id
-    )
-    cleanup_scope.assert_empty()
-    await cleanup_scope.close()
+    apply_payload = json.loads(capsys.readouterr().out)
+    assert apply_code == 0
+    assert apply_payload["state"] == "APPLIED"
+    assert "return 2" in (repository / "calc.py").read_text(encoding="utf-8")

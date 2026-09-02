@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import fields
 from datetime import UTC, datetime
 from decimal import Decimal
 
@@ -14,7 +15,6 @@ from pydantic import BaseModel, ConfigDict, JsonValue
 from rivet.contracts.messages import (
     AssistantMessage,
     ProviderOpaqueState,
-    SystemMessage,
     UserMessage,
 )
 from rivet.contracts.provider import (
@@ -132,7 +132,7 @@ def _task(mode: AgentTaskMode = AgentTaskMode.ASK) -> AgentTask:
 def _tool_call(
     arguments: dict[str, JsonValue] | None = None,
     *,
-    name: str = "test.echo",
+    name: str = "test_echo",
     call_id: str = "call_echo_1",
 ) -> ToolCall:
     return ToolCall(
@@ -150,7 +150,7 @@ async def _echo(arguments: BaseModel) -> str:
 
 def _echo_tool() -> AgentTool:
     return AgentTool.from_model(
-        name="test.echo",
+        name="test_echo",
         description="回显文本",
         input_model=EchoArguments,
         executor=_echo,
@@ -165,7 +165,7 @@ async def _constant_observation(arguments: BaseModel) -> str:
 
 def _constant_tool() -> AgentTool:
     return AgentTool.from_model(
-        name="test.echo",
+        name="test_echo",
         description="返回固定观察",
         input_model=EchoArguments,
         executor=_constant_observation,
@@ -184,16 +184,30 @@ async def test_final_answer_completes_without_tools() -> None:
     assert result.answer == "done"
     assert result.round_count == 1
     assert result.state_history == (
-        AgentLoopState.RECEIVE,
-        AgentLoopState.UNDERSTAND,
-        AgentLoopState.GATHER_CONTEXT,
-        AgentLoopState.PLAN,
-        AgentLoopState.PREPARE,
         AgentLoopState.MODEL_CALL,
-        AgentLoopState.PARSE_TOOL_CALLS,
-        AgentLoopState.EVALUATE,
         AgentLoopState.COMPLETE,
     )
+
+
+def test_agent_loop_exposes_exactly_six_real_states() -> None:
+    assert set(AgentLoopState) == {
+        AgentLoopState.MODEL_CALL,
+        AgentLoopState.EXECUTE,
+        AgentLoopState.OBSERVE,
+        AgentLoopState.COMPLETE,
+        AgentLoopState.FAILED,
+        AgentLoopState.CANCELLED,
+    }
+
+
+def test_agent_task_has_no_cross_session_resume_counters() -> None:
+    assert {field.name for field in fields(AgentTask)} == {
+        "run_id",
+        "session_id",
+        "messages",
+        "model",
+        "mode",
+    }
 
 
 @pytest.mark.asyncio
@@ -218,7 +232,6 @@ async def test_agent_loop_forwards_provider_text_deltas_before_final_answer() ->
     ("mode", "expected"),
     (
         (AgentTaskMode.ASK, AgentCompletionStatus.ANSWERED),
-        (AgentTaskMode.PLAN, AgentCompletionStatus.PLANNED),
         (AgentTaskMode.FIX, AgentCompletionStatus.READY_FOR_VERIFICATION),
     ),
 )
@@ -238,29 +251,19 @@ async def test_provider_stop_has_command_specific_non_verified_status(
 
 
 @pytest.mark.asyncio
-async def test_context_gatherer_runs_inside_kernel_before_first_model_call() -> None:
+async def test_first_model_call_contains_no_implicit_context() -> None:
     provider = ScriptedProvider((_response(content="done"),))
-    gathered = SystemMessage(content="受限仓库上下文", created_at=NOW)
+    task = _task()
+    loop = AgentLoop(provider, tools=(), clock=lambda: NOW)
 
-    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
-        """返回由正式 Context 能力选择的测试消息。"""
-        return (gathered,)
-
-    loop = AgentLoop(
-        provider,
-        tools=(),
-        context_gatherer=gather_context,
-        clock=lambda: NOW,
-    )
-
-    result = await loop.run(_task())
+    result = await loop.run(task)
 
     assert result.state is AgentLoopState.COMPLETE
-    assert provider.requests[0].messages[-1] == gathered
+    assert provider.requests[0].messages == task.messages
 
 
 @pytest.mark.asyncio
-async def test_transaction_write_refreshes_context_before_next_model_call() -> None:
+async def test_transaction_write_adds_only_real_tool_observation() -> None:
     current = {"content": "old content"}
 
     async def write(arguments: BaseModel) -> str:
@@ -268,16 +271,13 @@ async def test_transaction_write_refreshes_context_before_next_model_call() -> N
         current["content"] = values.content
         return "written"
 
-    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
-        return (SystemMessage(content=current["content"], created_at=NOW),)
-
     provider = ScriptedProvider(
         (
             _response(
                 tool_calls=(
                     ToolCall(
                         tool_call_id="call_refresh_context",
-                        tool_name="file.write_transaction",
+                        tool_name="file_write",
                         arguments={"content": "new content"},
                     ),
                 ),
@@ -287,7 +287,7 @@ async def test_transaction_write_refreshes_context_before_next_model_call() -> N
         )
     )
     tool = AgentTool.from_model(
-        name="file.write_transaction",
+        name="file_write",
         description="事务写入",
         input_model=WriteArguments,
         executor=write,
@@ -296,32 +296,32 @@ async def test_transaction_write_refreshes_context_before_next_model_call() -> N
     result = await AgentLoop(
         provider,
         tools=(tool,),
-        context_gatherer=gather_context,
         clock=lambda: NOW,
     ).run(_task(AgentTaskMode.FIX))
 
     assert result.state is AgentLoopState.COMPLETE
-    assert any(
-        message.content == "new content" for message in provider.requests[1].messages
+    assert result.state_history == (
+        AgentLoopState.MODEL_CALL,
+        AgentLoopState.EXECUTE,
+        AgentLoopState.OBSERVE,
+        AgentLoopState.MODEL_CALL,
+        AgentLoopState.COMPLETE,
     )
+    assert [message.role for message in provider.requests[1].messages[-2:]] == [
+        "assistant",
+        "tool",
+    ]
+    assert provider.requests[1].messages[-1].content == "written"
 
 
 @pytest.mark.asyncio
-async def test_parallel_writes_keep_tool_responses_contiguous_and_refresh_once() -> (
-    None
-):
+async def test_parallel_writes_keep_tool_responses_contiguous() -> None:
     current = {"content": "old content"}
-    gather_count = 0
 
     async def write(arguments: BaseModel) -> str:
         values = WriteArguments.model_validate(arguments.model_dump())
         current["content"] = values.content
         return f"written:{values.content}"
-
-    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
-        nonlocal gather_count
-        gather_count += 1
-        return (SystemMessage(content=current["content"], created_at=NOW),)
 
     provider = ScriptedProvider(
         (
@@ -329,12 +329,12 @@ async def test_parallel_writes_keep_tool_responses_contiguous_and_refresh_once()
                 tool_calls=(
                     ToolCall(
                         tool_call_id="call_write_first",
-                        tool_name="file.write_transaction",
+                        tool_name="file_write",
                         arguments={"content": "first content"},
                     ),
                     ToolCall(
                         tool_call_id="call_write_second",
-                        tool_name="file.write_transaction",
+                        tool_name="file_write",
                         arguments={"content": "final content"},
                     ),
                 ),
@@ -344,7 +344,7 @@ async def test_parallel_writes_keep_tool_responses_contiguous_and_refresh_once()
         )
     )
     tool = AgentTool.from_model(
-        name="file.write_transaction",
+        name="file_write",
         description="事务写入",
         input_model=WriteArguments,
         executor=write,
@@ -353,75 +353,20 @@ async def test_parallel_writes_keep_tool_responses_contiguous_and_refresh_once()
     result = await AgentLoop(
         provider,
         tools=(tool,),
-        context_gatherer=gather_context,
         clock=lambda: NOW,
     ).run(_task(AgentTaskMode.FIX))
 
     assert result.state is AgentLoopState.COMPLETE
-    assert gather_count == 2
     follow_up = provider.requests[1].messages
-    assert [message.role for message in follow_up[-4:]] == [
+    assert [message.role for message in follow_up[-3:]] == [
         "assistant",
         "tool",
         "tool",
-        "system",
     ]
-    assert [message.content for message in follow_up[-3:]] == [
+    assert [message.content for message in follow_up[-2:]] == [
         "written:first content",
         "written:final content",
-        "final content",
     ]
-
-
-@pytest.mark.asyncio
-async def test_context_gatherer_failure_closes_before_provider_call() -> None:
-    provider = ScriptedProvider((_response(content="unused"),))
-
-    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
-        """模拟上下文能力稳定失败。"""
-        raise RuntimeError("fixture failure")
-
-    result = await AgentLoop(
-        provider,
-        tools=(),
-        context_gatherer=gather_context,
-        clock=lambda: NOW,
-    ).run(_task())
-
-    assert result.state is AgentLoopState.FAILED
-    assert result.termination_reason is AgentTerminationReason.CONTEXT_FAILED
-    assert provider.requests == []
-
-
-@pytest.mark.asyncio
-async def test_resumed_budget_exhaustion_stops_before_context_and_provider() -> None:
-    provider = ScriptedProvider((_response(content="unused"),))
-    context_called = False
-
-    async def gather_context(_task: AgentTask) -> tuple[SystemMessage, ...]:
-        """记录预算预检是否错误进入了上下文阶段。"""
-        nonlocal context_called
-        context_called = True
-        return ()
-
-    task = AgentTask(
-        run_id="run_agent_budget_resume",
-        session_id="session_agent_budget_resume",
-        messages=(UserMessage(content="continue", created_at=NOW),),
-        model="deepseek-v4-pro",
-        initial_prompt_tokens=10,
-    )
-    result = await AgentLoop(
-        provider,
-        tools=(),
-        config=AgentLoopConfig(max_total_tokens=10),
-        context_gatherer=gather_context,
-        clock=lambda: NOW,
-    ).run(task)
-
-    assert result.termination_reason is AgentTerminationReason.TOKEN_BUDGET_EXCEEDED
-    assert context_called is False
-    assert provider.requests == []
 
 
 @pytest.mark.asyncio
@@ -483,7 +428,7 @@ async def test_unknown_tool_is_intercepted() -> None:
     provider = ScriptedProvider(
         (
             _response(
-                tool_calls=(_tool_call(name="missing.tool"),),
+                tool_calls=(_tool_call(name="missing_tool"),),
                 finish_reason=ModelFinishReason.TOOL_CALLS,
             ),
         )
@@ -712,7 +657,7 @@ async def test_user_cancel_interrupts_running_tool() -> None:
         return "unreachable"
 
     tool = AgentTool.from_model(
-        name="test.echo",
+        name="test_echo",
         description="阻塞测试工具",
         input_model=EchoArguments,
         executor=blocking_tool,

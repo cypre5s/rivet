@@ -1,93 +1,76 @@
-"""验证 CLI、环境、项目、用户和默认配置的唯一优先级。"""
+"""验证项目内最小配置与有限运行时覆盖。"""
 
 from __future__ import annotations
 
-from decimal import Decimal
 from pathlib import Path
 
 import pytest
 
-from rivet.cli.config import ConfigOverrides, load_config, save_user_config
+from rivet.cli.config import ConfigOverrides, load_config
 from rivet.cli.errors import CliConfigurationError
 
 
-def _write_configuration(path: Path, body: str) -> None:
-    """建立父目录并写入测试 TOML。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(body, encoding="utf-8")
+def _write_project_config(repository: Path, body: str) -> None:
+    directory = repository / ".rivet"
+    directory.mkdir()
+    (directory / "project.toml").write_text(body, encoding="utf-8")
 
 
-def test_configuration_precedence_is_cli_env_project_user_default(
+def test_configuration_precedence_is_default_project_environment_cli(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
-    xdg_config = tmp_path / "config"
-    _write_configuration(
-        xdg_config / "rivet" / "config.toml",
-        """schema_version = 1
-[rivet]
-model = "user-model"
-max_rounds = 5
-max_total_tokens = 5000
-""",
+    _write_project_config(
+        repository,
+        'schema_version = 1\n[rivet]\nmodel = "project-model"\n',
     )
-    _write_configuration(
-        repository / ".rivet" / "project.toml",
-        """schema_version = 1
-[rivet]
-model = "project-model"
-max_rounds = 7
-""",
-    )
-    environment = {
-        "XDG_CONFIG_HOME": str(xdg_config),
-        "RIVET_MODEL": "environment-model",
-        "RIVET_MAX_ROUNDS": "9",
-    }
 
     resolved = load_config(
         repository,
-        environment=environment,
+        environment={
+            "RIVET_MODEL": "environment-model",
+            "RIVET_MAX_ROUNDS": "9",
+            "RIVET_MAX_TOTAL_TOKENS": "5000",
+        },
         overrides=ConfigOverrides(model="cli-model"),
     )
 
     assert resolved.model == "cli-model"
     assert resolved.max_rounds == 9
-    assert resolved.max_total_tokens == 5000
+    assert resolved.max_total_tokens == 5_000
     assert resolved.sources == {
         "base_url": "default",
         "max_cost_usd": "default",
         "max_rounds": "environment",
-        "max_total_tokens": "user",
+        "max_total_tokens": "environment",
         "model": "cli",
-        "models": "default",
-        "safe_mode": "default",
     }
 
 
-def test_configuration_rejects_secret_fields_and_invalid_environment(
+@pytest.mark.parametrize(
+    "body",
+    (
+        'schema_version = 1\n[rivet]\napi_key = "forbidden"\n',
+        "schema_version = 1\n[rivet]\nsafe_mode = true\n",
+        "schema_version = 1\n[rivet]\nmax_rounds = 4\n",
+    ),
+)
+def test_project_configuration_rejects_every_non_model_field(
     tmp_path: Path,
+    body: str,
 ) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
-    _write_configuration(
-        repository / ".rivet" / "project.toml",
-        """schema_version = 1
-[rivet]
-api_key = ""
-""",
-    )
+    _write_project_config(repository, body)
 
-    with pytest.raises(CliConfigurationError, match="凭据"):
+    with pytest.raises(CliConfigurationError) as captured:
         load_config(repository, environment={})
 
-    (repository / ".rivet" / "project.toml").unlink()
-    with pytest.raises(CliConfigurationError, match="RIVET_MAX_ROUNDS"):
-        load_config(repository, environment={"RIVET_MAX_ROUNDS": "not-an-int"})
+    assert captured.value.code == "config.project_invalid"
 
 
-def test_configuration_only_reports_credential_presence(tmp_path: Path) -> None:
+def test_runtime_environment_is_validated_and_never_persisted(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
     credential = "provider-value-that-must-not-appear"
@@ -101,146 +84,33 @@ def test_configuration_only_reports_credential_presence(tmp_path: Path) -> None:
     assert public["credential_configured"] is True
     assert credential not in repr(resolved)
     assert credential not in str(public)
+    assert not (repository / ".rivet").exists()
+    with pytest.raises(CliConfigurationError, match="max_rounds"):
+        load_config(repository, environment={"RIVET_MAX_ROUNDS": "invalid"})
 
 
-def test_project_configuration_rejects_symlink_runtime_directory(
-    tmp_path: Path,
-) -> None:
+def test_project_configuration_rejects_symlink_file(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
-    external = tmp_path / "external"
+    external = tmp_path / "external.toml"
     repository.mkdir()
-    external.mkdir()
-    (external / "project.toml").write_text(
-        "schema_version = 1\n[rivet]\nsafe_mode = true\n",
-        encoding="utf-8",
-    )
-    (repository / ".rivet").symlink_to(external, target_is_directory=True)
+    (repository / ".rivet").mkdir()
+    external.write_text('[rivet]\nmodel = "external"\n', encoding="utf-8")
+    (repository / ".rivet" / "project.toml").symlink_to(external)
 
-    with pytest.raises(CliConfigurationError, match="符号链接"):
+    with pytest.raises(CliConfigurationError) as captured:
         load_config(repository, environment={})
 
+    assert captured.value.code == "config.project_invalid"
 
-def test_configuration_exposes_a_deduplicated_model_catalog(tmp_path: Path) -> None:
+
+def test_selected_model_is_first_in_static_model_catalog(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
-    xdg_config = tmp_path / "config"
-    _write_configuration(
-        xdg_config / "rivet" / "config.toml",
-        """schema_version = 1
-[rivet]
-model = "team-reasoner"
-models = ["team-chat", "team-reasoner"]
-""",
-    )
 
     resolved = load_config(
         repository,
-        environment={"XDG_CONFIG_HOME": str(xdg_config)},
+        environment={"RIVET_MODEL": "team-reasoner"},
     )
 
-    assert resolved.model == "team-reasoner"
-    assert resolved.models == ("team-chat", "team-reasoner")
-    assert resolved.public_mapping()["models"] == ["team-chat", "team-reasoner"]
-    assert resolved.sources["models"] == "user"
-
-
-def test_selected_model_is_available_even_when_a_stronger_layer_selects_it(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    xdg_config = tmp_path / "config"
-    _write_configuration(
-        xdg_config / "rivet" / "config.toml",
-        """schema_version = 1
-[rivet]
-models = ["team-chat", "team-reasoner"]
-""",
-    )
-
-    resolved = load_config(
-        repository,
-        environment={
-            "XDG_CONFIG_HOME": str(xdg_config),
-            "RIVET_MODEL": "emergency-model",
-        },
-    )
-
-    assert resolved.models == ("emergency-model", "team-chat", "team-reasoner")
-
-
-def test_user_configuration_is_written_atomically_without_credentials(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    xdg_config = tmp_path / "config"
-    environment = {
-        "XDG_CONFIG_HOME": str(xdg_config),
-        "DEEPSEEK_API_KEY": "must-remain-in-memory",
-    }
-
-    path = save_user_config(
-        {
-            "base_url": "https://gateway.example.test/v1",
-            "max_cost_usd": "1.25",
-            "max_rounds": 12,
-            "max_total_tokens": 24_000,
-            "model": "team-reasoner",
-            "models": ["team-chat", "team-reasoner"],
-            "safe_mode": True,
-        },
-        environment=environment,
-    )
-
-    serialized = path.read_text(encoding="utf-8")
-    assert path.stat().st_mode & 0o777 == 0o600
-    assert "team-chat" in serialized
-    assert "must-remain-in-memory" not in serialized
-    assert "api_key" not in serialized.casefold()
-    assert not list(path.parent.glob("*.tmp"))
-    resolved = load_config(repository, environment=environment)
-    assert resolved.model == "team-reasoner"
-    assert resolved.models == ("team-chat", "team-reasoner")
-    assert resolved.max_cost_usd == Decimal("1.25")
-
-
-def test_user_configuration_rejects_secrets_and_symlink_targets(
-    tmp_path: Path,
-) -> None:
-    xdg_config = tmp_path / "config"
-    environment = {"XDG_CONFIG_HOME": str(xdg_config)}
-
-    with pytest.raises(CliConfigurationError, match="凭据"):
-        save_user_config({"api_key": "never-write-this"}, environment=environment)
-
-    target = tmp_path / "outside.toml"
-    target.write_text("outside\n", encoding="utf-8")
-    config_path = xdg_config / "rivet" / "config.toml"
-    config_path.parent.mkdir(parents=True)
-    config_path.symlink_to(target)
-    with pytest.raises(CliConfigurationError, match="符号链接"):
-        save_user_config({"model": "safe-model"}, environment=environment)
-    assert target.read_text(encoding="utf-8") == "outside\n"
-
-
-def test_configuration_rejects_models_that_downstream_contracts_cannot_run(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-    xdg_config = tmp_path / "config"
-    _write_configuration(
-        xdg_config / "rivet" / "config.toml",
-        """schema_version = 1
-[rivet]
-model = "valid-model"
-models = ["valid-model", "Bad Model"]
-""",
-    )
-
-    with pytest.raises(CliConfigurationError, match="models"):
-        load_config(
-            repository,
-            environment={"XDG_CONFIG_HOME": str(xdg_config)},
-        )
+    assert resolved.models[0] == "team-reasoner"
+    assert len(resolved.models) == len(set(resolved.models))

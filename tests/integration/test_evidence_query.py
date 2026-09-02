@@ -31,13 +31,19 @@ async def test_evidence_detail_and_log_are_hash_verified_and_complete(
     assert detail["evidence_verified"] is True
     assert detail["verdict_status"] == "PASSED"
     assert detail["apply_eligible"] is True
+    assert detail["base_commit"] == prepared.outcome.verdict.base_commit
     assert detail["acceptance_sha256"]
     assert detail["patch_sha256"]
     assert detail["manifest_sha256"]
     assert isinstance(results, list)
-    assert {cast(str, result["kind"]) for result in results} >= {
-        "V0_ENVIRONMENT",
-        "V10_RESOURCE",
+    assert {cast(str, result["kind"]) for result in results} == {
+        "BASELINE",
+        "BEHAVIOR",
+        "REGRESSION",
+        "SCOPE",
+        "SECRET",
+        "BINDING",
+        "RESOURCE",
     }
     assert all("argv" in result and "duration_ms" in result for result in results)
     assert isinstance(files, list)

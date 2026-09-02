@@ -8,11 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from rivet.context.engine import ProgressiveContext
-from rivet.contracts.context import ContextBudget
-from rivet.contracts.readers import ReaderRequest
 from rivet.kernel.resources import ResourceScope
-from rivet.readers.service import ReaderService
 from rivet.tools.files import FileReader, TransactionFileWriter
 from rivet.tools.git import GitService
 from rivet.tools.process import ProcessRunner
@@ -42,11 +38,10 @@ async def test_transaction_tools_share_one_effective_workspace(
     main_hash_before = _content_hash(repository)
     scope = ResourceScope("transaction.workspace.view")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_workspace_view")
-    await manager.freeze_acceptance(
-        record.transaction_id,
+    record = await manager.create(
         acceptance_spec(acceptance_id="acceptance_workspace_view"),
         confirmed=True,
+        transaction_id="tx_workspace_view",
     )
     boundary = manager.transaction_boundary(record.transaction_id)
     writer = TransactionFileWriter(boundary)
@@ -102,28 +97,6 @@ async def test_transaction_tools_share_one_effective_workspace(
         "transaction replacement token\nline two"
     )
 
-    context = await ProgressiveContext(
-        boundary.effective_root,
-        scope=scope,
-    ).retrieve(
-        "定位 transaction replacement token",
-        budget=ContextBudget(
-            total_tokens=2_000,
-            required_tokens=100,
-            working_tokens=1_800,
-            history_tokens=100,
-        ),
-    )
-    reader_result = await ReaderService(
-        boundary.effective_root,
-        scope=scope,
-    ).read(ReaderRequest(source_path="tracked.txt"))
-
-    assert any(
-        "transaction replacement token" in item.content
-        for item in context.selection.items
-    )
-    assert "transaction replacement token" in reader_result.content
     assert _content_hash(repository) == main_hash_before
     assert (repository / "tracked.txt").read_text(encoding="utf-8") == "base\n"
     assert (repository / "second.txt").read_text(encoding="utf-8") == "second base\n"
@@ -139,7 +112,11 @@ async def test_workspace_view_metadata_is_json_auditable(tmp_path: Path) -> None
     repository = initialize_repository(tmp_path)
     scope = ResourceScope("transaction.workspace.metadata")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_workspace_metadata")
+    record = await manager.create(
+        acceptance_spec(acceptance_id="acceptance_workspace_metadata"),
+        confirmed=True,
+        transaction_id="tx_workspace_metadata",
+    )
     boundary = manager.transaction_boundary(record.transaction_id)
 
     payload = boundary.workspace_view.as_dict()

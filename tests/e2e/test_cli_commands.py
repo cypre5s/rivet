@@ -1,4 +1,4 @@
-"""从 console module 验证 Phase 13 的离线正式命令体验。"""
+"""从 console module 验证最终极简 CLI 的离线表面。"""
 
 from __future__ import annotations
 
@@ -7,39 +7,32 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from typing import cast
 
 import pytest
 
-OFFICIAL_COMMANDS = (
-    "init",
-    "ask",
-    "read",
-    "plan",
-    "fix",
-    "verify",
-    "diff",
-    "apply",
-    "abort",
-    "trace",
-    "resume",
-    "modules",
-    "doctor",
+from rivet.cli.parser import OFFICIAL_COMMANDS
+
+REMOVED_COMMANDS = (
     "benchmark",
-    "config",
     "clean",
+    "config",
+    "doctor",
+    "export",
+    "modules",
+    "plan",
+    "read",
+    "resume",
+    "trace",
 )
 
 
 def _environment(tmp_path: Path) -> dict[str, str]:
-    """构造不携带用户凭据的 CLI 测试环境。"""
     return {
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "PYTHONPATH": str(Path(__file__).parents[2] / "src"),
         "XDG_CACHE_HOME": str(tmp_path / "cache"),
-        "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_STATE_HOME": str(tmp_path / "state"),
     }
 
@@ -49,7 +42,6 @@ def _run(
     repository: Path,
     *arguments: str,
 ) -> subprocess.CompletedProcess[str]:
-    """运行隔离环境中的真实 Python 模块入口。"""
     return subprocess.run(
         (
             sys.executable,
@@ -77,164 +69,39 @@ def test_every_official_command_has_help(tmp_path: Path, command: str) -> None:
     assert completed.stderr == ""
 
 
-def test_init_config_modules_doctor_and_clean_are_offline(
+@pytest.mark.parametrize("command", REMOVED_COMMANDS)
+def test_removed_product_command_is_rejected(tmp_path: Path, command: str) -> None:
+    completed = _run(tmp_path, tmp_path, command, "--help")
+
+    assert completed.returncode == 2
+    assert "invalid choice" in completed.stderr
+
+
+def test_init_preview_is_read_only_and_confirmed_init_writes_only_project_config(
     tmp_path: Path,
 ) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
 
     previewed = _run(tmp_path, repository, "--json", "init")
-    assert not (repository / ".rivet").exists()
-    initialized = _run(tmp_path, repository, "init", "--yes")
-    configured = _run(tmp_path, repository, "--json", "config")
-    modules = _run(tmp_path, repository, "--json", "modules")
-    doctor = _run(tmp_path, repository, "--json", "doctor")
-    cleaned = _run(tmp_path, repository, "--json", "clean", "--dry-run")
-
-    assert initialized.returncode == 0
+    assert previewed.returncode == 0, previewed.stderr
     assert json.loads(previewed.stdout)["created"] is False
-    project_config = repository / ".rivet" / "project.toml"
-    assert project_config.is_file()
-    assert "DEEPSEEK_API_KEY" not in project_config.read_text(encoding="utf-8")
-    for completed in (configured, modules, doctor, cleaned):
-        assert completed.returncode == 0, completed.stderr
-        cast(dict[str, object], json.loads(completed.stdout))
-    module_payload = cast(dict[str, object], json.loads(modules.stdout))
-    module_summary = cast(dict[str, object], module_payload["summary"])
-    assert module_payload["source"] == "capability_policy"
-    assert module_summary["active"] == 0
-    assert module_summary["locked"] == 4
-    assert "credential_value" not in configured.stdout
+    assert not (repository / ".rivet").exists()
+
+    initialized = _run(tmp_path, repository, "--json", "init", "--yes")
+    assert initialized.returncode == 0, initialized.stderr
+    assert json.loads(initialized.stdout)["created"] is True
+    config_path = repository / ".rivet" / "project.toml"
+    assert config_path.is_file()
+    assert set(path.name for path in (repository / ".rivet").iterdir()) == {
+        "project.toml"
+    }
+    serialized = config_path.read_text(encoding="utf-8")
+    assert "DEEPSEEK_API_KEY" not in serialized
+    assert "acceptance = []" in serialized
 
 
-def test_module_lifecycle_cli_persists_policy_and_uses_stable_exit_codes(
-    tmp_path: Path,
-) -> None:
-    repository = tmp_path / "repository"
-    repository.mkdir()
-
-    listed = _run(tmp_path, repository, "modules", "list", "--json")
-    shown = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "show",
-        "context.lsp",
-        "--json",
-    )
-    blocked = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "disable",
-        "context.syntax",
-        "--json",
-    )
-    disabled = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "disable",
-        "context.lsp",
-        "--json",
-    )
-    persisted = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "show",
-        "context.lsp",
-        "--json",
-    )
-    removed_wake = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "wake",
-        "context.lsp",
-        "--json",
-    )
-    enabled = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "enable",
-        "context.lsp",
-        "--json",
-    )
-    removed_sleep = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "sleep",
-        "context.lsp",
-        "--json",
-    )
-    disabled_again = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "disable",
-        "context.lsp",
-        "--json",
-    )
-    locked = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "disable",
-        "provider.deepseek",
-        "--json",
-    )
-    missing = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "show",
-        "unknown.module",
-        "--json",
-    )
-    invalid_timeout = _run(
-        tmp_path,
-        repository,
-        "modules",
-        "disable",
-        "context.lsp",
-        "--timeout",
-        "-1",
-    )
-
-    assert listed.returncode == 0, listed.stderr
-    assert shown.returncode == 0, shown.stderr
-    assert blocked.returncode == 5
-    assert "module.active_dependents" in blocked.stderr
-    assert disabled.returncode == 0, disabled.stderr
-    persisted_module = cast(
-        dict[str, object],
-        cast(dict[str, object], json.loads(persisted.stdout))["module"],
-    )
-    assert persisted_module["persisted_override"] is False
-    assert persisted_module["effective_enabled"] is False
-    assert removed_wake.returncode == 2
-    assert "invalid choice: 'wake'" in removed_wake.stderr
-    assert enabled.returncode == 0, enabled.stderr
-    assert cast(dict[str, object], json.loads(enabled.stdout))["current_state"] == (
-        "INACTIVE"
-    )
-    assert removed_sleep.returncode == 2
-    assert "invalid choice: 'sleep'" in removed_sleep.stderr
-    assert disabled_again.returncode == 0, disabled_again.stderr
-    assert locked.returncode == 4
-    assert "module.manual_control_denied" in locked.stderr
-    assert missing.returncode == 3
-    assert "module.not_found" in missing.stderr
-    assert invalid_timeout.returncode == 2
-    assert "module.input_invalid" in invalid_timeout.stderr
-
-
-def test_model_command_without_key_is_classified_without_traceback(
-    tmp_path: Path,
-) -> None:
+def test_ask_without_key_is_classified_without_traceback(tmp_path: Path) -> None:
     repository = tmp_path / "repository"
     repository.mkdir()
 

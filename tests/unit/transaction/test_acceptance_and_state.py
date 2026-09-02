@@ -29,8 +29,11 @@ def test_acceptance_hash_is_stable_across_json_whitespace() -> None:
 
 def test_state_machine_accepts_only_adjacent_verified_path() -> None:
     assert (
-        validate_transition(TransactionState.BASELINED, TransactionState.PLANNED)
-        is TransactionState.PLANNED
+        validate_transition(
+            TransactionState.ACCEPTANCE_FROZEN,
+            TransactionState.PATCHING,
+        )
+        is TransactionState.PATCHING
     )
     assert (
         validate_transition(TransactionState.VERIFYING, TransactionState.VERIFIED)
@@ -38,7 +41,11 @@ def test_state_machine_accepts_only_adjacent_verified_path() -> None:
     )
 
     with pytest.raises(TransactionError, match="状态迁移"):
-        validate_transition(TransactionState.BASELINED, TransactionState.VERIFIED)
+        validate_transition(
+            TransactionState.ACCEPTANCE_FROZEN,
+            TransactionState.VERIFIED,
+        )
+    assert "BASELINED" not in TransactionState.__members__
 
 
 @pytest.mark.parametrize(
@@ -90,6 +97,7 @@ def test_acceptance_draft_is_pure_and_does_not_create_repository(
         expected_behaviors=("缺陷被修复",),
         preserved_behaviors=("旧测试通过",),
         verification_commands=(("pytest",),),
+        behavior_verification_commands=(("pytest", "tests/acceptance"),),
         max_wall_seconds=60,
         max_tokens=1_000,
         max_tool_calls=10,

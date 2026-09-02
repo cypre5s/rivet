@@ -14,26 +14,27 @@ from rivet.kernel.manifests import ManifestLoader
 FACTORY_MODULE = "tests.fixtures.kernel.fake_modules"
 
 
-def _write_manifest(path: Path, index: int, *, enabled: bool = True) -> None:
+def _write_manifest(path: Path, index: int) -> None:
     path.write_text(
         "\n".join(
             (
                 f'module_id = "test.module_{index}"',
-                'module_version = "1.0.0"',
-                'activation = "on_demand"',
                 f'factory = "{FACTORY_MODULE}:create_recording_module"',
-                f"enabled = {str(enabled).lower()}",
                 f'provides = ["test.capability_{index}"]',
                 "requires = []",
-                "idle_timeout_seconds = 300",
             )
         ),
         encoding="utf-8",
     )
 
 
-def test_loader_does_not_import_factory(tmp_path: Path) -> None:
-    sys.modules.pop(FACTORY_MODULE, None)
+def test_loader_does_not_import_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Restore any already-imported fixture module after this test so other
+    # collected tests do not retain a stale module object.
+    monkeypatch.delitem(sys.modules, FACTORY_MODULE, raising=False)
     manifest_path = tmp_path / "module.toml"
     _write_manifest(manifest_path, 1)
 

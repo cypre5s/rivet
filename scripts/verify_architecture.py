@@ -50,6 +50,29 @@ FORBIDDEN_TRACE_IMPORT_PREFIXES = (
     "rivet.transaction",
     "rivet.verify",
 )
+PRIVATE_ACTIVATION_SYMBOLS = frozenset(
+    {"_ActivationPermit", "_acquire", "_kernel_required"}
+)
+PRIVATE_ACTIVATION_ALLOWED_PATHS = {
+    "_ActivationPermit": frozenset(
+        {
+            "src/rivet/kernel/application.py",
+            "src/rivet/kernel/module_runtime.py",
+        }
+    ),
+    "_acquire": frozenset(
+        {
+            "src/rivet/kernel/application.py",
+            "src/rivet/kernel/module_runtime.py",
+        }
+    ),
+    "_kernel_required": frozenset(
+        {
+            "src/rivet/kernel/application.py",
+            "src/rivet/kernel/capability_demand.py",
+        }
+    ),
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +137,7 @@ def find_architecture_violations(
                 summary_prefix,
             )
         )
+    violations.extend(_find_activation_bypass_violations(repository_root))
     return tuple(
         sorted(
             violations,
@@ -163,6 +187,55 @@ def _find_source_violations(
                         summary=f"{summary_prefix} {module_name}",
                     )
                 )
+    return violations
+
+
+def _find_activation_bypass_violations(
+    repository_root: Path,
+) -> list[ArchitectureViolation]:
+    """拒绝业务源码接触只属于 Kernel 的私有激活资格。"""
+    source_root = repository_root / "src" / "rivet"
+    if not source_root.is_dir():
+        return []
+    violations: list[ArchitectureViolation] = []
+    for source_path in sorted(source_root.rglob("*.py")):
+        relative_path = source_path.relative_to(repository_root).as_posix()
+        try:
+            tree = ast.parse(
+                source_path.read_text(encoding="utf-8"), filename=relative_path
+            )
+        except (OSError, SyntaxError):
+            continue
+        accesses: set[tuple[str, int]] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and (
+                node.attr in PRIVATE_ACTIVATION_SYMBOLS
+            ):
+                accesses.add((node.attr, node.lineno))
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if alias.name in PRIVATE_ACTIVATION_SYMBOLS:
+                        accesses.add((alias.name, node.lineno))
+            elif isinstance(
+                node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+            ):
+                if node.name in PRIVATE_ACTIVATION_SYMBOLS:
+                    accesses.add((node.name, node.lineno))
+            elif isinstance(node, ast.Constant) and (
+                isinstance(node.value, str) and node.value in PRIVATE_ACTIVATION_SYMBOLS
+            ):
+                accesses.add((node.value, node.lineno))
+        for symbol, line in sorted(accesses, key=lambda item: (item[1], item[0])):
+            if relative_path in PRIVATE_ACTIVATION_ALLOWED_PATHS[symbol]:
+                continue
+            violations.append(
+                ArchitectureViolation(
+                    rule_id="kernel.activation_bypass",
+                    path=relative_path,
+                    line=line,
+                    summary=f"业务源码不得接触私有激活资格 {symbol}",
+                )
+            )
     return violations
 
 

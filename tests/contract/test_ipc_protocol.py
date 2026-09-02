@@ -5,7 +5,46 @@ from __future__ import annotations
 import pytest
 from pydantic import TypeAdapter, ValidationError
 
-from rivet.contracts.ipc import IpcCancel, IpcMessage
+from rivet.contracts.ipc import (
+    IPC_APPLICATION_METHODS,
+    IPC_CONTROL_METHODS,
+    IPC_REQUEST_METHODS,
+    IpcCancel,
+    IpcMessage,
+)
+
+
+def test_protocol_v1_has_only_the_minimal_request_surface() -> None:
+    assert IPC_CONTROL_METHODS == ("worker.handshake", "worker.shutdown")
+    assert IPC_APPLICATION_METHODS == (
+        "command.ask",
+        "command.fix",
+        "command.diff",
+        "command.verify",
+        "command.apply",
+        "command.abort",
+        "permission.resolve",
+        "workspace.files",
+        "transactions.list",
+        "evidence.get",
+        "evidence.log",
+    )
+    assert (*IPC_CONTROL_METHODS, *IPC_APPLICATION_METHODS) == IPC_REQUEST_METHODS
+    rendered = "\n".join(IPC_REQUEST_METHODS)
+    for removed in (
+        "benchmark",
+        "candidate",
+        "config",
+        "context.read",
+        "export",
+        "module",
+        "plan",
+        "reader",
+        "resume",
+        "session",
+        "trace.query",
+    ):
+        assert removed not in rendered
 
 
 def test_cancel_message_has_independent_and_target_request_ids() -> None:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from rivet.contracts.modules import ActivationPolicy, ModuleManifest
+from rivet.contracts.modules import ModuleManifest
 from rivet.kernel.errors import ModuleDependencyError
 from rivet.kernel.module_graph import stable_activation_order
 
@@ -13,8 +13,6 @@ def _manifest(module_id: str, requires: tuple[str, ...] = ()) -> ModuleManifest:
     suffix = module_id.rsplit(".", maxsplit=1)[-1]
     return ModuleManifest(
         module_id=module_id,
-        module_version="1.0.0",
-        activation=ActivationPolicy.ON_DEMAND,
         factory="tests.fixtures.kernel.fake_modules:create_recording_module",
         provides=(f"test.{suffix}.capability",),
         requires=requires,

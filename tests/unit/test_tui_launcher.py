@@ -30,9 +30,7 @@ def test_tui_environment_excludes_unlisted_secret(tmp_path: Path) -> None:
     assert environment["RIVET_MODEL"] == "team-reasoner"
     assert environment["RIVET_MODELS"] == "team-chat,team-reasoner"
     assert environment["RIVET_BASE_URL"] == "https://gateway.example.test/v1"
-    assert (
-        environment["RIVET_TRANSCRIPTION_MODEL_PATH"] == "/models/faster-whisper-tiny"
-    )
+    assert "RIVET_TRANSCRIPTION_MODEL_PATH" not in environment
     assert "UNRELATED_SECRET" not in environment
     assert "allowed-provider-value" not in environment["RIVET_WORKER_COMMAND_JSON"]
 

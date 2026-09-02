@@ -11,7 +11,12 @@ import pytest
 from rivet.contracts.transactions import TransactionState
 from rivet.kernel.resources import ResourceScope
 from rivet.transaction.store import TransactionStore
-from tests.transaction_helpers import initialize_repository, make_manager, run_git
+from tests.transaction_helpers import (
+    acceptance_spec,
+    initialize_repository,
+    make_manager,
+    run_git,
+)
 
 
 @pytest.mark.asyncio
@@ -23,7 +28,11 @@ async def test_repeated_abort_leaves_no_worktree_or_resource(tmp_path: Path) -> 
 
     for index in range(12):
         started = time.perf_counter()
-        record = await manager.create(transaction_id=f"tx_cleanup_{index}")
+        record = await manager.create(
+            acceptance_spec(acceptance_id=f"acceptance_cleanup_{index}"),
+            confirmed=True,
+            transaction_id=f"tx_cleanup_{index}",
+        )
         await manager.abort(record.transaction_id)
         durations.append(time.perf_counter() - started)
 
@@ -44,7 +53,11 @@ async def test_startup_scan_recovers_known_and_cleans_unknown_worktree(
     repository = initialize_repository(tmp_path)
     original_scope = ResourceScope("transaction.cleanup.crashed")
     original = make_manager(repository, tmp_path, original_scope)
-    record = await original.create(transaction_id="tx_crashed")
+    record = await original.create(
+        acceptance_spec(acceptance_id="acceptance_crashed"),
+        confirmed=True,
+        transaction_id="tx_crashed",
+    )
     worktree = original.worktree_path(record.transaction_id)
     recovery_scope = ResourceScope("transaction.cleanup.recovery")
     recovery_manager = make_manager(repository, tmp_path, recovery_scope)
@@ -76,7 +89,11 @@ async def test_scope_close_aborts_and_prunes_active_worktree(tmp_path: Path) -> 
     repository = initialize_repository(tmp_path)
     scope = ResourceScope("transaction.cleanup.exit")
     manager = make_manager(repository, tmp_path, scope)
-    record = await manager.create(transaction_id="tx_exit")
+    record = await manager.create(
+        acceptance_spec(acceptance_id="acceptance_exit"),
+        confirmed=True,
+        transaction_id="tx_exit",
+    )
     worktree = manager.worktree_path(record.transaction_id)
 
     await scope.close()

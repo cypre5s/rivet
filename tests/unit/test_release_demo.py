@@ -50,21 +50,18 @@ def test_demo_repository_uses_flash_without_a_cost_ceiling() -> None:
         )
     )
 
-    assert configuration["rivet"]["model"] == "deepseek-v4-flash"
-    assert configuration["rivet"]["max_total_tokens"] >= 128_000
-    assert "max_cost_usd" not in configuration["rivet"]
+    assert configuration["rivet"] == {"model": "deepseek-v4-flash"}
 
 
 def test_recorded_demo_turns_cover_context_patch_verify_and_diff() -> None:
     assert RECORDED_TOOL_NAMES == (
-        "workspace.info",
-        "search.files",
-        "file.read_text",
-        "file.read_text",
-        "process.run",
-        "file.replace_transaction",
-        "process.run",
-        "git.diff",
+        "workspace_info",
+        "context_search",
+        "file_read",
+        "file_read",
+        "file_read",
+        "file_replace",
+        "git_diff",
     )
 
 

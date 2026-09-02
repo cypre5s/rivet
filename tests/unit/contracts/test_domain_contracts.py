@@ -1,17 +1,12 @@
-"""验证模块、上下文、Reader、事务和验证契约。"""
+"""验证最小模块、事务和 Evidence 契约。"""
 
 from datetime import UTC, datetime
 
 import pytest
 from pydantic import ValidationError
 
-from rivet.contracts.context import ContextBudget, ContextItem, ContextLevel
-from rivet.contracts.modules import ActivationPolicy, ModuleManifest
-from rivet.contracts.readers import (
-    ReaderResult,
-    ReaderStatus,
-    SupportLevel,
-)
+from rivet.contracts import CONTRACT_MODELS
+from rivet.contracts.modules import ModuleManifest
 from rivet.contracts.transactions import AcceptanceSpec
 from rivet.contracts.verification import (
     Verdict,
@@ -22,73 +17,35 @@ from rivet.contracts.verification import (
 )
 
 
-def test_module_manifest_rejects_duplicate_capabilities() -> None:
+def test_module_manifest_surface_is_minimal_and_rejects_duplicate_capabilities() -> (
+    None
+):
+    assert set(ModuleManifest.model_fields) == {
+        "module_id",
+        "factory",
+        "provides",
+        "requires",
+    }
     with pytest.raises(ValidationError):
         ModuleManifest(
             module_id="context.lexical",
-            module_version="1.0.0",
-            activation=ActivationPolicy.ON_DEMAND,
-            factory="rivet.context.lexical:create_module",
+            factory="rivet.modules.factories:create_lexical_module",
             provides=("context.search.lexical", "context.search.lexical"),
         )
 
 
-def test_module_manifest_rejects_unknown_activation_policy() -> None:
-    with pytest.raises(ValidationError):
-        ModuleManifest.model_validate(
-            {
-                "schema_version": 1,
-                "module_id": "context.lexical",
-                "module_version": "1.0.0",
-                "activation": "automatic",
-                "factory": "rivet.context.lexical:create_module",
-                "provides": ("context.search.lexical",),
-            }
-        )
+def test_removed_reader_and_progressive_context_contracts_are_not_exported() -> None:
+    names = {model.__name__ for model in CONTRACT_MODELS}
 
-
-def test_context_budget_rejects_overcommit() -> None:
-    with pytest.raises(ValidationError):
-        ContextBudget(
-            total_tokens=100,
-            required_tokens=50,
-            working_tokens=40,
-            history_tokens=20,
-        )
-
-
-def test_context_item_records_source_reason_and_cost() -> None:
-    item = ContextItem(
-        context_item_id="context_example",
-        repository_path="src/rivet/cli.py",
-        content="def main(): ...",
-        reason="命中用户指定的 main 符号",
-        retrieval_level=ContextLevel.LEXICAL,
-        content_sha256="sha256:" + ("a" * 64),
-        token_estimate=8,
-        selected_at=datetime(2026, 8, 28, tzinfo=UTC),
+    assert names.isdisjoint(
+        {
+            "ContextBudget",
+            "ContextItem",
+            "ContextSelection",
+            "ReaderRequest",
+            "ReaderResult",
+        }
     )
-
-    assert item.reason.startswith("命中")
-    assert item.token_estimate == 8
-
-
-def test_reader_result_is_explicitly_untrusted_and_structured() -> None:
-    result = ReaderResult(
-        status=ReaderStatus.SUCCESS,
-        source_path="docs/input.txt",
-        media_type="text/plain",
-        detected_format="text",
-        reader_id="reader.text",
-        reader_version="1.0.0",
-        support_level=SupportLevel.NATIVE,
-        content="文档内容",
-        source_sha256="sha256:" + ("b" * 64),
-    )
-
-    assert result.untrusted is True
-    assert result.metadata == {}
-    assert result.warnings == ()
 
 
 def test_acceptance_spec_rejects_allowed_and_forbidden_overlap() -> None:
@@ -98,12 +55,14 @@ def test_acceptance_spec_rejects_allowed_and_forbidden_overlap() -> None:
             user_goal="修复超时",
             baseline_reproduction=(("uv", "run", "pytest"),),
             allowed_paths=("src/rivet/cli.py",),
+            write_scope=("src/rivet/cli.py",),
             forbidden_paths=("src/rivet/cli.py",),
             expected_behaviors=("超时时返回分类错误",),
             preserved_behaviors=("普通请求仍成功",),
             verification_commands=(("uv", "run", "pytest"),),
+            behavior_verification_commands=(("uv", "run", "pytest", "acceptance"),),
             max_wall_seconds=120,
-            max_tokens=1000,
+            max_tokens=1_000,
             max_tool_calls=10,
         )
 
@@ -111,7 +70,7 @@ def test_acceptance_spec_rejects_allowed_and_forbidden_overlap() -> None:
 def test_verdict_rejects_forged_passed_flag() -> None:
     step = VerificationStep(
         step_id="verification_contract",
-        kind=VerificationKind.TARGETED,
+        kind=VerificationKind.BEHAVIOR,
         name="契约失败步骤",
         required=True,
         command=("pytest",),
@@ -127,9 +86,11 @@ def test_verdict_rejects_forged_passed_flag() -> None:
     with pytest.raises(ValidationError):
         Verdict(
             transaction_id="tx_example",
+            base_commit="a" * 40,
             acceptance_sha256="sha256:" + ("c" * 64),
+            patch_sha256="sha256:" + ("e" * 64),
             evidence_id="evidence_example",
-            evidence_manifest_path="evidence/attempt_0001/manifest.json",
+            evidence_manifest_path="tx_example/attempt_0001/manifest.json",
             status=VerificationStatus.FAILED,
             passed=True,
             results=(result,),
@@ -140,7 +101,7 @@ def test_verdict_rejects_forged_passed_flag() -> None:
 def test_verdict_preserves_blocked_status() -> None:
     step = VerificationStep(
         step_id="verification_blocked",
-        kind=VerificationKind.ENVIRONMENT,
+        kind=VerificationKind.RESOURCE,
         name="环境阻塞步骤",
         required=True,
         command=("missing-tool",),
@@ -154,9 +115,11 @@ def test_verdict_preserves_blocked_status() -> None:
 
     verdict = Verdict(
         transaction_id="tx_blocked",
+        base_commit="b" * 40,
         acceptance_sha256="sha256:" + ("d" * 64),
+        patch_sha256="sha256:" + ("f" * 64),
         evidence_id="evidence_blocked",
-        evidence_manifest_path="evidence/attempt_0001/manifest.json",
+        evidence_manifest_path="tx_blocked/attempt_0001/manifest.json",
         status=VerificationStatus.BLOCKED,
         passed=False,
         results=(result,),

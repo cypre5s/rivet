@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.13.15"
           enable-cache: true
-      - run: sudo apt-get update && sudo apt-get install -y ripgrep
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
       - run: uv sync --dev --locked
       - name: Prove heavy profiles are absent
         run: |
@@ -34,15 +34,15 @@ jobs:
           if present:
               raise SystemExit(f"core profile unexpectedly contains: {present}")
           PY
-      - name: Exercise core-only degradation and readers
+      - name: Exercise the demand-driven core surface
         run: |
           uv run pytest -q \
-            tests/unit/cli/test_model_commands.py::test_core_profile_ask_degrades_when_syntax_extra_is_missing \
-            tests/unit/readers/test_text_and_structured.py \
-            tests/security/test_archive_safety.py \
-            tests/e2e/test_cli_commands.py::test_init_config_modules_doctor_and_clean_are_offline
-      - run: uv run rivet --json doctor --section readers
-      - run: uv run rivet --json modules list
+            tests/integration/test_production_modules.py \
+            tests/unit/kernel/test_application.py \
+            tests/unit/kernel/test_runtime_hardening.py \
+            tests/unit/context/test_lexical_only.py \
+            tests/unit/tools/test_catalog_v2.py
+      - run: uv run rivet --help
 
   python-quality:
     runs-on: ubuntu-24.04
@@ -55,16 +55,10 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: tools/lsp/package-lock.json
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - run: uv sync --all-extras --dev --locked
+      - run: uv sync --dev --locked
       - run: bun install --cwd tui --frozen-lockfile
-      - run: npm ci --prefix tools/lsp --ignore-scripts --no-audit --no-fund
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv run basedpyright
@@ -111,10 +105,10 @@ jobs:
           bun-version: 1.4.0
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
       - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-      - run: uv sync --all-extras --dev --locked
+      - run: uv sync --dev --locked
       - run: bun install --cwd tui --frozen-lockfile
       - run: uv run pytest tests/security tests/integration/test_bubblewrap.py -q
-      - run: uv run python scripts/run_benchmark.py --suite security
+      - run: uv run python scripts/run_benchmark.py --suite faults
       - run: uv run python scripts/verify_secrets.py --worktree --history
       - run: uv run python scripts/verify_licenses.py
       - run: uv pip check
@@ -127,17 +121,16 @@ jobs:
         with:
           python-version: "3.13.15"
           enable-cache: true
-      - uses: actions/setup-node@v6
-        with:
-          node-version: "24"
-          cache: npm
-          cache-dependency-path: tools/lsp/package-lock.json
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.0
-      - run: sudo apt-get update && sudo apt-get install -y ripgrep
-      - run: uv sync --all-extras --dev --locked
-      - run: npm ci --prefix tools/lsp --ignore-scripts --no-audit --no-fund
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap ripgrep
+      - run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+      - run: uv sync --dev --locked
       - run: bun install --cwd tui --frozen-lockfile
       - run: uv run pytest tests/e2e -q
       - run: uv run python scripts/run_benchmark.py --suite all
+      - run: >-
+          uv run python scripts/run_release_demo.py
+          --bwrap-path /usr/bin/bwrap
+          --result /tmp/rivet-release-demo.json
