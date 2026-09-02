@@ -62,6 +62,7 @@ export interface CommandContext {
   transactionId: string | null;
   verificationStatus: string;
   evidenceId: string | null;
+  acceptanceReady: boolean;
   transactionStates?: Readonly<Record<string, string>>;
 }
 
@@ -218,7 +219,7 @@ const readCommand: CommandHandler = (argument) => {
 
 const modulesCommand: CommandHandler = (argument) => {
   const tokens = argument.trim().split(/\s+/).filter(Boolean);
-  const operations = new Set(["list", "show", "enable", "disable", "wake", "sleep"]);
+  const operations = new Set(["list", "show", "enable", "disable"]);
   let operation = tokens.shift() ?? "list";
   if (!operations.has(operation)) {
     tokens.unshift(operation);
@@ -236,23 +237,23 @@ const modulesCommand: CommandHandler = (argument) => {
     const option = tokens.shift();
     if (
       option === "--with-dependencies" &&
-      (operation === "enable" || operation === "wake")
+      operation === "enable"
     ) params.with_dependencies = true;
     else if (
       option === "--cascade" &&
-      (operation === "disable" || operation === "sleep")
+      operation === "disable"
     ) params.cascade = true;
     else if (
       option === "--wait" &&
-      (operation === "disable" || operation === "sleep")
+      operation === "disable"
     ) params.wait = true;
     else if (
       option === "--yes" &&
-      (operation === "disable" || operation === "sleep")
+      operation === "disable"
     ) params.confirmed = true;
     else if (
       option === "--timeout" &&
-      (operation === "disable" || operation === "sleep")
+      operation === "disable"
     ) {
       const timeout = Number(tokens.shift());
       if (!Number.isFinite(timeout) || timeout < 0 || timeout > 300) {
@@ -329,9 +330,9 @@ export const COMMAND_REGISTRY: readonly CommandDescriptor[] = [
     { aliases: ["补丁", "修改"], requiresTransaction: true, shortcut: "Ctrl+X D" },
   ),
   descriptor(
-    "evidence", "事务与验证", "查看验证证据", "打开当前 Evidence 详情", "", "none",
+    "evidence", "事务与验证", "查看验证证据", "选择近期事务并复核 Evidence", "", "none",
     ui("open-evidence"),
-    { aliases: ["证据"], requiresEvidence: true, shortcut: "Ctrl+X E" },
+    { aliases: ["证据"], shortcut: "Ctrl+X E" },
   ),
   descriptor(
     "apply", "事务与验证", "应用通过的事务", "把已验证补丁显式应用到主工作区",
@@ -374,8 +375,8 @@ export const COMMAND_REGISTRY: readonly CommandDescriptor[] = [
     { aliases: ["模式"], shortcut: "Tab" },
   ),
   descriptor(
-    "modules", "模型与运行时", "按需模块", "查看并安全控制模块生命周期",
-    "[list|show|enable|disable|wake|sleep]", "module", modulesCommand,
+    "modules", "模型与运行时", "能力策略", "查看并配置按需能力策略",
+    "[list|show|enable|disable]", "module", modulesCommand,
     { aliases: ["模块"], shortcut: "Ctrl+X M" },
   ),
   descriptor(

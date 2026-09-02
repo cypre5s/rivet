@@ -32,6 +32,10 @@ export interface PermissionPrompt {
 
 export interface ModuleStatus {
   moduleId: string;
+  policy: string;
+  availability: string;
+  missingComponents?: string[];
+  availabilityAction?: string | null;
   manifestDefaultEnabled: boolean;
   persistedOverride: boolean | null;
   configuredEnabled: boolean;
@@ -53,21 +57,69 @@ export interface TransactionSummary {
   transactionId: string;
   state: string;
   evidenceId: string | null;
+  patchId: string | null;
+  patchSha256: string | null;
+  updatedAt: string;
+  applyEligible: boolean;
 }
 
 export interface VerificationSummary {
+  stepId: string;
   kind: string;
+  name: string;
   status: string;
+  required: boolean;
+  argv: string[];
+  durationMs: number;
+  exitCode: number | null;
+  logPath: string | null;
+  logSha256: string | null;
+  stdoutSummary: string;
+  stderrSummary: string;
+}
+
+export interface EvidenceFileSummary {
+  path: string;
+  sha256: string;
+  sizeBytes: number;
 }
 
 export interface EvidenceSummary {
-  evidenceId: string;
+  transactionId: string;
+  state: string;
+  verdictStatus: string;
+  passed: boolean;
+  applyEligible: boolean;
+  evidenceVerified: boolean;
+  evidenceId: string | null;
+  patchId: string | null;
   acceptanceSha256: string;
   patchSha256: string;
   manifestSha256: string;
   changedFiles: string[];
   changedSymbols: string[];
   verificationResults: VerificationSummary[];
+  files: EvidenceFileSummary[];
+  updatedAt: string;
+  decidedAt: string;
+  nextAction: string;
+}
+
+export interface EvidenceLog {
+  transactionId: string;
+  evidenceId: string;
+  stepId: string;
+  status: string;
+  logPath: string;
+  logSha256: string;
+  content: string;
+  truncated: boolean;
+}
+
+export interface VerificationSuggestion {
+  kind: string;
+  category: string;
+  argv: string[];
 }
 
 export interface RivetState {
@@ -83,6 +135,11 @@ export interface RivetState {
   safeMode: boolean;
   configSources: Record<string, string>;
   credentialConfigured: boolean;
+  acceptanceReady: boolean;
+  acceptanceReason: string;
+  acceptanceAction: string;
+  projectKinds: string[];
+  verificationSuggestions: VerificationSuggestion[];
   sessionId: string | null;
   sessions: string[];
   transaction: string;
@@ -94,7 +151,8 @@ export interface RivetState {
   verifyStatus: string;
   evidenceId: string;
   evidence: EvidenceSummary | null;
-  modules: string[];
+  evidenceLog: EvidenceLog | null;
+  taskModules: string[];
   moduleStatuses: ModuleStatus[];
   permission: PermissionPrompt | null;
   budget: { tokens: number; costUsd: number; elapsedMs: number };
@@ -132,6 +190,11 @@ export function initialRivetState(): RivetState {
     safeMode: false,
     configSources: {},
     credentialConfigured: false,
+    acceptanceReady: false,
+    acceptanceReason: "尚未完成 Evidence 预检",
+    acceptanceAction: "运行 rivet init 查看项目检测建议",
+    projectKinds: [],
+    verificationSuggestions: [],
     sessionId: null,
     sessions: [],
     transaction: "无",
@@ -143,7 +206,8 @@ export function initialRivetState(): RivetState {
     verifyStatus: "未验证",
     evidenceId: "无",
     evidence: null,
-    modules: [],
+    evidenceLog: null,
+    taskModules: [],
     moduleStatuses: [],
     permission: null,
     budget: { tokens: 0, costUsd: 0, elapsedMs: 0 },
@@ -162,6 +226,9 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
     timeline: appendTimeline(state.timeline, event),
   };
   switch (event.event_type) {
+    case "run.started":
+    case "run.resumed":
+      return { ...next, taskModules: [] };
     case "worker.ready":
     case "worker.recovered":
       return projectConfiguration(
@@ -236,20 +303,56 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
         ...next,
         verifyStatus: text(event.payload.status, "UNKNOWN"),
       };
+    case "candidate.ready":
+      return {
+        ...next,
+        verifyStatus: "CANDIDATE_ONLY",
+      };
     case "evidence.published":
       return {
         ...next,
         evidenceId: text(event.payload.evidence_id, "无"),
         evidence: evidenceSummary(event.payload),
+        evidenceLog: null,
+      };
+    case "evidence.snapshot": {
+      const evidence = evidenceSummary(event.payload);
+      return {
+        ...next,
+        transaction: text(event.payload.transaction_id, state.transaction),
+        verifyStatus: text(
+          event.payload.verdict_status,
+          text(event.payload.state, state.verifyStatus),
+        ),
+        evidenceId: text(event.payload.evidence_id, "无"),
+        evidence,
+        evidenceLog: null,
+      };
+    }
+    case "evidence.log":
+      return {
+        ...next,
+        evidenceLog: evidenceLog(event.payload),
       };
     case "module.activated": {
       const moduleId = text(event.payload.module_id, "");
-      if (moduleId.length === 0 || state.modules.includes(moduleId)) return next;
-      return { ...next, modules: [...state.modules, moduleId] };
+      if (moduleId.length === 0 || state.taskModules.includes(moduleId)) return next;
+      return { ...next, taskModules: [...state.taskModules, moduleId] };
+    }
+    case "module.released": {
+      const moduleId = text(event.payload.module_id, "");
+      if (number(event.payload.lease_count, 0) > 0) return next;
+      return {
+        ...next,
+        taskModules: state.taskModules.filter((item) => item !== moduleId),
+      };
     }
     case "module.slept": {
       const moduleId = text(event.payload.module_id, "");
-      return { ...next, modules: state.modules.filter((item) => item !== moduleId) };
+      return {
+        ...next,
+        taskModules: state.taskModules.filter((item) => item !== moduleId),
+      };
     }
     case "module.state.changed":
     case "module.enablement.changed":
@@ -260,30 +363,35 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
         status.moduleId === moduleId
           ? {
               ...status,
+              configuredEnabled:
+                event.event_type === "module.operation.completed"
+                  ? text(event.payload.operation, "") === "enable"
+                    ? true
+                    : text(event.payload.operation, "") === "disable"
+                      ? false
+                      : status.configuredEnabled
+                  : status.configuredEnabled,
               runtimeState: text(event.payload.current_state, status.runtimeState),
               effectiveEnabled: boolean(
                 event.payload.effective_enabled,
                 status.effectiveEnabled,
               ),
+              policy:
+                status.policy === "LOCKED"
+                  ? "LOCKED"
+                  : text(event.payload.operation, "") === "enable"
+                    ? "ENABLED"
+                    : text(event.payload.operation, "") === "disable"
+                      ? "DISABLED"
+                      : status.policy,
             }
           : status,
       );
-      return {
-        ...next,
-        moduleStatuses: statuses,
-        modules: activeModuleIds(statuses),
-      };
+      return { ...next, moduleStatuses: statuses };
     }
     case "modules.snapshot": {
       const statuses = moduleStatusArray(event.payload.modules);
-      if (statuses.length === 0) {
-        return { ...next, modules: stringArray(event.payload.modules) };
-      }
-      return {
-        ...next,
-        moduleStatuses: statuses,
-        modules: activeModuleIds(statuses),
-      };
+      return statuses.length === 0 ? next : { ...next, moduleStatuses: statuses };
     }
     case "permission.requested":
       return { ...next, permission: permissionPrompt(event.payload) };
@@ -303,6 +411,8 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       };
     case "tool.failed":
       return { ...next, error: text(event.payload.summary, "工具执行失败") };
+    case "command.completed":
+      return { ...next, error: null };
     default:
       return next;
   }
@@ -363,8 +473,33 @@ function projectConfiguration(
       payload.credential_configured,
       state.credentialConfigured,
     ),
+    acceptanceReady: boolean(payload.acceptance_ready, state.acceptanceReady),
+    acceptanceReason: text(payload.acceptance_reason, state.acceptanceReason),
+    acceptanceAction: text(payload.acceptance_action, state.acceptanceAction),
+    projectKinds:
+      payload.project_kinds === undefined
+        ? state.projectKinds
+        : stringArray(payload.project_kinds),
+    verificationSuggestions:
+      payload.verification_suggestions === undefined
+        ? state.verificationSuggestions
+        : verificationSuggestionArray(payload.verification_suggestions),
     configSources: stringRecord(payload.sources, state.configSources),
   };
+}
+
+function verificationSuggestionArray(
+  value: JsonValue | undefined,
+): VerificationSuggestion[] {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    if (item === null || Array.isArray(item) || typeof item !== "object") return [];
+    const suggestion = item as Record<string, JsonValue>;
+    const argv = stringArray(suggestion.argv);
+    const kind = text(suggestion.kind, "");
+    const category = text(suggestion.category, "");
+    return argv.length > 0 && kind && category ? [{ kind, category, argv }] : [];
+  });
 }
 
 function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem[] {
@@ -375,14 +510,33 @@ function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem
   ) {
     return timeline;
   }
+  const responseId = text(event.payload.response_id, "");
+  const streamingEventId = responseId ? `agent_stream_${responseId}` : event.event_id;
   const item: TimelineItem = {
-    eventId: event.event_id,
+    eventId:
+      event.event_type === "agent.output.delta"
+        ? streamingEventId
+        : event.event_id,
     eventType: event.event_type,
     sequence: event.sequence,
     ...presented,
   };
+  if (event.event_type === "agent.output.delta" && responseId) {
+    const existingIndex = timeline.findIndex(
+      (existing) => existing.eventId === streamingEventId,
+    );
+    if (existingIndex >= 0) {
+      return timeline.map((existing, index) =>
+        index === existingIndex ? item : existing,
+      );
+    }
+  }
+  const withoutPartial =
+    responseId && item.kind === "assistant"
+      ? timeline.filter((existing) => existing.eventId !== streamingEventId)
+      : timeline;
   const appended: TimelineItem[] = [
-    ...timeline,
+    ...withoutPartial,
     item,
   ];
   return appended.slice(-MAX_TIMELINE_ITEMS);
@@ -429,31 +583,95 @@ function transactionSummaryArray(value: JsonValue | undefined): TransactionSumma
       transactionId,
       state,
       evidenceId: typeof item.evidence_id === "string" ? item.evidence_id : null,
+      patchId: typeof item.patch_id === "string" ? item.patch_id : null,
+      patchSha256:
+        typeof item.patch_sha256 === "string" ? item.patch_sha256 : null,
+      updatedAt: text(item.updated_at, ""),
+      applyEligible: boolean(item.apply_eligible, state === "VERIFIED"),
     });
   }
   return transactions;
 }
 
 function evidenceSummary(payload: Record<string, JsonValue>): EvidenceSummary | null {
-  const evidenceId = text(payload.evidence_id, "");
-  if (!evidenceId) return null;
+  const evidenceId = text(payload.evidence_id, "") || null;
+  const transactionId = text(payload.transaction_id, "");
+  if (evidenceId === null && !transactionId) return null;
   const verificationResults: VerificationSummary[] = [];
   if (Array.isArray(payload.verification_results)) {
     for (const value of payload.verification_results) {
       if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
       const kind = text(value.kind, "");
       const status = text(value.status, "");
-      if (kind && status) verificationResults.push({ kind, status });
+      if (!kind || !status) continue;
+      verificationResults.push({
+        stepId: text(value.step_id, kind),
+        kind,
+        name: text(value.name, kind),
+        status,
+        required: boolean(value.required, true),
+        argv: stringArray(value.argv),
+        durationMs: number(value.duration_ms, 0),
+        exitCode:
+          typeof value.exit_code === "number" ? value.exit_code : null,
+        logPath: typeof value.log_path === "string" ? value.log_path : null,
+        logSha256:
+          typeof value.log_sha256 === "string" ? value.log_sha256 : null,
+        stdoutSummary: text(value.stdout_summary, ""),
+        stderrSummary: text(value.stderr_summary, ""),
+      });
+    }
+  }
+  const files: EvidenceFileSummary[] = [];
+  if (Array.isArray(payload.files)) {
+    for (const value of payload.files) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+      const path = text(value.path, "");
+      const sha256 = text(value.sha256, "");
+      if (!path || !sha256) continue;
+      files.push({ path, sha256, sizeBytes: number(value.size_bytes, 0) });
     }
   }
   return {
+    transactionId,
+    state: text(payload.state, "UNKNOWN"),
+    verdictStatus: text(payload.verdict_status, text(payload.status, "NOT_RUN")),
+    passed: boolean(payload.passed, false),
+    applyEligible: boolean(payload.apply_eligible, false),
+    evidenceVerified: boolean(payload.evidence_verified, evidenceId !== null),
     evidenceId,
+    patchId: typeof payload.patch_id === "string" ? payload.patch_id : null,
     acceptanceSha256: text(payload.acceptance_sha256, "未提供"),
     patchSha256: text(payload.patch_sha256, "未提供"),
     manifestSha256: text(payload.manifest_sha256, "未提供"),
     changedFiles: stringArray(payload.changed_files),
     changedSymbols: stringArray(payload.changed_symbols),
     verificationResults,
+    files,
+    updatedAt: text(payload.updated_at, ""),
+    decidedAt: text(payload.decided_at, ""),
+    nextAction: text(payload.next_action, "审查后端事务状态"),
+  };
+}
+
+function evidenceLog(payload: Record<string, JsonValue>): EvidenceLog | null {
+  const transactionId = text(payload.transaction_id, "");
+  const evidenceId = text(payload.evidence_id, "");
+  const stepId = text(payload.step_id, "");
+  const logPath = text(payload.log_path, "");
+  const logSha256 = text(payload.log_sha256, "");
+  if (!transactionId || !evidenceId || !stepId || !logPath || !logSha256) {
+    return null;
+  }
+  return {
+    transactionId,
+    evidenceId,
+    stepId,
+    status: text(payload.status, "UNKNOWN"),
+    logPath,
+    logSha256,
+    content: text(payload.content, ""),
+    truncated: boolean(payload.truncated, false),
   };
 }
 
@@ -480,6 +698,20 @@ function moduleStatusArray(value: JsonValue | undefined): ModuleStatus[] {
     if (!moduleId) continue;
     statuses.push({
       moduleId,
+      policy: text(
+        item.policy,
+        boolean(item.manual_control, false)
+          ? boolean(item.configured_enabled, false)
+            ? "ENABLED"
+            : "DISABLED"
+          : "LOCKED",
+      ),
+      availability: text(item.availability, "AVAILABLE"),
+      missingComponents: stringArray(item.missing_components),
+      availabilityAction:
+        typeof item.availability_action === "string"
+          ? item.availability_action
+          : null,
       manifestDefaultEnabled: boolean(item.manifest_default_enabled, false),
       persistedOverride:
         typeof item.persisted_override === "boolean" ? item.persisted_override : null,
@@ -499,10 +731,4 @@ function moduleStatusArray(value: JsonValue | undefined): ModuleStatus[] {
     });
   }
   return statuses;
-}
-
-function activeModuleIds(statuses: ModuleStatus[]): string[] {
-  return statuses
-    .filter((status) => ["ACTIVE", "IDLE", "ACTIVATING"].includes(status.runtimeState))
-    .map((status) => status.moduleId);
 }

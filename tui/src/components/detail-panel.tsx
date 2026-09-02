@@ -31,7 +31,7 @@ export function DetailPanel({
       gap={1}
     >
       <box height={1} flexDirection="row" justifyContent="space-between">
-        <text fg={theme.accent} content={panel} />
+        <text fg={theme.accent} content={panel === "Modules" ? "能力策略" : panel} />
         <text fg={theme.textMuted} content="Esc 关闭" />
       </box>
       <PanelContent
@@ -116,50 +116,65 @@ function PanelContent({
     );
   }
   if (panel === "Modules") {
-    return state.moduleStatuses.length ? (
-      <scrollbox flexGrow={1} focused={true}>
-        {state.moduleStatuses.map((module, index) => (
-          <box key={module.moduleId} flexDirection="column" marginBottom={1}>
-            <text
-              fg={
-                index === selectedModuleIndex
-                  ? theme.accent
-                  : module.effectiveEnabled
-                    ? theme.textPrimary
-                    : theme.textMuted
-              }
-              content={`${index === selectedModuleIndex ? "›" : " "} ${module.runtimeState === "ACTIVE" ? "●" : "○"} ${module.moduleId}`}
-            />
-            <text
-              fg={theme.textSecondary}
-              content={`  ${module.configuredEnabled ? "enabled" : "disabled"} · ${module.runtimeState} · ${module.scope} · ${module.activation}`}
-            />
-            <text
-              fg={theme.textMuted}
-              content={`  依赖 ${module.dependencies.join(", ") || "无"} · Lease ${module.leaseCount} · Resource ${module.activeResourceCount}`}
-            />
-            <text
-              fg={theme.accent}
-              content={`  ${moduleActions(module).join("  ·  ")}`}
-            />
-            {module.lastError === null ? null : (
-              <text fg={theme.danger} content={`  最近错误：${module.lastError}`} />
+    if (state.moduleStatuses.length) {
+      const safeModuleIndex = Math.max(
+        0,
+        Math.min(selectedModuleIndex, state.moduleStatuses.length - 1),
+      );
+      const selectedModule = state.moduleStatuses[safeModuleIndex]!;
+      return (
+        <box flexGrow={1} flexDirection="column">
+          <scrollbox flexGrow={1} focused={true}>
+            {state.moduleStatuses.map((module, index) => {
+              const selected = index === safeModuleIndex;
+              return (
+                <box
+                  key={module.moduleId}
+                  height={1}
+                  flexDirection="row"
+                  backgroundColor={selected ? theme.selection : theme.surface}
+                >
+                  <text
+                    fg={moduleColor(module, selected, theme)}
+                    content={`${selected ? "›" : " "} ${modulePolicyIcon(module)} ${moduleDisplayName(module.moduleId)} · ${modulePolicyLabel(module)}`}
+                  />
+                </box>
+              );
+            })}
+          </scrollbox>
+          <box flexDirection="column" marginTop={1}>
+            <box height={1} width="100%">
+              <text
+                fg={theme.textMuted}
+                content={`可用性 ${moduleAvailabilityLabel(selectedModule.availability)} · 依赖 ${selectedModule.dependencies.join(", ") || "无"}`}
+              />
+            </box>
+            {selectedModule.availabilityAction === null ||
+            selectedModule.availabilityAction === undefined ? null : (
+              <box height={1} width="100%">
+                <text
+                  fg={theme.warning}
+                  content={`下一步：${selectedModule.availabilityAction}`}
+                />
+              </box>
             )}
+            {selectedModule.lastError === null ? null : (
+              <box height={1} width="100%">
+                <text fg={theme.danger} content={`异常：${selectedModule.lastError}`} />
+              </box>
+            )}
+            <box height={1} width="100%">
+              <text
+                fg={theme.accent}
+                content={`↑↓ 选择 · ${moduleActionHints(selectedModule).join(" · ")}`}
+              />
+            </box>
           </box>
-        ))}
-        <text
-          fg={theme.textMuted}
-          content="↑↓ 选择 · E 启用 · W 唤醒 · S 休眠 · D 禁用"
-        />
-      </scrollbox>
-    ) : state.modules.length ? (
-      <scrollbox flexGrow={1} focused={true}>
-        {state.modules.map((module) => (
-          <text key={module} fg={theme.textSecondary} content={`● ACTIVE  ${module}`} />
-        ))}
-      </scrollbox>
-    ) : (
-      <EmptyState text="模块状态尚未加载" action="执行 /modules list" theme={theme} />
+        </box>
+      );
+    }
+    return (
+      <EmptyState text="能力策略尚未加载" action="执行 /modules list" theme={theme} />
     );
   }
   if (panel === "Sessions") {
@@ -178,32 +193,73 @@ function PanelContent({
     );
   }
   if (panel === "Evidence") {
-    if (state.evidence === null) {
+    const safeTransactionIndex = Math.max(
+      0,
+      Math.min(selectedModuleIndex, Math.max(0, state.transactions.length - 1)),
+    );
+    const selectedTransaction = state.transactions[safeTransactionIndex];
+    const selectedTransactionId =
+      selectedTransaction?.transactionId ??
+      (state.transaction === "无" ? null : state.transaction);
+    const evidence =
+      state.evidence !== null &&
+      (!state.evidence.transactionId ||
+        state.evidence.transactionId === selectedTransactionId)
+        ? state.evidence
+        : null;
+    if (evidence === null) {
       return (
         <EmptyState
-          text={state.evidenceId === "无" ? "当前没有验证证据" : state.evidenceId}
-          action={state.evidenceId === "无" ? "完成独立验证后重试" : "当前只加载了证据索引"}
+          text={selectedTransactionId === null ? "当前没有历史事务" : "正在复核事务证据"}
+          action={selectedTransactionId === null ? "完成 /fix 后重试" : selectedTransactionId}
           theme={theme}
         />
       );
     }
-    const evidence = state.evidence;
     const lines = [
-      `结论：${state.verifyStatus}`,
-      `Evidence：${evidence.evidenceId}`,
+      "近期事务（↑↓ 选择）",
+      ...state.transactions.slice(0, 12).map(
+        (transaction, index) =>
+          `${index === safeTransactionIndex ? "›" : " "} ${transaction.transactionId} · ${transaction.state}${transaction.applyEligible ? " · 可 Apply" : ""}`,
+      ),
+      "",
+      `Transaction：${evidence.transactionId || selectedTransactionId || "无"}`,
+      `状态：${evidence.state} · Verdict：${evidence.verdictStatus}`,
+      `Apply：${evidence.applyEligible ? "后端允许（仍需显式确认）" : "不允许"}`,
+      `Evidence 完整性：${evidence.evidenceVerified ? "已复核" : "尚未发布"}`,
+      `Evidence：${evidence.evidenceId ?? "无"}`,
+      `Patch：${evidence.patchId ?? "无"}`,
       `AcceptanceSpec SHA-256：${evidence.acceptanceSha256}`,
       `Patch SHA-256：${evidence.patchSha256}`,
       `Manifest SHA-256：${evidence.manifestSha256}`,
       `Changed Files：\n${evidence.changedFiles.join(", ") || "无"}`,
       `Changed Symbols：\n${evidence.changedSymbols.join(", ") || "无"}`,
+      "V0–V10 验证矩阵",
       ...evidence.verificationResults.map(
-        (result) => `${result.kind}  ${result.status}`,
+        (result) =>
+          `${result.kind} · ${result.status} · ${result.required ? "required" : "optional"} · ${result.durationMs}ms · exit=${result.exitCode ?? "-"}\n  ${result.stepId}\n  argv: ${JSON.stringify(result.argv)}${result.logPath === null ? "" : `\n  log: ${result.logPath} · ${result.logSha256 ?? "无哈希"}`}`,
       ),
+      "Evidence 文件索引",
+      ...evidence.files.map(
+        (file) => `${file.path} · ${file.sizeBytes} B\n  ${file.sha256}`,
+      ),
+      `下一步：${evidence.nextAction}`,
+      "L / Enter：惰性加载首个失败步骤日志",
+      ...(state.evidenceLog !== null &&
+      state.evidenceLog.transactionId === evidence.transactionId
+        ? [
+            "",
+            `日志：${state.evidenceLog.stepId} · ${state.evidenceLog.status}`,
+            `${state.evidenceLog.logPath} · ${state.evidenceLog.logSha256}`,
+            state.evidenceLog.content || "（空日志）",
+            state.evidenceLog.truncated ? "…日志展示已截断" : "",
+          ]
+        : []),
     ];
     return (
       <scrollbox flexGrow={1} focused={true}>
-        {lines.map((line) => (
-          <text key={line} fg={theme.textSecondary} content={line} />
+        {lines.map((line, index) => (
+          <text key={`${index}:${line}`} fg={theme.textSecondary} content={line} />
         ))}
       </scrollbox>
     );
@@ -222,24 +278,75 @@ function PanelContent({
   );
 }
 
-function moduleActions(module: ModuleStatus): string[] {
-  if (!module.manualControl) return ["内部模块，仅由 Kernel 控制"];
+function moduleActionHints(module: ModuleStatus): string[] {
+  if (module.policy === "LOCKED" || !module.manualControl) return ["Kernel 管理"];
   if (["required", "eager"].includes(module.activation)) {
-    return ["系统常驻模块，只读"];
+    return ["系统常驻"];
   }
   if (!module.configuredEnabled) {
-    return [`/modules enable ${module.moduleId}`];
+    return ["E 启用"];
   }
-  const actions: string[] = [];
-  if (["INACTIVE", "SLEEPING"].includes(module.runtimeState)) {
-    actions.push(`/modules wake ${module.moduleId}`);
+  return ["D 禁用"];
+}
+
+const MODULE_NAMES: Readonly<Record<string, string>> = {
+  "provider.deepseek": "DeepSeek 模型",
+  "context.lexical": "词法检索",
+  "context.syntax": "语法分析",
+  "context.lsp": "LSP 语义",
+  "reader.core": "基础读取",
+  "reader.document": "文档读取",
+  "reader.image": "图片读取",
+  "reader.media": "媒体读取",
+  "reader.archive": "7z 读取",
+  "reader.transcription": "本地转录",
+  "reader.pdf": "PDF 读取",
+  "transaction.git": "隔离事务",
+  "verify.matrix": "独立验证",
+  "guard.sandbox": "安全沙箱",
+};
+
+function moduleDisplayName(moduleId: string): string {
+  return MODULE_NAMES[moduleId] ?? moduleId;
+}
+
+function modulePolicyLabel(module: ModuleStatus): string {
+  const labels: Readonly<Record<string, string>> = {
+    LOCKED: "Kernel 管理",
+    ENABLED: "已启用",
+    DISABLED: "已禁用",
+  };
+  return labels[module.policy] ?? module.policy;
+}
+
+function modulePolicyIcon(module: ModuleStatus): string {
+  if (module.availability !== "AVAILABLE") return "!";
+  if (module.policy === "LOCKED") return "◆";
+  return module.policy === "ENABLED" ? "●" : "○";
+}
+
+function moduleAvailabilityLabel(availability: string): string {
+  const labels: Readonly<Record<string, string>> = {
+    AVAILABLE: "可用",
+    SAFE_MODE_RESTRICTED: "Safe Mode 限制",
+    MISSING_DEPENDENCY: "缺少依赖",
+    MISSING_EXECUTABLE: "缺少程序",
+    UNSUPPORTED: "当前平台不支持",
+  };
+  return labels[availability] ?? availability;
+}
+
+function moduleColor(
+  module: ModuleStatus,
+  selected: boolean,
+  theme: RivetTheme,
+): string {
+  if (selected) return theme.accent;
+  if (module.availability !== "AVAILABLE" || module.lastError !== null) {
+    return theme.danger;
   }
-  if (["ACTIVE", "IDLE"].includes(module.runtimeState)) {
-    actions.push(`/modules sleep ${module.moduleId}`);
-  }
-  actions.push(`/modules disable ${module.moduleId}`);
-  if (module.leaseCount > 0) actions.push(`阻塞：${module.leaseCount} 个活动 Lease`);
-  return actions;
+  if (module.policy === "ENABLED") return theme.success;
+  return module.policy === "LOCKED" ? theme.textSecondary : theme.textMuted;
 }
 
 function EmptyState({

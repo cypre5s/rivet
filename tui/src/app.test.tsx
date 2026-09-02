@@ -1,11 +1,16 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, spyOn, test } from "bun:test";
 import { testRender } from "@opentui/react/test-utils";
 import { act } from "react";
 
 import { RivetApp } from "./app.tsx";
 import type { IpcRequest } from "./contracts/ipc.ts";
 import { WorkerClient, type WorkerTransport } from "./ipc/client.ts";
-import { initialRivetState, type RivetState } from "./state/reducer.ts";
+import {
+  initialRivetState,
+  type EvidenceSummary,
+  type RivetState,
+  type VerificationSummary,
+} from "./state/reducer.ts";
 
 class CaptureTransport implements WorkerTransport {
   readonly writes: string[] = [];
@@ -151,6 +156,49 @@ function readyState(overrides: Partial<RivetState> = {}): RivetState {
   };
 }
 
+function verificationSummary(kind: string, index: number): VerificationSummary {
+  return {
+    stepId: `verification_${index}`,
+    kind,
+    name: kind,
+    status: "PASSED",
+    required: true,
+    argv: ["pytest", "-q"],
+    durationMs: 12,
+    exitCode: 0,
+    logPath: `step_${index}.log`,
+    logSha256: `${index}`.repeat(64),
+    stdoutSummary: "",
+    stderrSummary: "",
+  };
+}
+
+function evidenceState(
+  evidenceId: string,
+  verificationResults: VerificationSummary[],
+): EvidenceSummary {
+  return {
+    transactionId: "tx_demo",
+    state: "VERIFIED",
+    verdictStatus: "PASSED",
+    passed: true,
+    applyEligible: true,
+    evidenceVerified: true,
+    evidenceId,
+    patchId: "patch_demo",
+    acceptanceSha256: "a".repeat(64),
+    patchSha256: "p".repeat(64),
+    manifestSha256: "m".repeat(64),
+    changedFiles: ["calculator.py"],
+    changedSymbols: ["total_with_tax"],
+    verificationResults,
+    files: [],
+    updatedAt: "2026-09-02T00:00:00Z",
+    decidedAt: "2026-09-02T00:00:00Z",
+    nextAction: "审查后显式 Apply",
+  };
+}
+
 describe("Rivet OpenTUI experience", () => {
   test("refreshes the model picker from a live Worker ready event", async () => {
     const transport = new CaptureTransport();
@@ -224,6 +272,62 @@ describe("Rivet OpenTUI experience", () => {
       .map((line) => JSON.parse(line) as IpcRequest)
       .find((item) => item.method === "command.ask");
     expect(command?.params.model).toBe("team-reasoner");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("reuses input history with consecutive up and down arrows", async () => {
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} />,
+      { width: 100, height: 28 },
+    );
+    await act(async () => setup.renderOnce());
+
+    await act(async () => setup.mockInput.typeText("第一个问题"));
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+    await act(async () => setup.mockInput.typeText("第二个问题"));
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+
+    await act(async () => setup.mockInput.pressArrow("up"));
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe("第二个问题");
+    await act(async () => setup.mockInput.pressArrow("up"));
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe("第一个问题");
+    await act(async () => setup.mockInput.pressArrow("down"));
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe("第二个问题");
+    await act(async () => setup.mockInput.pressArrow("down"));
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe("");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("keeps explicit task commands and Tab mode selection synchronized", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 100, height: 28 },
+    );
+    await act(async () => setup.renderOnce());
+
+    await act(async () => setup.mockInput.pressTab());
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("PLAN · 模型");
+    await act(async () => setup.mockInput.typeText("/ask 你好"));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("ASK · 模型");
+
+    await act(async () => setup.mockInput.pressTab());
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("PLAN · 模型");
+    expect(setup.renderer.currentFocusedEditor?.plainText).toBe("/plan 你好");
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+
+    expect(
+      transport.writes
+        .map((line) => JSON.parse(line) as IpcRequest)
+        .some((request) => request.method === "command.plan"),
+    ).toBeTrue();
     await act(async () => setup.renderer.destroy());
   });
 
@@ -408,7 +512,7 @@ describe("Rivet OpenTUI experience", () => {
     const client = new WorkerClient(transport, { requireHandshake: false });
     const setup = await testRender(
       <RivetApp
-        initialState={readyState({ modules: ["reader.pdf"] })}
+        initialState={readyState({ taskModules: ["reader.pdf"] })}
         noColor={true}
         client={client}
       />,
@@ -805,6 +909,92 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderer.destroy());
   });
 
+  test("collapses internal execution events and toggles them by clicking the chevron", async () => {
+    const timeline: RivetState["timeline"] = [
+      {
+        eventId: "user",
+        eventType: "user.message",
+        sequence: 0,
+        title: "/ask 你好",
+        detail: "",
+        kind: "user",
+        status: "success",
+      },
+      ...[
+        ["plan", "plan.updated", "任务阶段已更新", "命令已提交"],
+        ["module", "module.activated", "已启用 provider.deepseek", "按需模块已激活"],
+        ["tool-start", "tool.started", "正在执行 workspace.info", "调用 workspace.info"],
+        ["tool-end", "tool.completed", "workspace.info 执行完成", "工具执行成功"],
+        ["run", "run.completed", "运行状态已更新", "Agent Loop: final_answer"],
+      ].map(([eventId, eventType, title, detail], index) => ({
+        eventId: eventId ?? "internal",
+        eventType: eventType ?? "status.updated",
+        sequence: index + 1,
+        title: title ?? "运行状态已更新",
+        detail: detail ?? "",
+        kind: "status" as const,
+        status: "success" as const,
+      })),
+      {
+        eventId: "answer",
+        eventType: "agent.answered",
+        sequence: 6,
+        title: "回复已生成",
+        detail: "你好，我已经完成只读检查。",
+        kind: "assistant",
+        status: "success",
+      },
+      ...[
+        ["session", "session.updated", "运行状态已更新", "会话状态已保存"],
+        ["budget", "budget.updated", "本次用量已更新", ""],
+        ["command", "command.completed", "命令执行完成", "/ask 已完成"],
+        ["end", "plan.updated", "任务阶段已更新", "ask 已结束"],
+      ].map(([eventId, eventType, title, detail], index) => ({
+        eventId: eventId ?? "internal-end",
+        eventType: eventType ?? "status.updated",
+        sequence: index + 7,
+        title: title ?? "运行状态已更新",
+        detail: detail ?? "",
+        kind: "status" as const,
+        status: "success" as const,
+      })),
+    ];
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          sessionId: "session_timeline",
+          timeline,
+          lastSequence: 10,
+        })}
+        noColor={true}
+      />,
+      { width: 120, height: 34 },
+    );
+    await act(async () => setup.renderOnce());
+    await setup.flush();
+    await setup.waitForVisualIdle();
+
+    const collapsed = setup.captureCharFrame();
+    expect(collapsed).toContain("RIVET");
+    expect(collapsed).toContain("› 执行过程");
+    expect(collapsed).not.toContain("正在执行 workspace.info");
+    expect(collapsed).not.toContain("本次用量已更新");
+
+    const rows = collapsed.split("\n");
+    const groupY = rows.findIndex((row) => row.includes("› 执行过程"));
+    const groupX = rows[groupY]?.indexOf("›") ?? -1;
+    expect(groupX).toBeGreaterThanOrEqual(0);
+    expect(groupY).toBeGreaterThanOrEqual(0);
+    await act(async () => setup.mockMouse.click(groupX, groupY));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("正在执行 workspace.info");
+
+    await act(async () => setup.mockMouse.click(groupX, groupY));
+    await setup.flush();
+    expect(setup.captureCharFrame()).not.toContain("正在执行 workspace.info");
+    await act(async () => setup.renderer.destroy());
+  });
+
   test("controls the selected module from the Modules panel through IPC", async () => {
     const transport = new CaptureTransport();
     const client = new WorkerClient(transport, { requireHandshake: false });
@@ -812,10 +1002,12 @@ describe("Rivet OpenTUI experience", () => {
       <RivetApp
         initialState={readyState({
           sessionId: "session_modules",
-          modules: ["reader.pdf"],
+          taskModules: ["reader.pdf", "context.syntax"],
           moduleStatuses: [
             {
               moduleId: "reader.pdf",
+              policy: "DISABLED",
+              availability: "AVAILABLE",
               manifestDefaultEnabled: false,
               persistedOverride: false,
               configuredEnabled: false,
@@ -832,9 +1024,29 @@ describe("Rivet OpenTUI experience", () => {
               activeResourceCount: 0,
               lastError: null,
             },
+            {
+              moduleId: "context.syntax",
+              policy: "ENABLED",
+              availability: "AVAILABLE",
+              manifestDefaultEnabled: true,
+              persistedOverride: null,
+              configuredEnabled: true,
+              effectiveEnabled: true,
+              runtimeState: "INACTIVE",
+              activation: "on_demand",
+              scope: "workspace",
+              manualControl: true,
+              sleepPolicy: "automatic",
+              dependencies: ["context.lexical"],
+              dependents: [],
+              providedCapabilities: ["context.syntax.parse"],
+              leaseCount: 0,
+              activeResourceCount: 0,
+              lastError: null,
+            },
           ],
         })}
-        noColor={true}
+        noColor={false}
         client={client}
       />,
       { width: 120, height: 30 },
@@ -845,8 +1057,23 @@ describe("Rivet OpenTUI experience", () => {
     await setup.flush();
 
     const panel = setup.captureCharFrame();
-    expect(panel).toContain("reader.pdf");
+    expect(panel).toContain("能力策略");
+    expect(panel).toContain("PDF 读取");
+    expect(panel).toContain("语法分析");
+    expect(panel).toContain("已禁用");
     expect(panel).toContain("E 启用");
+    expect(panel).not.toContain("workspace");
+    expect(panel).not.toContain("on_demand");
+    expect(panel).toContain("依赖");
+    expect(panel).not.toContain("/modules enable");
+
+    const spans = setup.captureSpans().lines.flatMap((line) => line.spans);
+    const selectedSpan = spans.find((span) => span.text.includes("PDF 读取"));
+    const unselectedSpan = spans.find((span) => span.text.includes("语法分析"));
+    expect(selectedSpan).toBeDefined();
+    expect(unselectedSpan).toBeDefined();
+    expect(selectedSpan?.bg).not.toEqual(unselectedSpan?.bg);
+
     await act(async () => setup.mockInput.pressKey("e"));
     await setup.flush();
 
@@ -898,23 +1125,16 @@ describe("Rivet OpenTUI experience", () => {
         initialState={readyState({
           sessionId: "session_demo",
           evidenceId: "evidence_demo",
-          evidence: {
-            evidenceId: "evidence_demo",
-            acceptanceSha256: "a".repeat(64),
-            patchSha256: "p".repeat(64),
-            manifestSha256: "m".repeat(64),
-            changedFiles: ["calculator.py"],
-            changedSymbols: ["total_with_tax"],
-            verificationResults: [
-              { kind: "V0_ENVIRONMENT", status: "PASSED" },
-              { kind: "V10_RESOURCE", status: "PASSED" },
-            ],
-          },
+          transaction: "tx_demo",
+          evidence: evidenceState("evidence_demo", [
+            verificationSummary("V0_ENVIRONMENT", 0),
+            verificationSummary("V10_RESOURCE", 10),
+          ]),
           verifyStatus: "PASSED",
         })}
         noColor={true}
       />,
-      { width: 120, height: 34 },
+      { width: 120, height: 60 },
     );
     await act(async () => setup.renderOnce());
     await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
@@ -930,6 +1150,34 @@ describe("Rivet OpenTUI experience", () => {
     expect(panel).toContain("V0_ENVIRONMENT");
     expect(panel).toContain("V10_RESOURCE");
     await act(async () => setup.renderer.destroy());
+  });
+
+  test("renders repeated verification stage identifiers without duplicate React keys", async () => {
+    const consoleError = spyOn(console, "error").mockImplementation(() => {});
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          evidenceId: "evidence_repeated_stage",
+          transaction: "tx_demo",
+          evidence: evidenceState("evidence_repeated_stage", [
+            verificationSummary("V3_TARGETED", 1),
+            verificationSummary("V3_TARGETED", 2),
+          ]),
+          verifyStatus: "PASSED",
+        })}
+        noColor={true}
+      />,
+      { width: 120, height: 34 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
+    await act(async () => setup.mockInput.pressKey("e"));
+    await setup.flush();
+    await act(async () => setup.renderer.destroy());
+
+    const errors = consoleError.mock.calls.flat().join(" ");
+    consoleError.mockRestore();
+    expect(errors).not.toContain("same key");
   });
 
   test("treats Escape on a permission prompt as an explicit denial", async () => {
@@ -986,6 +1234,41 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.mockInput.pressKey("n"));
     await setup.flush();
     expect(setup.captureCharFrame()).not.toContain("影响范围：主工作区");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("warns before model cost and routes an unready FIX to candidate-only", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          acceptanceReady: false,
+          acceptanceReason: "verification.acceptance 为空",
+          acceptanceAction: "配置独立行为验收 argv",
+        })}
+        noColor={true}
+        client={client}
+      />,
+      { width: 110, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => {
+      await setup.mockInput.typeText("/fix 修复 src/app.py");
+      setup.mockInput.pressEnter();
+    });
+    await setup.flush();
+
+    const warning = setup.captureCharFrame();
+    expect(warning).toContain("独立验收尚未就绪");
+    expect(warning).toContain("不可 Apply");
+
+    await act(async () => setup.mockInput.pressKey("y"));
+    await setup.flush();
+    const fixRequest = transport.writes
+      .map((line) => JSON.parse(line) as IpcRequest)
+      .find((request) => request.method === "command.fix");
+    expect(fixRequest?.params.candidate_only).toBeTrue();
     await act(async () => setup.renderer.destroy());
   });
 

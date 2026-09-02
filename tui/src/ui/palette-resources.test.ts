@@ -8,7 +8,7 @@ describe("global palette resources", () => {
     const state = {
       ...initialRivetState(),
       sessions: ["session_one"],
-      modules: ["reader.pdf"],
+      taskModules: ["reader.pdf"],
       transaction: "tx_one",
       evidenceId: "evidence_one",
     };

@@ -30,6 +30,7 @@ export const DEFAULT_COMMAND_CONTEXT: CommandContext = {
   transactionId: null,
   verificationStatus: "NOT_RUN",
   evidenceId: null,
+  acceptanceReady: true,
 };
 
 export function parseCommandInput(
@@ -124,7 +125,7 @@ export function moduleCommandUnavailableReason(
   statuses: ModuleStatus[],
 ): string | null {
   const [operation, moduleId] = value.split(/\s+/, 2);
-  if (moduleId === undefined || !["enable", "disable", "wake", "sleep"].includes(operation ?? "")) {
+  if (moduleId === undefined || !["enable", "disable"].includes(operation ?? "")) {
     return null;
   }
   const status = statuses.find((item) => item.moduleId === moduleId);
@@ -132,12 +133,9 @@ export function moduleCommandUnavailableReason(
   if (!status.manualControl) return "内部模块仅由 Kernel 控制";
   if (
     ["required", "eager"].includes(status.activation) &&
-    (operation === "disable" || operation === "sleep")
+    operation === "disable"
   ) {
-    return "系统必需或常驻模块不能执行该操作";
-  }
-  if ((operation === "disable" || operation === "sleep") && status.leaseCount > 0) {
-    return `当前有 ${status.leaseCount} 个活动 Lease`;
+    return "系统必需或常驻模块不能被禁用";
   }
   return null;
 }
@@ -177,8 +175,6 @@ function moduleChoices(sources: CommandSources): string[] {
       ...sources.modules.flatMap((moduleId) => [
         `show ${moduleId}`,
         `enable ${moduleId}`,
-        `wake ${moduleId}`,
-        `sleep ${moduleId}`,
         `disable ${moduleId}`,
       ]),
     ];
@@ -186,40 +182,14 @@ function moduleChoices(sources: CommandSources): string[] {
   const choices = ["list"];
   for (const status of statuses) {
     choices.push(`show ${status.moduleId}`);
-    if (
-      !status.manualControl ||
-      status.activation === "required" ||
-      status.activation === "eager"
-    ) {
-      if (["ACTIVE", "IDLE"].includes(status.runtimeState)) {
-        choices.push(
-          `sleep ${status.moduleId}`,
-          `disable ${status.moduleId}`,
-        );
-      }
-      continue;
-    }
+    if (!status.manualControl) continue;
+    if (["required", "eager"].includes(status.activation)) continue;
     if (!status.configuredEnabled) {
       choices.push(
         `enable ${status.moduleId}`,
         `enable ${status.moduleId} --with-dependencies`,
       );
       continue;
-    }
-    if (["INACTIVE", "SLEEPING"].includes(status.runtimeState)) {
-      choices.push(
-        `wake ${status.moduleId}`,
-        `wake ${status.moduleId} --with-dependencies`,
-      );
-    }
-    if (["ACTIVE", "IDLE"].includes(status.runtimeState)) {
-      choices.push(
-        `sleep ${status.moduleId}`,
-        `sleep ${status.moduleId} --wait --timeout 30`,
-      );
-      if (status.dependents.length > 0) {
-        choices.push(`sleep ${status.moduleId} --cascade --yes`);
-      }
     }
     choices.push(`disable ${status.moduleId}`);
     if (status.dependents.length > 0) {

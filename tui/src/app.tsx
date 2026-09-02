@@ -18,6 +18,7 @@ import { createTheme, type ThemeName } from "./components/theme.ts";
 import { WelcomeScreen } from "./components/welcome-screen.tsx";
 import type { JsonValue } from "./contracts/ipc.ts";
 import { useCommandOptions } from "./hooks/use-command-options.ts";
+import { useEvidenceDetail } from "./hooks/use-evidence-detail.ts";
 import { useAppKeyboard } from "./hooks/use-app-keyboard.ts";
 import { useRepositoryFiles } from "./hooks/use-repository-files.ts";
 import { useSessionList } from "./hooks/use-session-list.ts";
@@ -37,6 +38,7 @@ import {
   type WorkMode,
 } from "./ui/command-registry.ts";
 import {
+  explicitTaskMode,
   PLACEHOLDERS,
   TIPS,
   type Overlay,
@@ -136,6 +138,11 @@ export function RivetApp({
   }, [selectedModel, state.model, state.models]);
 
   useEffect(() => {
+    const commandMode = explicitTaskMode(input);
+    if (commandMode !== null && commandMode !== mode) setMode(commandMode);
+  }, [input, mode]);
+
+  useEffect(() => {
     if (screen !== "welcome" || input.length > 0) return;
     const timer = setInterval(
       () => setWelcomeIndex((index) => (index + 1) % PLACEHOLDERS.length),
@@ -162,6 +169,7 @@ export function RivetApp({
     (topOverlay?.kind === "arguments" &&
       argumentCommand?.name === "resume");
   const transactionListRequested =
+    openPanel === "Evidence" ||
     topOverlay?.kind === "palette" ||
     (topOverlay?.kind === "arguments" &&
       argumentCommand?.requiresTransaction === true);
@@ -175,6 +183,20 @@ export function RivetApp({
   );
   useSessionList(readyClient, sessionListRequested, setInlineError);
   useTransactionList(readyClient, transactionListRequested, setInlineError);
+  const selectedTransaction =
+    state.transactions.length > 0
+      ? state.transactions[
+          Math.max(0, Math.min(selectedIndex, state.transactions.length - 1))
+        ]?.transactionId ?? null
+      : state.transaction === "无"
+        ? null
+        : state.transaction;
+  useEvidenceDetail(
+    readyClient,
+    openPanel === "Evidence",
+    selectedTransaction,
+    setInlineError,
+  );
 
   const commandContext: CommandContext = {
     modelConfigured: state.credentialConfigured,
@@ -186,6 +208,7 @@ export function RivetApp({
     transactionId: state.transaction === "无" ? null : state.transaction,
     verificationStatus: state.verifyStatus,
     evidenceId: state.evidenceId === "无" ? null : state.evidenceId,
+    acceptanceReady: state.acceptanceReady,
     transactionStates: Object.fromEntries(
       state.transactions.map((transaction) => [
         transaction.transactionId,

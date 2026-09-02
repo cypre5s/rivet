@@ -12,8 +12,10 @@ import type { WorkerClient } from "../ipc/client.ts";
 import type { RivetAction, RivetState } from "../state/reducer.ts";
 import {
   clampIndex,
+  explicitTaskMode,
   MODES,
   overlayItemCount,
+  replaceExplicitTaskMode,
   type Overlay,
 } from "../ui/app-model.ts";
 import type {
@@ -152,6 +154,10 @@ export function useAppKeyboard(
       key.preventDefault();
       return;
     }
+    if (state.openPanel === "Evidence" && handleEvidencePanelKey(key)) {
+      key.preventDefault();
+      return;
+    }
     if (command === "palette.open") {
       key.preventDefault();
       actions.pushOverlay({ kind: "palette" });
@@ -184,7 +190,7 @@ export function useAppKeyboard(
       if (state.openPanel !== null) actions.setOpenPanel(null);
       else actions.setInlineError(null);
     } else if (
-      state.input.length === 0 &&
+      !state.running &&
       (key.name === "up" || key.name === "down")
     ) {
       key.preventDefault();
@@ -240,7 +246,11 @@ export function useAppKeyboard(
   function cycleMode(direction: 1 | -1) {
     const current = MODES.indexOf(state.mode);
     const next = (current + direction + MODES.length) % MODES.length;
-    actions.setMode(MODES[next] ?? "ASK");
+    const nextMode = MODES[next] ?? "ASK";
+    actions.setMode(nextMode);
+    if (explicitTaskMode(state.input) !== null) {
+      actions.setInput(replaceExplicitTaskMode(state.input, nextMode));
+    }
   }
 
   function browseHistory(direction: 1 | -1) {
@@ -299,7 +309,7 @@ export function useAppKeyboard(
       return true;
     }
     const module = modules[clampIndex(state.selectedIndex, modules.length)];
-    if (module === undefined || !["e", "w", "s", "d"].includes(key.name)) {
+    if (module === undefined || !["e", "d"].includes(key.name)) {
       return false;
     }
     if (
@@ -310,26 +320,51 @@ export function useAppKeyboard(
       actions.setNotice("该模块受 Kernel 策略保护，不能手动控制");
       return true;
     }
-    const operation = { e: "enable", w: "wake", s: "sleep", d: "disable" }[
-      key.name
-    ];
+    const operation = { e: "enable", d: "disable" }[key.name];
     if (operation === undefined) return false;
     if (operation === "enable" && module.configuredEnabled) {
       actions.setNotice("模块已经启用");
       return true;
     }
-    if (operation === "wake" && !module.configuredEnabled) {
-      actions.setNotice("模块尚未启用，请先执行 Enable");
-      return true;
-    }
-    if (
-      operation === "sleep" &&
-      !["ACTIVE", "IDLE"].includes(module.runtimeState)
-    ) {
-      actions.setNotice("模块当前没有运行，无需休眠");
+    if (operation === "disable" && !module.configuredEnabled) {
+      actions.setNotice("能力已经禁用");
       return true;
     }
     actions.executeInput(`/modules ${operation} ${module.moduleId}`);
+    return true;
+  }
+
+  function handleEvidencePanelKey(key: {
+    name: string;
+    ctrl: boolean;
+  }): boolean {
+    if (key.ctrl) return false;
+    const transactions = state.rivet.transactions;
+    if (key.name === "up" || key.name === "down") {
+      if (transactions.length === 0) return true;
+      const delta = key.name === "up" ? -1 : 1;
+      actions.setSelectedIndex((current) =>
+        clampIndex(current + delta, transactions.length),
+      );
+      return true;
+    }
+    if (key.name !== "l" && key.name !== "return") return false;
+    const transactionId =
+      transactions[clampIndex(state.selectedIndex, transactions.length)]
+        ?.transactionId ??
+      (state.rivet.transaction === "无" ? null : state.rivet.transaction);
+    if (transactionId === null || services.client === undefined) {
+      actions.setNotice("当前没有可读取的 Evidence 日志");
+      return true;
+    }
+    void services.client
+      .request("evidence.log", { transaction_id: transactionId })
+      .then(() => actions.setNotice("已惰性加载一个验证步骤日志"))
+      .catch((error: unknown) =>
+        actions.setInlineError(
+          error instanceof Error ? error.message : "Evidence 日志加载失败",
+        ),
+      );
     return true;
   }
 

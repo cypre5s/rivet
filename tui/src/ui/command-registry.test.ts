@@ -15,6 +15,7 @@ const BASE_CONTEXT: CommandContext = {
   transactionId: "tx_one",
   verificationStatus: "PASSED",
   evidenceId: "evidence_one",
+  acceptanceReady: true,
 };
 
 describe("unified command registry", () => {

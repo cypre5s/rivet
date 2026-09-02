@@ -1,7 +1,7 @@
 import { SyntaxStyle } from "@opentui/core";
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
 
-import type { RivetState } from "../state/reducer.ts";
+import type { RivetState, TimelineItem } from "../state/reducer.ts";
 import type { RivetTheme } from "./theme.ts";
 
 export function TimelinePanel({
@@ -14,6 +14,10 @@ export function TimelinePanel({
   running: boolean;
 }) {
   const visible = state.timeline.slice(-120);
+  const entries = useMemo(() => groupTimeline(visible), [visible]);
+  const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
   const syntaxStyle = useMemo(
     () =>
       SyntaxStyle.fromStyles({
@@ -38,7 +42,35 @@ export function TimelinePanel({
         {visible.length === 0 ? (
           <text fg={theme.textMuted} content="提交任务后，执行步骤会显示在这里。" />
         ) : (
-          visible.map((item) => {
+          entries.map((entry) => {
+            if (entry.kind === "group") {
+              const expanded = expandedGroups.has(entry.id);
+              const failed = entry.items.some(
+                (item) => item.status === "failed" || item.status === "blocked",
+              );
+              return (
+                <box key={entry.id} flexDirection="column" marginBottom={1}>
+                  <box
+                    height={1}
+                    flexDirection="row"
+                    onMouseDown={() =>
+                      setExpandedGroups((current) => toggleGroup(current, entry.id))
+                    }
+                  >
+                    <text
+                      fg={failed ? theme.warning : theme.accent}
+                      content={`${expanded ? "⌄" : "›"} 执行过程 · ${entry.items.length} 项${failed ? " · 需关注" : ""}`}
+                    />
+                  </box>
+                  {expanded
+                    ? entry.items.map((item) => (
+                        <StatusRow key={item.eventId} item={item} theme={theme} />
+                      ))
+                    : null}
+                </box>
+              );
+            }
+            const item = entry.item;
             if (item.kind === "user") {
               return (
                 <box key={item.eventId} flexDirection="column" marginBottom={1}>
@@ -60,19 +92,7 @@ export function TimelinePanel({
                 </box>
               );
             }
-            return (
-              <box key={item.eventId} flexDirection="row" minHeight={1}>
-                <text
-                  width={2}
-                  fg={statusColor(item.status, theme)}
-                  content={statusIcon(item.status)}
-                />
-                <text fg={theme.textSecondary} content={item.title} />
-                {item.detail ? (
-                  <text fg={theme.textMuted} content={`  ${item.detail}`} />
-                ) : null}
-              </box>
-            );
+            return <StatusRow key={item.eventId} item={item} theme={theme} />;
           })
         )}
       </scrollbox>
@@ -82,6 +102,61 @@ export function TimelinePanel({
           content={`${state.error}${state.connection === "crashed" ? "  Ctrl+Shift+R 恢复 Worker" : ""}`}
         />
       )}
+    </box>
+  );
+}
+
+type TimelineEntry =
+  | { kind: "item"; item: TimelineItem }
+  | { kind: "group"; id: string; items: TimelineItem[] };
+
+function groupTimeline(items: TimelineItem[]): TimelineEntry[] {
+  const entries: TimelineEntry[] = [];
+  let pending: TimelineItem[] = [];
+  const flush = () => {
+    const first = pending[0];
+    if (first !== undefined) {
+      entries.push({ kind: "group", id: `progress-${first.eventId}`, items: pending });
+    }
+    pending = [];
+  };
+  for (const item of items) {
+    if (item.kind === "user" || item.kind === "assistant") {
+      flush();
+      entries.push({ kind: "item", item });
+    } else {
+      pending.push(item);
+    }
+  }
+  flush();
+  return entries;
+}
+
+function toggleGroup(current: ReadonlySet<string>, id: string): ReadonlySet<string> {
+  const next = new Set(current);
+  if (next.has(id)) next.delete(id);
+  else next.add(id);
+  return next;
+}
+
+function StatusRow({
+  item,
+  theme,
+}: {
+  item: TimelineItem;
+  theme: RivetTheme;
+}) {
+  return (
+    <box flexDirection="row" minHeight={1}>
+      <text
+        width={2}
+        fg={statusColor(item.status, theme)}
+        content={statusIcon(item.status)}
+      />
+      <text fg={theme.textSecondary} content={item.title} />
+      {item.detail ? (
+        <text fg={theme.textMuted} content={`  ${item.detail}`} />
+      ) : null}
     </box>
   );
 }

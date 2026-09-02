@@ -101,12 +101,33 @@ export function createAppCommandActions(
       return false;
     }
     if (
+      command?.name === "fix" &&
+      !environment.commandContext.acceptanceReady &&
+      outcome.kind === "worker"
+    ) {
+      environment.pushOverlay({
+        kind: "confirm",
+        command,
+        outcome: {
+          ...outcome,
+          params: { ...outcome.params, candidate_only: true },
+        },
+        displayInput: value,
+        title: "独立验收尚未就绪",
+        description: "本次只能生成候选补丁：无 Evidence、不可 Apply，也不能声明修复完成",
+        impact: `${environment.rivetState.acceptanceReason}。继续会产生模型费用，但不会运行 Verify、不会生成 Evidence，事务也不能 Apply。下一步：${environment.rivetState.acceptanceAction}`,
+      });
+      return false;
+    }
+    if (
       command?.dangerous ||
-      (command?.name === "modules" && /^\s*(disable|sleep)\b/.test(value.slice(8)))
+      (command?.name === "modules" && /^\s*disable\b/.test(value.slice(8)))
     ) {
       const confirmedOutcome =
         command?.name === "modules" && outcome.kind === "worker"
           ? { ...outcome, params: { ...outcome.params, confirmed: true } }
+          : command?.name === "init" && outcome.kind === "worker"
+            ? { ...outcome, params: { ...outcome.params, confirmed: true } }
           : outcome;
       environment.pushOverlay({
         kind: "confirm",
@@ -125,6 +146,8 @@ export function createAppCommandActions(
     command: CommandDescriptor | null,
   ) {
     closeAllTransientOverlays();
+    const commandMode = command === null ? null : parseMode(command.name);
+    if (commandMode !== null) environment.setMode(commandMode);
     if (command !== null) rememberCommand(command, displayInput);
     if (outcome.kind === "ui") {
       environment.setInput("");
@@ -277,6 +300,7 @@ export function createAppCommandActions(
     if (panel !== null) {
       environment.setScreen("session");
       environment.setOpenPanel(panel);
+      if (panel === "Evidence") environment.setSelectedIndex(0);
     }
   }
 
@@ -292,6 +316,8 @@ export function createAppCommandActions(
       environment.setInlineError(availability.reason);
       return;
     }
+    const commandMode = parseMode(command.name);
+    if (commandMode !== null) environment.setMode(commandMode);
     if (autocomplete || commandNeedsArgument(command)) {
       environment.setInput(
         `/${command.name}${command.argumentKind === "none" ? "" : " "}`,

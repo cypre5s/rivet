@@ -102,7 +102,7 @@ export function useCommandOptions({
             .map((transaction) => transaction.transactionId)
             .filter((transactionId) => transactionId !== state.transaction),
         ],
-        modules: state.modules,
+        modules: state.taskModules,
         moduleStatuses: state.moduleStatuses,
         files,
         contextFiles,
@@ -116,7 +116,7 @@ export function useCommandOptions({
         id: value,
         title: value,
         ...(unavailableReason === null
-          ? topOverlay.commandName === "modules" && /^(disable|sleep)\b/.test(value)
+          ? topOverlay.commandName === "modules" && /^disable\b/.test(value)
             ? { description: "高影响操作 · 执行前需要确认" }
             : {}
           : { available: false, description: unavailableReason }),
@@ -127,7 +127,7 @@ export function useCommandOptions({
     contextFiles,
     files,
     models,
-    state.modules,
+    state.taskModules,
     state.moduleStatuses,
     state.sessions,
     state.transaction,

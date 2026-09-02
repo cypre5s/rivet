@@ -10,6 +10,7 @@ const commandContext = {
   transactionId: "tx_one",
   verificationStatus: "PASSED",
   evidenceId: "evidence_one",
+  acceptanceReady: true,
 };
 
 const permissionEvent: IpcEvent = {

@@ -25,7 +25,12 @@ describe("trace event presentation", () => {
       presentTraceEvent(
         event("module.activated", { module_id: "context.syntax" }),
       ).title,
-    ).toBe("已启用 context.syntax");
+    ).toBe("已激活 context.syntax");
+    expect(
+      presentTraceEvent(
+        event("module.released", { module_id: "context.syntax" }),
+      ).title,
+    ).toBe("已释放 context.syntax");
     expect(
       presentTraceEvent(
         event("verification.completed", { status: "PASSED" }),

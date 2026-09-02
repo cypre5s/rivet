@@ -23,7 +23,7 @@ export function createPaletteResources(
   }
   const moduleIds = state.moduleStatuses.length
     ? state.moduleStatuses.map((status) => status.moduleId)
-    : state.modules;
+    : state.taskModules;
   for (const [index, moduleId] of moduleIds.slice(0, 8).entries()) {
     resources.push(
       resource("modules", moduleId, `查看 ${moduleId}`, `module-${index}`),

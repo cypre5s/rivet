@@ -14,7 +14,7 @@ const EVENT_TITLES: Record<string, string> = {
   "worker.ready": "Rivet 已就绪",
   "worker.recovered": "Rivet 已恢复连接",
   "worker.stopping": "正在安全退出",
-  "module.activated": "已启用按需模块",
+  "module.activated": "按需能力已激活",
   "module.slept": "按需模块已休眠",
   "module.operation.requested": "模块操作已请求",
   "module.operation.started": "正在执行模块操作",
@@ -24,6 +24,10 @@ const EVENT_TITLES: Record<string, string> = {
   "module.operation.blocked": "模块操作被安全边界阻止",
   "module.operation.failed": "模块操作失败",
   "modules.snapshot": "模块状态已刷新",
+  "module.requested": "任务请求按需能力",
+  "module.released": "任务已释放按需能力",
+  "module.activation_failed": "按需能力激活失败",
+  "module.release_failed": "按需能力释放失败",
   "context.selected": "已选择相关上下文",
   "workspace.tree_updated": "仓库文件清单已更新",
   "tool.started": "正在执行工具",
@@ -34,8 +38,12 @@ const EVENT_TITLES: Record<string, string> = {
   "verification.started": "正在执行验证矩阵",
   "verification.completed": "验证已完成",
   "evidence.published": "验证证据已发布",
+  "evidence.snapshot": "Evidence 完整性已复核",
+  "evidence.log": "验证日志已按需加载",
+  "candidate.ready": "候选补丁已保存（不可 Apply）",
   "permission.requested": "需要确认受限操作",
   "permission.resolved": "权限请求已处理",
+  "agent.output.delta": "正在生成回复",
   "agent.answered": "回复已生成",
   "agent.planned": "计划已生成",
   "agent.patch_ready": "补丁生成完成，等待独立验证",
@@ -52,7 +60,10 @@ const EVENT_TITLES: Record<string, string> = {
 
 export function presentTraceEvent(event: IpcEvent): PresentedEvent {
   const payload = event.payload;
-  const explicitSummary = text(payload.summary) || text(payload.human_message);
+  const explicitSummary =
+    (event.event_type === "agent.output.delta" ? text(payload.content) : "") ||
+    text(payload.summary) ||
+    text(payload.human_message);
   const suggestedAction = text(payload.suggested_action);
   const title = specializedTitle(event.event_type, payload) ?? EVENT_TITLES[event.event_type] ?? "运行状态已更新";
   const detailParts = [
@@ -73,7 +84,15 @@ function specializedTitle(
 ): string | null {
   if (eventType === "module.activated") {
     const moduleId = text(payload.module_id);
-    return moduleId ? `已启用 ${moduleId}` : null;
+    return moduleId ? `已激活 ${moduleId}` : null;
+  }
+  if (eventType === "module.requested") {
+    const moduleId = text(payload.module_id);
+    return moduleId ? `正在请求 ${moduleId}` : null;
+  }
+  if (eventType === "module.released") {
+    const moduleId = text(payload.module_id);
+    return moduleId ? `已释放 ${moduleId}` : null;
   }
   if (eventType === "module.slept") {
     const moduleId = text(payload.module_id);
@@ -126,6 +145,7 @@ function specializedTitle(
 
 function eventKind(eventType: string): TimelineKind {
   if (
+    eventType === "agent.output.delta" ||
     eventType === "agent.completed" ||
     eventType === "agent.answered" ||
     eventType === "agent.planned"
@@ -141,6 +161,7 @@ function eventStatus(
   payload: Record<string, JsonValue>,
 ): TimelineStatus {
   const status = text(payload.status).toUpperCase();
+  if (eventType === "agent.output.delta") return "running";
   if (status === "READY_FOR_VERIFICATION") return "running";
   if (eventType.endsWith("started") || status === "RUNNING") return "running";
   if (eventType.includes("cancel") || status === "CANCELLED") return "cancelled";

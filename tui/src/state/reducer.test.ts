@@ -76,11 +76,11 @@ describe("Trace-driven reducer", () => {
     expect(state.evidenceId).toBe("evidence_one");
     expect(state.evidence?.changedFiles).toEqual(["calculator.py"]);
     expect(state.evidence?.changedSymbols).toEqual(["total_with_tax"]);
-    expect(state.evidence?.verificationResults).toEqual([
+    expect(state.evidence?.verificationResults).toMatchObject([
       { kind: "V0_ENVIRONMENT", status: "PASSED" },
       { kind: "V10_RESOURCE", status: "PASSED" },
     ]);
-    expect(state.modules).toEqual(["reader.pdf"]);
+    expect(state.taskModules).toEqual(["reader.pdf"]);
     expect(state.budget.tokens).toBe(120);
     expect(state.timeline).toHaveLength(7);
     expect(state.timeline[0]?.title).toBe("Rivet 已就绪");
@@ -122,6 +122,67 @@ describe("Trace-driven reducer", () => {
     state = reduceTraceEvent(state, event(3, "worker.recovered", {}));
     expect(state.connection).toBe("ready");
     expect(state.error).toBeNull();
+  });
+
+  test("clears a recovered tool error when the overall command completes", () => {
+    let state = reduceTraceEvent(
+      initialRivetState(),
+      event(0, "tool.failed", { summary: "目录工具失败" }),
+    );
+    expect(state.error).toBe("目录工具失败");
+
+    state = reduceTraceEvent(
+      state,
+      event(1, "command.completed", { summary: "/plan 已完成" }),
+    );
+
+    expect(state.error).toBeNull();
+    expect(state.timeline.map((item) => item.status)).toEqual([
+      "failed",
+      "success",
+    ]);
+  });
+
+  test("updates one assistant item from cumulative stream snapshots and finalizes it", () => {
+    let state = reduceTraceEvent(
+      initialRivetState(),
+      event(0, "agent.output.delta", {
+        response_id: "response_one",
+        content: "正在分析",
+        summary: "模型回复正在生成",
+      }),
+    );
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({
+      kind: "assistant",
+      status: "running",
+      detail: "正在分析",
+    });
+
+    state = reduceTraceEvent(
+      state,
+      event(1, "agent.output.delta", {
+        response_id: "response_one",
+        content: "正在分析仓库。",
+      }),
+    );
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]?.detail).toBe("正在分析仓库。");
+
+    state = reduceTraceEvent(
+      state,
+      event(2, "agent.answered", {
+        response_id: "response_one",
+        status: "ANSWERED",
+        summary: "正在分析仓库。结论如下。",
+      }),
+    );
+    expect(state.timeline).toHaveLength(1);
+    expect(state.timeline[0]).toMatchObject({
+      kind: "assistant",
+      status: "success",
+      detail: "正在分析仓库。结论如下。",
+    });
   });
 
   test("transport status does not consume the worker trace sequence", () => {
@@ -182,7 +243,7 @@ describe("Trace-driven reducer", () => {
       }),
     );
 
-    expect(state.transactions).toEqual([
+    expect(state.transactions).toMatchObject([
       {
         transactionId: "tx_verified",
         state: "VERIFIED",
@@ -203,6 +264,8 @@ describe("Trace-driven reducer", () => {
         modules: [
           {
             module_id: "context.syntax",
+            policy: "ENABLED",
+            availability: "AVAILABLE",
             manifest_default_enabled: true,
             persisted_override: null,
             configured_enabled: true,
@@ -225,17 +288,31 @@ describe("Trace-driven reducer", () => {
 
     expect(state.moduleStatuses[0]?.moduleId).toBe("context.syntax");
     expect(state.moduleStatuses[0]?.dependencies).toEqual(["context.lexical"]);
-    expect(state.modules).toEqual([]);
+    expect(state.taskModules).toEqual([]);
 
     state = reduceTraceEvent(
       state,
       event(1, "module.operation.completed", {
         module_id: "context.syntax",
-        current_state: "ACTIVE",
-        effective_enabled: true,
+        operation: "disable",
+        current_state: "INACTIVE",
+        effective_enabled: false,
       }),
     );
-    expect(state.moduleStatuses[0]?.runtimeState).toBe("ACTIVE");
-    expect(state.modules).toEqual(["context.syntax"]);
+    expect(state.moduleStatuses[0]?.policy).toBe("DISABLED");
+    expect(state.moduleStatuses[0]?.configuredEnabled).toBeFalse();
+    expect(state.taskModules).toEqual([]);
+
+    state = reduceTraceEvent(
+      state,
+      event(2, "module.activated", { module_id: "context.syntax" }),
+    );
+    expect(state.taskModules).toEqual(["context.syntax"]);
+
+    state = reduceTraceEvent(
+      state,
+      event(3, "module.released", { module_id: "context.syntax" }),
+    );
+    expect(state.taskModules).toEqual([]);
   });
 });

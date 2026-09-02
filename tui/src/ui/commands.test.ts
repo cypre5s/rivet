@@ -60,6 +60,7 @@ describe("TUI command input", () => {
       transactionId: "tx_one",
       verificationStatus: "PASSED",
       evidenceId: "evidence_one",
+      acceptanceReady: true,
     })).toMatchObject({ kind: "worker", method: "command.apply" });
   });
 
@@ -114,6 +115,7 @@ describe("TUI command input", () => {
         transactionId: "tx_verified",
         verificationStatus: "PASSED",
         evidenceId: "evidence_one",
+        acceptanceReady: true,
       }),
     ).toThrow("只有验证通过的事务可以应用");
     expect(
@@ -124,6 +126,7 @@ describe("TUI command input", () => {
         transactionId: "tx_current",
         verificationStatus: "FAILED",
         evidenceId: null,
+        acceptanceReady: true,
         transactionStates: { tx_historical: "VERIFIED" },
       }),
     ).toEqual({
@@ -166,8 +169,6 @@ describe("TUI command input", () => {
     expect(commandArgumentCompletions("modules", "reader", sources)).toEqual([
       "show reader.pdf",
       "enable reader.pdf",
-      "wake reader.pdf",
-      "sleep reader.pdf",
       "disable reader.pdf",
     ]);
     expect(commandArgumentCompletions("context", "app", sources)).toEqual([
@@ -182,9 +183,11 @@ describe("TUI command input", () => {
     expect(commandArgumentRequest("/ask explain this")).toBeNull();
   });
 
-  test("keeps protected module actions visible with an explicit reason", () => {
+  test("keeps Kernel-managed capabilities out of policy mutations", () => {
     const status = {
       moduleId: "kernel.required",
+      policy: "LOCKED",
+      availability: "AVAILABLE",
       manifestDefaultEnabled: true,
       persistedOverride: null,
       configuredEnabled: true,
@@ -211,10 +214,9 @@ describe("TUI command input", () => {
       contextFiles: [],
     });
 
-    expect(completions).toContain("sleep kernel.required");
-    expect(completions).toContain("disable kernel.required");
+    expect(completions).toEqual(["show kernel.required"]);
     expect(
-      moduleCommandUnavailableReason("sleep kernel.required", [status]),
+      moduleCommandUnavailableReason("disable kernel.required", [status]),
     ).toContain("系统必需");
   });
 });

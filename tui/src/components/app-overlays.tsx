@@ -185,9 +185,9 @@ export function AppOverlays({
       ) : null}
       {overlay?.kind === "confirm" ? (
         <ConfirmDialog
-          title={overlay.command.title}
-          description={overlay.command.description}
-          impact={dangerousImpact(overlay.command.name, state)}
+          title={overlay.title ?? overlay.command.title}
+          description={overlay.description ?? overlay.command.description}
+          impact={overlay.impact ?? dangerousImpact(overlay.command.name, state)}
           compact={compact}
           viewportHeight={viewportHeight}
           theme={theme}

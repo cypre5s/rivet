@@ -23,6 +23,9 @@ export type Overlay =
       command: CommandDescriptor;
       outcome: CommandOutcome;
       displayInput: string;
+      title?: string;
+      description?: string;
+      impact?: string;
     };
 
 export const MODES: readonly WorkMode[] = ["ASK", "PLAN", "FIX"];
@@ -75,6 +78,18 @@ export function hasArgumentChoices(command: CommandDescriptor): boolean {
 export function parseMode(value: string): WorkMode | null {
   const normalized = value.trim().toUpperCase();
   return MODES.includes(normalized as WorkMode) ? (normalized as WorkMode) : null;
+}
+
+export function explicitTaskMode(value: string): WorkMode | null {
+  const match = /^\/(ask|plan|fix)(?=\s|$)/i.exec(value.trimStart());
+  return match?.[1] === undefined ? null : parseMode(match[1]);
+}
+
+export function replaceExplicitTaskMode(value: string, mode: WorkMode): string {
+  return value.replace(
+    /^(\s*)\/(?:ask|plan|fix)(?=\s|$)/i,
+    `$1/${mode.toLocaleLowerCase()}`,
+  );
 }
 
 export function panelForAction(
@@ -132,7 +147,7 @@ export function dangerousImpact(command: string, state: RivetState): string {
   if (command === "abort") return `隔离事务 · ${state.transaction}`;
   if (command === "clean") return "仅带 Rivet ownership marker 的运行产物";
   if (command === "init") return "当前仓库的 .rivet 项目配置";
-  if (command === "modules") return "所选模块、活动 Lease 与依赖关系";
+  if (command === "modules") return "能力启用策略、可用性与依赖关系";
   return "当前命令声明的受控范围";
 }
 
@@ -141,6 +156,7 @@ export function keyHelpLines(): string[] {
     "Ctrl+P      全局命令面板",
     "Ctrl+O      文件选择器",
     "Ctrl+R      输入历史",
+    "↑ / ↓       快速复用历史输入",
     "Ctrl+K      快速选择已配置模型",
     "Ctrl+G      连接、Key 与模型配置",
     "Ctrl+X      Leader 快捷键",
@@ -165,6 +181,7 @@ export function statusLines(
     `阶段：${running ? "RUNNING" : state.plan.phase}`,
     `模型：${state.model}（${state.models.length} 个可用）`,
     `凭据：${state.credentialConfigured ? "当前会话已配置" : "未配置"}`,
+    `独立验收：${state.acceptanceReady ? "READY" : "NOT READY"}`,
     `会话：${state.sessionId ?? "无"}`,
     `事务：${state.transaction}`,
     `验证：${state.verifyStatus}`,
