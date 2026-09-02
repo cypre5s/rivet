@@ -2,133 +2,398 @@
 
 # RIVET
 
-**A lightweight coding agent that verifies before it applies.**
+**A demand-driven coding agent that verifies before it applies.**
 
-轻量且可靠的本地编程智能体：按需运行，验证后应用。
+没有真实 Demand，就不激活能力。没有独立 Evidence，就不允许 Apply。
 
 <a href="pyproject.toml"><img alt="Python 3.13" src="https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square&logo=python&logoColor=white"></a>
 <a href="tui/package.json"><img alt="Bun 1.4" src="https://img.shields.io/badge/Bun-1.4-14151A?style=flat-square&logo=bun&logoColor=white"></a>
-<a href=".github/workflows/ci.yml"><img alt="Ubuntu 24.04" src="https://img.shields.io/badge/Ubuntu-24.04-E95420?style=flat-square&logo=ubuntu&logoColor=white"></a>
-<a href="#1-lightweight-by-design"><img alt="Modules on demand" src="https://img.shields.io/badge/Modules-On--demand-67D4E8?style=flat-square"></a>
-<a href="#2-reliable-by-evidence"><img alt="Verify V0–V10" src="https://img.shields.io/badge/Verify-V0--V10-7FCF9B?style=flat-square"></a>
+<a href="#demand-driven-kernel"><img alt="Demand-driven Kernel" src="https://img.shields.io/badge/Kernel-Demand--driven-65D1E6?style=flat-square"></a>
+<a href="#evidence-gated-patching"><img alt="Evidence-gated Apply" src="https://img.shields.io/badge/Apply-Evidence--gated-79C99E?style=flat-square"></a>
 <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/License-MIT-2ea44f?style=flat-square"></a>
 
 <p>
-  <a href="#核心设计">核心设计</a> ·
-  <a href="#运行界面">运行界面</a> ·
+  <a href="#为什么是-rivet">设计动机</a> ·
   <a href="#快速开始">快速开始</a> ·
-  <a href="#命令与运行要求">命令与运行要求</a>
+  <a href="#一次可靠修复">修复流程</a> ·
+  <a href="#验证与审计">验证与审计</a>
 </p>
 
 </div>
 
 <p align="center">
-  <img src="docs/images/rivet-home.png" alt="Rivet OpenTUI 欢迎页，显示 ASK 模式、模型与仓库连接状态" width="900" />
+  <img src="docs/images/rivet-home.png" alt="Rivet 当前 OpenTUI 欢迎页" width="900" />
 </p>
 
-## Rivet 是什么
+Rivet 是一个本地 Coding Agent，但它不追求堆叠功能。项目只保留两个能够形成完整证明链的能力：
 
-Rivet 是一个轻量且可靠的本地编程智能体：通过 Agent Kernel 与按需模块控制运行成本，通过隔离事务与证据驱动验证保障代码修改可信。
+1. **Demand-driven Lightweight Kernel**：只有用户或模型产生真实需求，相关能力才会被激活；
+2. **Evidence-gated Reliable Patching**：模型只能生成候选补丁，独立验证通过并形成 Evidence 后，用户才能显式 Apply。
 
-## 核心设计
+这两个约束贯穿 Kernel、工具、事务、验证、Trace、CLI 和 TUI。Rivet 的目标不是让“模型说修好了”，而是让一次代码修改能够回答：为什么启动了这个能力、修改边界是什么、验证了什么，以及最终应用的是否正是那份通过验证的补丁。
 
-Rivet 只有两个并列的核心目标：让 Agent 在能力增长时仍保持轻量，以及让它交付的代码修改可以被独立复核。Agent Kernel 与 On-demand Modules 共同实现第一个目标，并不是两个彼此分离的产品方向。
+## 为什么是 Rivet
 
-[Aider](https://github.com/Aider-AI/aider) 强调终端结对编程、仓库地图与 Git 集成，[OpenCode](https://github.com/anomalyco/opencode) 提供终端编程智能体，[OpenHands](https://github.com/OpenHands/OpenHands) 面向多后端的自托管开发平台，[goose](https://github.com/aaif-goose/goose) 则覆盖多种 Provider 与扩展。Rivet 选择了不同的核心约束：不以集成数量作为主要差异，而是让运行成本随本次实际启用的能力增长，并让补丁在独立证据通过前无法进入主工作区。
+Coding Agent 同时面临两类常见问题：
 
-### 1. Lightweight by Design
+| 问题 | Rivet 的约束 | 落地方式 |
+| --- | --- | --- |
+| 简单任务也启动完整工具链 | **No Demand, No Activation** | 静态 ToolCatalog、CapabilityDemand、惰性 ModuleRuntime |
+| 可选能力缺失阻塞无关任务 | 前置条件在使用时检查 | Provider、Context、Git、Guard、Verify 分别按需激活 |
+| 异常退出遗留进程或 Worktree | 每项资源都有明确所有者 | Lease、ResourceScope、逆序释放、失败后继续清理 |
+| 模型自述被当成修复成功 | **Model cannot produce VERIFIED** | 模型最高只能返回 `READY_FOR_VERIFICATION` |
+| 补丁越界或验证对象发生漂移 | 冻结并绑定验收边界 | AcceptanceSpec、Base、Patch、Evidence 哈希链 |
+| 自动修改直接污染主工作区 | 候选与主工作区分离 | Git Worktree Transaction、显式 Apply |
+| 崩溃后无法判断是否已应用 | 副作用事实必须可恢复 | Apply Intent、最小 Checkpoint、确定性恢复 |
 
-`Rivet Kernel + On-demand Modules` 的目的不是减少功能，而是避免为尚未使用的功能预付启动时间、内存、进程和依赖成本。
+Rivet 因此刻意不提供 Reader 平台、Tree-sitter/LSP 语义层、Session Resume、用户模块管理、Plan 模式、Benchmark/Doctor/Export 产品命令或动态工具插件。它们不是两条核心闭环的必要组成部分。
 
-- **设计目的：** 启动时只保留轻量而确定的控制面，让一次简单问答无需同时启动代码索引、LSP、OCR、转录、Git Worktree 和完整验证链；任务变复杂时再逐项获得能力，使常驻成本不必随功能总量同步膨胀。
-- **设计依据：** [Anthropic 的 Agent 工程实践](https://www.anthropic.com/research/building-effective-agents)建议从满足需求的最简单方案开始，并指出更高自主性会带来额外延迟、成本和累积错误风险；[VS Code Activation Events](https://code.visualstudio.com/api/references/activation-events)也证明了按命令、语言或视图惰性激活大型能力的可行性。因此，轻量化应来自清晰的激活边界，而不是删掉必要能力或安全约束。
-- **解决的问题：** 传统 Coding Agent 容易随着 Reader、LSP、沙箱、事务和验证功能增加，把更多导入、后台进程、连接与生命周期耦合放进每次启动路径。结果是简单任务也承担完整工具链成本，可选依赖缺失会阻塞无关任务，异常退出后还可能留下进程、客户端、临时目录或 Worktree。
-- **实现方式：** 自研 `Rivet Kernel` 只负责 AgentLoop、工具协议、显式状态、预算、取消、Checkpoint、Trace 与资源所有权；Context、Reader、LSP、Transaction、Verify、Evidence、Guard 等以内置 `ON_DEMAND` 模块提供。启动阶段只解析 Manifest，不导入 capability factory、不实例化模块，也不启动其进程或连接；任务请求某项 capability 时，`ModuleRuntime` 才按依赖图激活最小闭包。`Lease` 保证使用中的模块不会休眠，释放后遵循模块空闲策略；手动休眠或任务关闭时按逆激活顺序清理 `ResourceScope`，并以资源归零检查结束生命周期。
+## Demand-driven Kernel
+
+### 唯一合法的 Demand 来源
+
+```text
+USER_EXPLICIT
+    └── MODEL_TOOL_CALL
+            └── KERNEL_REQUIRED
+                    └── module activation
+```
+
+- `USER_EXPLICIT` 是唯一合法根节点；
+- `MODEL_TOOL_CALL` 必须绑定工具调用 ID 和已持久化父 Demand；
+- `KERNEL_REQUIRED` 只能由 Kernel 为具体能力派生；
+- 模块激活必须引用同一条 Demand 链中的 `demand_id`、来源和 Capability。
+
+`demand.created` 会在激活前追加到 NDJSON Trace。记录失败时操作失败关闭，模块不会被导入或启动。CI 还会扫描内部 Permit 和 Runtime 私有入口，防止绕开 Demand 直接激活模块。
+
+### 六状态 AgentLoop
+
+Rivet 不把理解、规划或授权伪装成模型的固定认知阶段。AgentLoop 只保留真实控制流：
+
+```text
+MODEL_CALL
+  ├── FINAL ───────────────────────────────→ COMPLETE
+  └── TOOL_CALL → EXECUTE → OBSERVE ──────→ MODEL_CALL
+
+终止状态：FAILED / CANCELLED
+```
+
+授权仍然存在，但属于工具执行边界：
+
+```text
+ToolCall → Schema Validate → Demand → Authorize → Acquire → Execute → Release
+```
+
+### 固定的五个模块
+
+```text
+provider.deepseek   context.lexical   transaction.git
+guard.sandbox       verify.matrix
+```
+
+启动时只解析 Manifest，不导入模块 factory，也不会创建工作目录、网络连接、子进程或索引。`Lease` 保证使用中的能力不会被关闭；释放和异常路径会按确定性逆序回收完整依赖闭包。
+
+### 固定的九个工具
+
+```text
+workspace_info   context_search   file_read
+file_write       file_replace     file_create
+file_delete      process_run      git_diff
+```
+
+ToolCatalog 只保存名称、说明、JSON Schema、副作用级别、所需 Capability 和静态 executor key。它不导入执行实现。Context 只使用 `git ls-files`、ripgrep、路径/关键词排序和有界文本片段，不预建语义索引。
+
+## Evidence-gated Patching
+
+一次 FIX 必须穿过下面的完整状态链：
+
+```text
+只读调查
+  → Acceptance Proposal
+  → 用户确认 Proposal 哈希与 Git Base
+  → ACCEPTANCE_FROZEN
+  → 隔离 Git Worktree
+  → Candidate Patch
+  → READY_FOR_VERIFICATION
+  → Independent Verify
+  → Evidence Manifest
+  → VERIFIED
+  → Explicit Apply
+```
+
+### 冻结 AcceptanceSpec
+
+AcceptanceSpec 在第一个候选 Worktree 和第一项写操作之前冻结，包含：
+
+- 用户目标；
+- 允许读取的现有路径；
+- 允许修改的现有路径；
+- 允许新建的路径；
+- 禁止路径；
+- 预期行为与需要保留的行为；
+- 独立 Acceptance、Regression 和 Static argv；
+- 文件、轮次、Token、费用和进程预算。
+
+确认后的任务、范围、验证命令、Acceptance 哈希或 Git Base 发生任何漂移，事务都不会创建。
+
+### 独立 Verify
+
+验证不复用模型结论，也不允许 Provider、工具或事务管理器写出 `VERIFIED`。Verify Matrix 使用七类有明确含义的检查：
+
+| 检查 | 证明什么 |
+| --- | --- |
+| `Baseline` | 修改前确实能够复现目标问题 |
+| `Behavior` | 候选补丁满足独立行为验收 |
+| `Regression` | 已冻结的回归和静态命令继续通过 |
+| `Scope` | 修改仅发生在获准范围内 |
+| `Secret` | 补丁没有引入凭据或危险内容 |
+| `Binding` | 每条验收声明都有对应执行证据 |
+| `Resource` | Worktree、Patch 与资源状态一致且无泄漏 |
+
+Evidence 原子发布，并绑定：
+
+```text
+base_commit
+acceptance_sha256
+patch_sha256
+manifest_sha256
+changed_files
+verification_results
+```
+
+Apply 前会再次验证整条哈希链和主仓库漂移。持久化 Apply Intent 用于处理“Git 已应用，但最终状态记录尚未落盘”的崩溃窗口；此时 `abort` 会拒绝破坏现场，重试 `apply` 会恢复确定事实。
+
+## 交互界面
+
+不带子命令会启动 OpenTUI。普通输入就是 ASK，`/fix` 进入可靠修复流程，`@` 只选择只读上下文。
+
+```bash
+uv run rivet
+```
+
+Slash 菜单固定为七项，不存在隐藏的 Plan、Session、Module 或配置中心：
 
 <p align="center">
-  <img src="docs/images/rivet-running.png" alt="Rivet ASK 任务只按需激活 Provider、Guard 与 lexical Context 模块" width="900" />
-  <br />
-  <sub>ASK 任务只激活当前需要的 Provider、Guard 与 lexical Context，未使用能力不进入运行路径。</sub>
+  <img src="docs/images/rivet-slash-commands.png" alt="Rivet 当前七项 Slash 命令" width="900" />
 </p>
 
-### 2. Reliable by Evidence
+```text
+/help  /model  /fix  /diff  /verify  /apply  /abort
+```
 
-可靠修补的判断依据不是模型说“已经完成”，而是隔离环境中能够重放、校验并绑定到当前补丁的本地证据。
-
-- **设计目的：** 在自动修改前固定目标与边界，在修改期间保护主工作区，在修改后用独立验证决定能否交付。模型负责理解、规划和生成候选补丁，但没有权限把自己的文本结论升级成 `VERIFIED`。
-- **设计依据：** [NIST AI 600-1](https://www.nist.gov/publications/artificial-intelligence-risk-management-framework-generative-artificial-intelligence)将自信但错误的生成内容与人类的自动化偏见列为生成式 AI 风险，并强调部署前测试、验证及评估记录；[MCP 工具安全规范](https://modelcontextprotocol.io/specification/2025-06-18/server/tools)要求校验输入与结果、实施访问控制，并让用户能够确认敏感操作。代码修改具有真实副作用，因此“生成补丁”和“证明补丁可交付”必须由不同边界完成。
-- **解决的问题：** 避免 Agent 因上下文不足找错代码、直接污染主工作区、越过任务范围修改相邻文件，或把模型自述和一次有限测试通过误当成完整修复；同时避免验证结果无法追溯到确切的 AcceptanceSpec、补丁字节和执行记录，导致用户无法判断 Apply 是否安全。
-- **实现方式：** Context 按 `L0 仓库清单 → L1 词法检索 → 必要时 L2 Tree-sitter → 精确语义需要时 L3 LSP` 逐级取证；写入前显式确认并冻结带哈希的 `AcceptanceSpec`，将读范围、写范围、允许新建路径和禁止路径分离。所有自动修改发生在独立 [Git Worktree](https://git-scm.com/docs/git-worktree)，主工作区在 Apply 前保持不变；模型停止时，`fix` 最多进入 `READY_FOR_VERIFICATION`。随后 `Rivet Verify` 独立执行 V0–V10，覆盖基线、目标与回归测试、静态检查、范围、秘密和资源门禁，并把结论、命令、Diff、changed symbols 与逐文件哈希写入原子发布的 `Evidence Bundle`。只有 Evidence 与 AcceptanceSpec、Patch 三重绑定且状态为 `VERIFIED` 的事务，才能由用户显式执行 `rivet apply`。
-
-<p align="center">
-  <img src="docs/images/rivet-verified.png" alt="Rivet FIX 事务通过 V0–V10 后发布 Evidence 并等待用户显式 Apply" width="900" />
-  <br />
-  <sub>模型只生成候选补丁；独立验证与哈希 Evidence 通过后，事务才进入 VERIFIED 并等待显式 Apply。</sub>
-</p>
-
-## 运行界面
-
-输入 `/` 查看可用操作、快捷键、参数提示和当前状态。
-
-<p align="center">
-  <img src="docs/images/rivet-slash-commands.png" alt="Rivet Slash Command 菜单，显示命令、快捷键与可用状态" width="850" />
-</p>
-
-Reader 的真实结果会标记不可信文件内容，并保留命令与完成状态。
-
-<p align="center">
-  <img src="docs/images/rivet-result.png" alt="Rivet Reader 读取文件后的结果时间线" width="850" />
-</p>
+TUI 只保留 Welcome、Timeline、Composer、Slash Menu、`@` 文件选择、Diff、Evidence、权限确认、模型选择和 Transaction 选择。权限面板会分别展示读范围、写范围、新建范围、禁止路径、预期行为、验证命令和预算。
 
 ## 快速开始
 
-当前仓库为 Private，克隆前需要相应的 GitHub 访问权限。Ubuntu 24.04 上从源码启动：
+### 环境要求
+
+- Python `3.13.x`；
+- [uv](https://docs.astral.sh/uv/)；
+- Git 与 ripgrep；
+- Bubblewrap：受管写入和本地进程执行时需要；
+- Bun `1.4.x`：只在使用 TUI 时需要。
+
+### 安装
 
 ```bash
 git clone https://github.com/cypre5s/rivet.git
 cd rivet
-uv sync --all-extras --dev --frozen
+
+uv sync --frozen
 bun install --cwd tui --frozen-lockfile
+```
 
+只在真正调用 DeepSeek Provider 时才需要凭据：
+
+```bash
 export DEEPSEEK_API_KEY="your-api-key"
-uv run rivet
 ```
 
-不启动 TUI 时可直接提问：
+### 初始化独立验收
+
+`init` 先只读检测候选命令；只有显式确认才会写入最小模板：
 
 ```bash
-uv run rivet ask "解释当前仓库的结构"
+uv run rivet init
+uv run rivet init --yes
 ```
 
-一次隔离修改工作流如下；将 `<transaction_id>` 替换为 `fix` 输出的事务 ID：
+仓库内唯一的 Rivet 文件是 `.rivet/project.toml`：
+
+```toml
+schema_version = 1
+
+[rivet]
+model = "deepseek-v4-flash"
+
+[verification]
+acceptance = [["uv", "run", "pytest", "tests/test_bug.py", "-q"]]
+regression = [["uv", "run", "pytest", "-q"]]
+static = []
+```
+
+所有验证命令都必须是 argv 数组，不接受 shell 字符串。`acceptance` 必须由用户审查并直接判断目标行为；Rivet 不会自动采信模型生成的测试作为独立 oracle。
+
+## 一次可靠修复
+
+### 1. 获取只读 Proposal
+
+第一次调用只调查代码并返回冻结候选，不创建事务或 Worktree：
 
 ```bash
-uv run rivet plan "修复 demo/calculator-fix 中失败的测试"
-uv run rivet fix --yes \
-  --allow-write demo/calculator-fix/calculator.py \
-  "修复 demo/calculator-fix 中失败的测试"
-uv run rivet verify
-uv run rivet diff
+uv run rivet fix \
+  --allow-read tests/test_port.py \
+  --allow-write src/port.py \
+  --allow-new tests/test_port_regression.py \
+  "拒绝 1..65535 之外的端口"
+```
+
+输出会包含 Proposal、`acceptance_sha256` 和 `base_commit`。
+
+### 2. 显式确认同一份 Proposal
+
+```bash
+uv run rivet fix \
+  --allow-read tests/test_port.py \
+  --allow-write src/port.py \
+  --allow-new tests/test_port_regression.py \
+  --yes \
+  --acceptance-sha256 'sha256:<proposal digest>' \
+  --base-commit '<proposal base commit>' \
+  "拒绝 1..65535 之外的端口"
+```
+
+TUI 会自动完成这次绑定重放，但仍会展示完整权限确认。
+
+### 3. 审查、验证、应用
+
+```bash
+uv run rivet diff <transaction_id>
+uv run rivet verify <transaction_id>
 uv run rivet apply <transaction_id>
 ```
 
-## 命令与运行要求
+`fix` 已自动执行一次独立验证；`verify` 用于显式重验。只有当前事务为 `VERIFIED`、Evidence 完整且主仓库没有漂移时，`apply` 才会成功。
 
-| 命令 | 作用 |
+不再需要候选时：
+
+```bash
+uv run rivet abort <transaction_id>
+```
+
+## Headless CLI
+
+公开命令精确为七个：
+
+| 命令 | 作用 | 是否需要 Provider |
+| --- | --- | --- |
+| `rivet init` | 检测并确认最小验证配置 | 否 |
+| `rivet ask` | 只读询问仓库 | 是 |
+| `rivet fix` | 提案、隔离修改和独立验证 | 是 |
+| `rivet diff [TX]` | 查看持久化候选 Patch | 否 |
+| `rivet verify [TX]` | 对候选重新执行独立验证 | 否 |
+| `rivet apply TX` | 显式应用 VERIFIED Patch | 否 |
+| `rivet abort TX` | 终止并清理未应用事务 | 否 |
+
+全局 `--json` 适合脚本集成；`--model`、`--base-url`、`--max-rounds`、`--max-total-tokens` 和 `--max-cost-usd` 提供有界运行时覆盖。
+
+## 状态、Trace 与恢复
+
+Rivet 不在仓库中写 Session 数据。状态与缓存遵循 XDG：
+
+```text
+$XDG_STATE_HOME/rivet/<repo-id>/
+├── trace/events.ndjson
+├── transactions/
+└── evidence/
+
+$XDG_CACHE_HOME/rivet/worktrees/
+```
+
+- Trace 是 append-only NDJSON；
+- Transaction、Patch、Evidence 和 Apply Intent 是跨进程恢复事实；
+- Worktree 是可由 Base + 持久 Patch 重建的缓存；
+- 普通搜索和读取不创建持久 Checkpoint；
+- 写入、进程和 Apply 只记录最小副作用状态。
+
+离线审计可以重新计算 Demand 可追溯率和孤儿激活数：
+
+```bash
+uv run python scripts/audit_trace.py \
+  "$XDG_STATE_HOME/rivet/<repo-id>/trace/events.ndjson"
+```
+
+通过条件固定为：
+
+```text
+Demand Traceability = 100%
+Orphan Activation = 0
+```
+
+## 验证与审计
+
+当前实现的发布门禁包括：
+
+```bash
+uv run pytest -q
+uv run ruff format --check .
+uv run ruff check .
+uv run basedpyright
+
+bun test --cwd tui
+bun run --cwd tui typecheck
+
+uv run python scripts/verify_architecture.py
+uv run python scripts/verify_dependencies.py
+uv run python scripts/verify_ipc_contracts.py
+uv run python scripts/verify_secrets.py
+uv run python scripts/verify_licenses.py
+```
+
+开发期离线矩阵和固定 Release Demo 不进入产品 CLI：
+
+```bash
+uv run python scripts/run_benchmark.py --suite all --output /tmp/rivet-benchmark.json
+uv run python scripts/run_release_demo.py \
+  --bwrap-path /usr/bin/bwrap \
+  --result /tmp/rivet-release-demo.json
+```
+
+本次重构的最终本地验收结果：
+
+| 门禁 | 结果 |
 | --- | --- |
-| `rivet ask` | 只读理解和回答 |
-| `rivet plan` | 生成可验证计划 |
-| `rivet fix` | 在隔离事务中修改代码 |
-| `rivet verify` | 验证当前事务 |
-| `rivet diff` | 查看事务补丁 |
-| `rivet apply` | 应用通过验证的事务 |
-| `rivet read` | 安全读取项目文件 |
-| `rivet modules` | 查看和管理按需模块 |
+| Python | `493 passed`, 仅真实 API smoke 按设计跳过 |
+| TUI | `63 passed`，TypeScript typecheck 通过 |
+| 离线功能矩阵 | 48 次运行，误放行 0、主工作区污染 0、资源泄漏 0 |
+| 故障注入 | 5/5 通过 |
+| Release Demo | Patch → Verify → Evidence → Apply 全链路通过 |
+| Trace 审计 | Demand 可追溯率 100%，孤儿激活 0 |
 
-在 TUI 中输入 `/` 可以查看全部可用操作。
+离线录制 Provider 用于可复现架构验收，不代表真实模型的泛化质量；真实 DeepSeek smoke 必须显式启用并使用有效凭据。
 
-**基础运行依赖：** Ubuntu 24.04、Python 3.13、uv、Git、ripgrep 与 bubblewrap。OpenTUI 还需要 Bun 1.4.x 和已安装的 `tui` 依赖；Headless 命令不需要 Bun。
+## 项目结构
 
-**可选增强依赖：** Tesseract 与 Poppler 用于 OCR，ffprobe 用于补充媒体元数据；音视频转录还需要 `transcription` 可选依赖和已下载的本地 faster-whisper 模型。缺少增强依赖时 Reader 会返回明确的降级状态，不会虚构正文。
+```text
+src/rivet/
+├── cli/           # 七个公开命令与最小配置
+├── kernel/        # AgentLoop、Demand、Runtime、Lease、ResourceScope
+├── context/       # 仅词法检索
+├── tools/         # 静态 Catalog、执行器与九个工具处理器
+├── providers/     # DeepSeek Provider
+├── transaction/   # Acceptance、Git Worktree、Patch 与 Apply 恢复
+├── guard/         # Workspace 边界与 Bubblewrap
+├── verify/        # 七类验证和 Evidence
+├── trace/         # NDJSON、因果审计与恢复适配器
+└── ipc/           # TUI Worker 协议
 
-Rivet 使用 [MIT License](LICENSE)。
+tui/               # OpenTUI 前端
+scripts/           # 架构门禁、离线矩阵和 Release Demo
+tests/             # unit / integration / security / e2e / performance
+```
+
+更完整的架构不变量和取舍见 [Rivet v2 架构决策](docs/architecture/rivet-v2-decisions.md)。
+
+## License
+
+[MIT](LICENSE)
