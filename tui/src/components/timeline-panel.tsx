@@ -13,7 +13,7 @@ export function TimelinePanel({
   theme: RivetTheme;
   running: boolean;
 }) {
-  const visible = state.timeline.slice(-120);
+  const visible = state.timeline.filter(showInTimeline).slice(-120);
   const entries = useMemo(() => groupTimeline(visible), [visible]);
   const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(
     () => new Set(),
@@ -39,9 +39,7 @@ export function TimelinePanel({
       paddingY={1}
     >
       <scrollbox flexGrow={1} focused={false} stickyScroll={true} stickyStart="bottom">
-        {visible.length === 0 ? (
-          <text fg={theme.textMuted} content="提交任务后，执行步骤会显示在这里。" />
-        ) : (
+        {visible.length === 0 ? null : (
           entries.map((entry) => {
             if (entry.kind === "group") {
               const expanded = expandedGroups.has(entry.id);
@@ -59,7 +57,7 @@ export function TimelinePanel({
                   >
                     <text
                       fg={failed ? theme.warning : theme.accent}
-                      content={`${expanded ? "⌄" : "›"} 执行过程 · ${entry.items.length} 项${failed ? " · 需关注" : ""}`}
+                      content={`${expanded ? "⌄" : "›"} ${entry.items.length} 步${failed ? " · !" : ""}`}
                     />
                   </box>
                   {expanded
@@ -74,7 +72,7 @@ export function TimelinePanel({
             if (item.kind === "user") {
               return (
                 <box key={item.eventId} flexDirection="column" marginBottom={1}>
-                  <text fg={theme.textMuted} content="YOU" />
+                  <text fg={theme.textMuted} content="›" />
                   <text fg={theme.textPrimary} content={item.title} />
                 </box>
               );
@@ -82,7 +80,7 @@ export function TimelinePanel({
             if (item.kind === "assistant") {
               return (
                 <box key={item.eventId} flexDirection="column" marginBottom={1}>
-                  <text fg={theme.accent} content="RIVET" />
+                  <text fg={theme.accent} content="◆" />
                   <markdown
                     content={item.detail || item.title}
                     syntaxStyle={syntaxStyle}
@@ -99,10 +97,33 @@ export function TimelinePanel({
       {state.error === null ? null : (
         <text
           fg={theme.danger}
-          content={`${state.error}${state.connection === "crashed" ? "  Ctrl+Shift+R 恢复 Worker" : ""}`}
+          content={`${state.error}${state.connection === "crashed" ? " · Ctrl+Shift+R 重连" : ""}`}
         />
       )}
     </box>
+  );
+}
+
+const QUIET_TIMELINE_EVENTS = new Set([
+  "budget.updated",
+  "command.completed",
+  "config.updated",
+  "evidence.log",
+  "module.operation.requested",
+  "module.operation.started",
+  "module.state.changed",
+  "permission.resolved",
+  "plan.updated",
+  "run.completed",
+  "session.updated",
+  "worker.ready",
+  "workspace.tree_updated",
+]);
+
+function showInTimeline(item: TimelineItem): boolean {
+  return (
+    !item.eventType.endsWith(".snapshot") &&
+    !QUIET_TIMELINE_EVENTS.has(item.eventType)
   );
 }
 

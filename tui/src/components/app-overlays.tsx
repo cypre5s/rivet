@@ -115,8 +115,8 @@ export function AppOverlays({
       ) : null}
       {overlay?.kind === "history" ? (
         <OptionPicker
-          title="输入历史"
-          placeholder="搜索本次运行中的输入"
+          title="历史"
+          placeholder="搜索"
           query={display.overlayQuery}
           options={display.historyOptions}
           selectedIndex={display.selectedIndex}
@@ -130,8 +130,8 @@ export function AppOverlays({
       ) : null}
       {overlay?.kind === "models" ? (
         <OptionPicker
-          title="选择模型"
-          placeholder="搜索 Provider 或模型"
+          title="模型"
+          placeholder="搜索"
           query={display.overlayQuery}
           options={display.modelOptions}
           selectedIndex={display.selectedIndex}
@@ -159,8 +159,8 @@ export function AppOverlays({
       ) : null}
       {overlay?.kind === "arguments" && display.argumentRequest !== null ? (
         <OptionPicker
-          title={`/${overlay.commandName} 参数`}
-          placeholder="搜索可用参数"
+          title={`/${overlay.commandName}`}
+          placeholder="搜索"
           query={display.argumentRequest.query}
           options={display.argumentOptions}
           selectedIndex={display.selectedIndex}
@@ -180,6 +180,7 @@ export function AppOverlays({
           title={overlay.title}
           lines={overlay.lines}
           compact={compact}
+          viewportHeight={viewportHeight}
           theme={theme}
         />
       ) : null}

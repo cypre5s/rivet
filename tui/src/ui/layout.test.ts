@@ -12,18 +12,14 @@ describe("responsive terminal layout", () => {
     expect(computeLayout(160, 40).mode).toBe("wide");
   });
 
-  test("degrades logo and optional copy before hiding the composer", () => {
+  test("scales the brand and panels without adding layout-specific copy", () => {
     expect(computeLayout(40, 12)).toMatchObject({
       logoSize: "text",
       panelPresentation: "fullscreen",
       contentWidth: "100%",
-      showShortcutHints: false,
-      showTip: false,
     });
     expect(computeLayout(80, 24)).toMatchObject({
       panelPresentation: "drawer",
-      showShortcutHints: true,
-      showTip: true,
     });
     expect(computeLayout(120, 30)).toMatchObject({
       logoSize: "large",

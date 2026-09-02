@@ -8,18 +8,16 @@ export function WelcomeScreen({
   state,
   layout,
   theme,
-  tip,
   composer,
 }: {
   state: RivetState;
   layout: LayoutDecision;
   theme: RivetTheme;
-  tip: string;
   composer: ReactNode;
 }) {
   const repository = displayRepository(state.repository);
   const branch = state.branch ? ` · ${state.branch}` : "";
-  const connection = connectionLabel(state.connection);
+  const connection = connectionMark(state.connection);
 
   return (
     <box flexGrow={1} flexDirection="column" backgroundColor={theme.background}>
@@ -34,15 +32,12 @@ export function WelcomeScreen({
         <RivetLogo size={layout.logoSize} theme={theme} />
         <box width={layout.contentWidth} flexDirection="column" gap={1}>
           {composer}
-          {layout.showShortcutHints ? (
+          {layout.mode === "minimal" ? null : (
             <text
               fg={theme.textMuted}
-              content="tab 模式    ctrl+p 命令    / 操作    @ 文件"
+              content="Tab · / · @"
             />
-          ) : null}
-          {layout.showTip ? (
-            <text fg={theme.textSecondary} content={`● Tip  ${tip}`} />
-          ) : null}
+          )}
         </box>
       </box>
       <box height={1} paddingX={1} flexDirection="row" justifyContent="space-between">
@@ -50,7 +45,16 @@ export function WelcomeScreen({
           fg={theme.textMuted}
           content={`${repository}${branch}`}
         />
-        <text fg={theme.textMuted} content={`${connection} · v0.1.0`} />
+        <text
+          fg={
+            state.connection === "ready"
+              ? theme.success
+              : state.connection === "crashed"
+                ? theme.danger
+                : theme.textMuted
+          }
+          content={connection}
+        />
       </box>
     </box>
   );
@@ -88,8 +92,8 @@ export function displayRepository(repository: string): string {
   return repository;
 }
 
-function connectionLabel(connection: RivetState["connection"]): string {
-  if (connection === "ready") return "已连接";
-  if (connection === "crashed") return "连接中断";
-  return "连接中";
+function connectionMark(connection: RivetState["connection"]): string {
+  if (connection === "ready") return "●";
+  if (connection === "crashed") return "×";
+  return "◌";
 }

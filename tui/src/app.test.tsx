@@ -26,6 +26,8 @@ class CaptureTransport implements WorkerTransport {
       request.method === "worker.handshake" ||
       request.method === "sessions.list" ||
       request.method === "transactions.list" ||
+      request.method === "evidence.get" ||
+      request.method === "evidence.log" ||
       request.method === "command.read" ||
       request.method === "config.update"
     ) {
@@ -58,6 +60,27 @@ class CaptureTransport implements WorkerTransport {
                   evidence_id: "evidence_recent",
                 },
               ],
+            },
+          })}\n`;
+          for (const listener of this.stdoutListeners) listener(event);
+        }
+        if (request.method === "evidence.log") {
+          const event = `${JSON.stringify({
+            schema_version: 1,
+            message_type: "event",
+            protocol_version: 1,
+            event_id: "event_evidence_log",
+            event_type: "evidence.log",
+            sequence: this.nextSequence++,
+            payload: {
+              transaction_id: request.params.transaction_id,
+              evidence_id: "evidence_recent",
+              step_id: "verification_0",
+              status: "PASSED",
+              log_path: "verification_0.log",
+              log_sha256: "f".repeat(64),
+              content: "2 checks passed",
+              truncated: false,
             },
           })}\n`;
           for (const listener of this.stdoutListeners) listener(event);
@@ -226,7 +249,7 @@ describe("Rivet OpenTUI experience", () => {
     });
     await act(async () => Bun.sleep(30));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("模型 live-reasoner");
+    expect(setup.captureCharFrame()).toContain("ASK · live-reasoner ▾");
 
     await act(async () => setup.mockInput.pressKey("k", { ctrl: true }));
     await setup.flush();
@@ -253,8 +276,8 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderOnce());
 
     const initial = setup.captureCharFrame();
-    expect(initial).toContain("模型 team-chat");
-    expect(initial).toContain("3 个可用模型");
+    expect(initial).toContain("ASK · team-chat ▾");
+    expect(initial).not.toContain("个可用模型");
     await act(async () => setup.mockInput.pressKey("k", { ctrl: true }));
     await setup.flush();
     const picker = setup.captureCharFrame();
@@ -264,7 +287,7 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.mockInput.pressArrow("down"));
     await act(async () => setup.mockInput.pressEnter());
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("模型 team-reasoner");
+    expect(setup.captureCharFrame()).toContain("team-reasoner ▾");
     await act(async () => setup.mockInput.typeText("解释配置"));
     await act(async () => setup.mockInput.pressEnter());
     await setup.flush();
@@ -311,14 +334,14 @@ describe("Rivet OpenTUI experience", () => {
 
     await act(async () => setup.mockInput.pressTab());
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("PLAN · 模型");
+    expect(setup.captureCharFrame()).toContain("PLAN · deepseek-v4-pro");
     await act(async () => setup.mockInput.typeText("/ask 你好"));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("ASK · 模型");
+    expect(setup.captureCharFrame()).toContain("ASK · deepseek-v4-pro");
 
     await act(async () => setup.mockInput.pressTab());
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("PLAN · 模型");
+    expect(setup.captureCharFrame()).toContain("PLAN · deepseek-v4-pro");
     expect(setup.renderer.currentFocusedEditor?.plainText).toBe("/plan 你好");
     await act(async () => setup.mockInput.pressEnter());
     await setup.flush();
@@ -345,8 +368,11 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderOnce());
     await act(async () => setup.mockInput.pressKey("g", { ctrl: true }));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("连接与模型配置");
-    expect(setup.captureCharFrame()).toContain("仅保存在当前 Worker 会话");
+    const configFrame = setup.captureCharFrame();
+    expect(configFrame).toContain("Key 仅用于当前会话");
+    expect(configFrame).toContain("https://api.deepseek.com");
+    expect(configFrame).toContain("deepseek-v4-pro");
+    expect(configFrame).not.toContain("Worker 会话");
 
     const secret = "fixture-tui-value-that-must-be-masked";
     await act(async () => setup.mockInput.typeText(secret));
@@ -364,7 +390,7 @@ describe("Rivet OpenTUI experience", () => {
     expect(request?.params.api_key_action).toBe("replace");
     expect(request?.params.api_key).toBe(secret);
     expect(setup.captureCharFrame()).not.toContain(secret);
-    expect(setup.captureCharFrame()).toContain("配置已保存");
+    expect(setup.captureCharFrame()).toContain("已保存");
     await act(async () => setup.renderer.destroy());
   });
 
@@ -380,7 +406,7 @@ describe("Rivet OpenTUI experience", () => {
     await setup.flush();
     await act(async () => setup.mockInput.pressKey("d", { ctrl: true }));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("保存后清除当前会话 Key");
+    expect(setup.captureCharFrame()).toContain("将清除");
     await act(async () => setup.mockInput.pressKey("s", { ctrl: true }));
     await setup.flush();
 
@@ -429,14 +455,14 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderOnce());
     await act(async () => setup.mockInput.pressKey("g", { ctrl: true }));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("连接与模型配置");
+    expect(setup.captureCharFrame()).toContain("Key 仅用于当前会话");
 
     for (let index = 0; index < 7; index += 1) {
       await act(async () => setup.mockInput.pressTab());
       await setup.flush();
     }
     const compact = setup.captureCharFrame();
-    expect(compact).toContain("Safe Mode");
+    expect(compact).toContain("安全模式");
     expect(compact.split("\n")).toHaveLength(13);
     await act(async () => setup.renderer.destroy());
   });
@@ -458,10 +484,17 @@ describe("Rivet OpenTUI experience", () => {
       await act(async () => setup.renderOnce());
       const frame = setup.captureCharFrame();
 
-      expect(frame).toContain("修复失败的测试");
+      expect(frame).toContain("输入任务…");
       expect(frame).toContain("ASK");
+      expect(frame).not.toContain("已连接");
+      expect(frame).not.toContain("v0.1.0");
+      expect(frame).not.toContain("Enter 发送");
+      expect(frame).not.toContain("Ctrl+P 命令");
       expect(frame).not.toContain("Repository / Context");
       expect(frame).not.toContain("Chat / Trace");
+      expect(
+        frame.split("\n").filter((line) => line.trim().length > 0).length,
+      ).toBeLessThanOrEqual(10);
       expect(setup.renderer.currentFocusedEditor).not.toBeNull();
       await act(async () => setup.renderer.destroy());
     }
@@ -482,7 +515,6 @@ describe("Rivet OpenTUI experience", () => {
     await setup.flush();
     const completed = setup.captureCharFrame();
     expect(completed).toContain("/verify");
-    expect(completed).not.toContain("全部操作");
 
     await act(async () => setup.mockInput.pressEscape());
     await act(async () => setup.renderer.destroy());
@@ -498,7 +530,7 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.mockInput.typeText("/mode f"));
     await setup.flush();
     const menu = setup.captureCharFrame();
-    expect(menu).toContain("/mode 参数");
+    expect(menu).toContain("/mode");
     expect(menu).toContain("fix");
 
     await act(async () => setup.mockInput.pressEnter());
@@ -636,7 +668,7 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.mockInput.pasteBracketedText(pasted));
     await setup.flush();
     const frame = setup.captureCharFrame();
-    expect(frame).toContain("粘贴 9 行");
+    expect(frame).toContain("9 行 ×");
     expect(frame).not.toContain("YOU");
     await act(async () => setup.renderer.destroy());
   });
@@ -666,7 +698,8 @@ describe("Rivet OpenTUI experience", () => {
     await setup.flush();
 
     const frame = setup.captureCharFrame();
-    expect(frame).toContain("全部操作");
+    expect(frame).toContain("/clear");
+    expect(frame).not.toContain("Ctrl+L");
     expect(frame.split("\n")).toHaveLength(13);
     await act(async () => setup.renderer.destroy());
   });
@@ -680,7 +713,7 @@ describe("Rivet OpenTUI experience", () => {
 
     await act(async () => setup.mockInput.pressKey("p", { ctrl: true }));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("搜索命令、面板和资源");
+    expect(setup.captureCharFrame()).toContain("搜索");
     await act(async () => setup.mockInput.typeText("deepseek"));
     await setup.flush();
     expect(setup.captureCharFrame()).toContain("deepseek-v4-pro");
@@ -690,15 +723,35 @@ describe("Rivet OpenTUI experience", () => {
 
     await act(async () => setup.mockInput.pressKey("o", { ctrl: true }));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("搜索仓库内文件");
+    expect(setup.captureCharFrame()).toContain("搜索");
     await act(async () => setup.mockInput.pressEscape());
     await act(async () => Bun.sleep(30));
     await setup.flush();
 
     await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("v Verify");
+    expect(setup.captureCharFrame()).toContain("v 验证");
     await act(async () => setup.mockInput.pressEscape());
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("sizes short information views to their content", async () => {
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} />,
+      { width: 120, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.typeText("/cost"));
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+
+    const frame = setup.captureCharFrame();
+    const rows = frame.split("\n");
+    const top = rows.findIndex((row) => row.includes("┌"));
+    const bottom = rows.findIndex((row) => row.includes("└"));
+    expect(frame).toContain("0 tok · $0.0000 · 0ms");
+    expect(top).toBeGreaterThanOrEqual(0);
+    expect(bottom - top).toBeLessThanOrEqual(7);
     await act(async () => setup.renderer.destroy());
   });
 
@@ -715,12 +768,12 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderOnce());
     await act(async () => setup.mockInput.typeText("/"));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("/全部操作");
+    expect(setup.captureCharFrame()).toContain("/clear");
 
     await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
     await setup.flush();
     expect(exitCount).toBe(0);
-    expect(setup.captureCharFrame()).not.toContain("/全部操作");
+    expect(setup.captureCharFrame()).not.toContain("/clear");
 
     await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
     expect(exitCount).toBe(1);
@@ -740,12 +793,12 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderOnce());
     await act(async () => setup.mockInput.pressKey("o", { ctrl: true }));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("搜索仓库内文件");
+    expect(setup.captureCharFrame()).toContain("搜索");
 
     await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
     await setup.flush();
     expect(exitCount).toBe(0);
-    expect(setup.captureCharFrame()).not.toContain("搜索仓库内文件");
+    expect(setup.captureCharFrame()).not.toContain("搜索");
 
     await act(async () => setup.mockInput.pressKey("c", { ctrl: true }));
     expect(exitCount).toBe(1);
@@ -793,8 +846,12 @@ describe("Rivet OpenTUI experience", () => {
     await setup.flush();
     const frame = setup.captureCharFrame();
 
-    expect(frame).toContain("Rivet · ASK");
-    expect(frame).toContain("YOU");
+    expect(frame).toContain("RIVET");
+    expect(frame.match(/RIVET/gu)).toHaveLength(1);
+    expect(frame).not.toContain("YOU");
+    expect(frame).not.toContain("RIVET · ASK");
+    expect(frame).not.toContain("Enter 发送");
+    expect(frame).not.toContain("TX ");
     expect(frame).toContain("解释当前架构");
     expect(frame).not.toContain("● Tip");
     await act(async () => setup.renderer.destroy());
@@ -898,12 +955,12 @@ describe("Rivet OpenTUI experience", () => {
       { width: 120, height: 30 },
     );
     await act(async () => setup.renderOnce());
-    expect(setup.captureCharFrame()).not.toContain("当前还没有上下文来源");
+    expect(setup.captureCharFrame()).not.toContain("暂无上下文");
 
     await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
     await act(async () => setup.mockInput.pressKey("c"));
     await setup.flush();
-    expect(setup.captureCharFrame()).toContain("当前还没有上下文来源");
+    expect(setup.captureCharFrame()).toContain("暂无上下文");
 
     await act(async () => setup.mockInput.pressEscape());
     await act(async () => setup.renderer.destroy());
@@ -976,12 +1033,14 @@ describe("Rivet OpenTUI experience", () => {
 
     const collapsed = setup.captureCharFrame();
     expect(collapsed).toContain("RIVET");
-    expect(collapsed).toContain("› 执行过程");
+    expect(collapsed).toContain("› 3 步");
     expect(collapsed).not.toContain("正在执行 workspace.info");
     expect(collapsed).not.toContain("本次用量已更新");
+    expect(collapsed).not.toContain("任务阶段已更新");
+    expect(collapsed).not.toContain("命令执行完成");
 
     const rows = collapsed.split("\n");
-    const groupY = rows.findIndex((row) => row.includes("› 执行过程"));
+    const groupY = rows.findIndex((row) => row.includes("› 3 步"));
     const groupX = rows[groupY]?.indexOf("›") ?? -1;
     expect(groupX).toBeGreaterThanOrEqual(0);
     expect(groupY).toBeGreaterThanOrEqual(0);
@@ -992,6 +1051,11 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.mockMouse.click(groupX, groupY));
     await setup.flush();
     expect(setup.captureCharFrame()).not.toContain("正在执行 workspace.info");
+
+    await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
+    await act(async () => setup.mockInput.pressKey("t"));
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("任务阶段已更新");
     await act(async () => setup.renderer.destroy());
   });
 
@@ -1057,14 +1121,17 @@ describe("Rivet OpenTUI experience", () => {
     await setup.flush();
 
     const panel = setup.captureCharFrame();
-    expect(panel).toContain("能力策略");
+    expect(panel).toContain("能力");
     expect(panel).toContain("PDF 读取");
     expect(panel).toContain("语法分析");
-    expect(panel).toContain("已禁用");
+    expect(panel).toContain("○ PDF 读取");
     expect(panel).toContain("E 启用");
     expect(panel).not.toContain("workspace");
     expect(panel).not.toContain("on_demand");
-    expect(panel).toContain("依赖");
+    expect(panel).not.toContain("已禁用");
+    expect(panel).not.toContain("已启用");
+    expect(panel).not.toContain("/modules list");
+    expect(panel).not.toContain("依赖 无");
     expect(panel).not.toContain("/modules enable");
 
     const spans = setup.captureSpans().lines.flatMap((line) => line.spans);
@@ -1119,7 +1186,37 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.renderer.destroy());
   });
 
-  test("shows hash-bound evidence and verification stages", async () => {
+  test("keeps the complete permission scope visible in a minimal terminal", async () => {
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          permission: {
+            requestId: "request_compact_permission",
+            permission: "WRITE",
+            reason: "修改事务文件",
+            argv: "pytest -q",
+            cwd: ".",
+            paths: "src/app.py",
+            network: "禁用",
+            timeoutSeconds: 60,
+          },
+        })}
+        noColor={true}
+      />,
+      { width: 40, height: 12 },
+    );
+    await act(async () => setup.renderOnce());
+    const frame = setup.captureCharFrame();
+
+    expect(frame).toContain("修改事务文件");
+    expect(frame).toContain("src/app.py");
+    expect(frame).toContain("pytest -q");
+    expect(frame).toContain("网络  禁用 · 60s");
+    expect(frame).toContain("A 允许 · D 拒绝");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("keeps evidence concise until technical details are requested", async () => {
     const setup = await testRender(
       <RivetApp
         initialState={readyState({
@@ -1141,14 +1238,101 @@ describe("Rivet OpenTUI experience", () => {
     await act(async () => setup.mockInput.pressKey("e"));
     await setup.flush();
 
+    const summary = setup.captureCharFrame();
+    expect(summary).toContain("✓ 通过");
+    expect(summary).toContain("2/2 · 1 文件 · 1 符号");
+    expect(summary).toContain("✓ 可应用");
+    expect(summary).toContain("D 详情");
+    expect(summary).not.toContain("tx_demo");
+    expect(summary).not.toContain("验收哈希");
+    expect(summary).not.toContain("V0_ENVIRONMENT");
+
+    await act(async () => setup.mockInput.pressKey("d"));
+    await setup.flush();
+    const detail = setup.captureCharFrame();
+    expect(detail).toContain("验收哈希");
+    expect(detail).toContain("补丁哈希");
+    expect(detail).toContain("清单哈希");
+    expect(detail).toContain("calculator.py");
+    expect(detail).toContain("total_with_tax");
+    expect(detail).toContain("V0_ENVIRONMENT");
+    expect(detail).toContain("V10_RESOURCE");
+    expect(detail).toContain("D 收起");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("loads an evidence log only after an explicit panel action", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const recentEvidence = {
+      ...evidenceState("evidence_recent", [verificationSummary("V0_ENVIRONMENT", 0)]),
+      transactionId: "tx_recent",
+    };
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          sessionId: "session_evidence_log",
+          evidenceId: "evidence_recent",
+          transaction: "tx_recent",
+          evidence: recentEvidence,
+          verifyStatus: "PASSED",
+        })}
+        noColor={true}
+        client={client}
+      />,
+      { width: 90, height: 36 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
+    await act(async () => setup.mockInput.pressKey("e"));
+    await act(async () => Bun.sleep(30));
+    await setup.flush();
+
+    expect(setup.captureCharFrame()).not.toContain("2 checks passed");
+    await act(async () => setup.mockInput.pressKey("l"));
+    await act(async () => Bun.sleep(30));
+    await setup.flush();
+
+    expect(
+      transport.writes
+        .map((line) => JSON.parse(line) as IpcRequest)
+        .some((request) => request.method === "evidence.log"),
+    ).toBeTrue();
     const panel = setup.captureCharFrame();
-    expect(panel).toContain("AcceptanceSpec SHA-256");
-    expect(panel).toContain("Patch SHA-256");
-    expect(panel).toContain("Manifest SHA-256");
-    expect(panel).toContain("calculator.py");
-    expect(panel).toContain("total_with_tax");
-    expect(panel).toContain("V0_ENVIRONMENT");
-    expect(panel).toContain("V10_RESOURCE");
+    expect(panel).toContain("日志 · verification_0 · 通过");
+    expect(panel).toContain("2 checks passed");
+    expect(panel).toContain("验收哈希");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("keeps the evidence decision readable in a compact terminal", async () => {
+    const setup = await testRender(
+      <RivetApp
+        initialState={readyState({
+          sessionId: "session_compact_evidence",
+          evidenceId: "evidence_compact",
+          transaction: "tx_demo",
+          evidence: evidenceState("evidence_compact", [
+            verificationSummary("V0_ENVIRONMENT", 0),
+            verificationSummary("V10_RESOURCE", 10),
+          ]),
+          verifyStatus: "PASSED",
+        })}
+        noColor={true}
+      />,
+      { width: 60, height: 18 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.pressKey("x", { ctrl: true }));
+    await act(async () => setup.mockInput.pressKey("e"));
+    await setup.flush();
+
+    const frame = setup.captureCharFrame();
+    expect(frame).toContain("✓ 通过");
+    expect(frame).toContain("2/2 · 1 文件");
+    expect(frame).toContain("✓ 可应用");
+    expect(frame).not.toContain("验收哈希");
+    expect(frame.split("\n")).toHaveLength(19);
     await act(async () => setup.renderer.destroy());
   });
 
@@ -1230,10 +1414,10 @@ describe("Rivet OpenTUI experience", () => {
     });
     await setup.flush();
 
-    expect(setup.captureCharFrame()).toContain("影响范围：主工作区 · tx_one");
+    expect(setup.captureCharFrame()).toContain("范围  主工作区 · tx_one");
     await act(async () => setup.mockInput.pressKey("n"));
     await setup.flush();
-    expect(setup.captureCharFrame()).not.toContain("影响范围：主工作区");
+    expect(setup.captureCharFrame()).not.toContain("范围  主工作区");
     await act(async () => setup.renderer.destroy());
   });
 
@@ -1260,7 +1444,7 @@ describe("Rivet OpenTUI experience", () => {
     await setup.flush();
 
     const warning = setup.captureCharFrame();
-    expect(warning).toContain("独立验收尚未就绪");
+    expect(warning).toContain("缺少独立验收");
     expect(warning).toContain("不可 Apply");
 
     await act(async () => setup.mockInput.pressKey("y"));

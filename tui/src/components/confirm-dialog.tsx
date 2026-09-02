@@ -32,8 +32,8 @@ export function ConfirmDialog({
     >
       <text fg={theme.warning} content={`! ${title}`} />
       <text fg={theme.textPrimary} content={description} />
-      <text fg={theme.textSecondary} content={`影响范围：${impact}`} />
-      <text fg={theme.textMuted} content="Y 明确确认    N / Esc 取消" />
+      <text fg={theme.textSecondary} content={`范围  ${impact}`} />
+      <text fg={theme.textMuted} content="Y 确认 · N 取消" />
     </box>
   );
 }

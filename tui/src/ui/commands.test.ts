@@ -117,7 +117,7 @@ describe("TUI command input", () => {
         evidenceId: "evidence_one",
         acceptanceReady: true,
       }),
-    ).toThrow("只有验证通过的事务可以应用");
+    ).toThrow("事务未通过验证");
     expect(
       parseCommandInput("/apply tx_historical", {
         modelConfigured: true,

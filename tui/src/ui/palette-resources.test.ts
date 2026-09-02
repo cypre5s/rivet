@@ -24,8 +24,11 @@ describe("global palette resources", () => {
     expect(names).toContain("model deepseek-v4-pro");
     expect(names).toContain("modules reader.pdf");
     expect(names).toContain("diff tx_one");
-    expect(resources.map((resource) => resource.title)).toContain(
-      "查看 evidence_one",
-    );
+    expect(resources.find((resource) => resource.id === "resource.model-0")?.title)
+      .toBe("");
+    expect(
+      resources.find((resource) => resource.id === "resource.current-evidence")
+        ?.title,
+    ).toBe("evidence_one");
   });
 });

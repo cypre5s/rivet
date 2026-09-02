@@ -4,21 +4,27 @@ export function InfoOverlay({
   title,
   lines,
   compact,
+  viewportHeight,
   theme,
 }: {
   title: string;
   lines: string[];
   compact: boolean;
+  viewportHeight: number;
   theme: RivetTheme;
 }) {
+  const height = Math.min(
+    viewportHeight,
+    Math.max(7, Math.min(compact ? 16 : 22, lines.length + 6)),
+  );
   return (
     <box
       position="absolute"
       zIndex={33}
-      top={compact ? 0 : "12%"}
+      top={viewportHeight <= height + 2 ? 0 : compact ? "8%" : "12%"}
       left={compact ? 0 : "14%"}
       width={compact ? "100%" : "72%"}
-      height={compact ? "100%" : "76%"}
+      height={height}
       backgroundColor={theme.surface}
       border={true}
       borderColor={theme.border}
@@ -26,9 +32,8 @@ export function InfoOverlay({
       padding={1}
       gap={1}
     >
-      <box height={1} flexDirection="row" justifyContent="space-between">
+      <box height={1} flexDirection="row">
         <text fg={theme.accent} content={title} />
-        <text fg={theme.textMuted} content="Esc 关闭" />
       </box>
       <scrollbox flexGrow={1} focused={true}>
         {lines.map((line, index) => (

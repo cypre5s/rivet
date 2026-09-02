@@ -1,5 +1,11 @@
 import type { ModuleStatus, RivetState } from "../state/reducer.ts";
 import type { PanelName } from "../ui/command-registry.ts";
+import {
+  compactIdentifier,
+  evidencePanelModel,
+  type EvidenceLineTone,
+  verificationStatusText,
+} from "../ui/evidence-presentation.ts";
 import type { PanelPresentation } from "../ui/layout.ts";
 import type { RivetTheme } from "./theme.ts";
 
@@ -8,6 +14,7 @@ export function DetailPanel({
   state,
   selectedContextFiles,
   selectedModuleIndex,
+  evidenceExpanded,
   presentation,
   theme,
 }: {
@@ -15,6 +22,7 @@ export function DetailPanel({
   state: RivetState;
   selectedContextFiles: string[];
   selectedModuleIndex: number;
+  evidenceExpanded: boolean;
   presentation: PanelPresentation;
   theme: RivetTheme;
 }) {
@@ -30,15 +38,15 @@ export function DetailPanel({
       padding={1}
       gap={1}
     >
-      <box height={1} flexDirection="row" justifyContent="space-between">
-        <text fg={theme.accent} content={panel === "Modules" ? "能力策略" : panel} />
-        <text fg={theme.textMuted} content="Esc 关闭" />
+      <box height={1} flexDirection="row">
+        <text fg={theme.accent} content={panelTitle(panel)} />
       </box>
       <PanelContent
         panel={panel}
         state={state}
         selectedContextFiles={selectedContextFiles}
         selectedModuleIndex={selectedModuleIndex}
+        evidenceExpanded={evidenceExpanded}
         theme={theme}
       />
     </box>
@@ -50,12 +58,14 @@ function PanelContent({
   state,
   selectedContextFiles,
   selectedModuleIndex,
+  evidenceExpanded,
   theme,
 }: {
   panel: PanelName;
   state: RivetState;
   selectedContextFiles: string[];
   selectedModuleIndex: number;
+  evidenceExpanded: boolean;
   theme: RivetTheme;
 }) {
   if (panel === "Diff") {
@@ -68,7 +78,7 @@ function PanelContent({
         flexGrow={1}
       />
     ) : (
-      <EmptyState text="当前事务还没有 Diff" action="完成 /fix 后重试" theme={theme} />
+      <EmptyState text="暂无修改" theme={theme} />
     );
   }
   if (panel === "Trace") {
@@ -78,7 +88,7 @@ function PanelContent({
           <text
             key={`trace-${item.eventId}`}
             fg={theme.textSecondary}
-            content={`${item.sequence.toString().padStart(4, "0")}  ${item.eventType}\n  ${item.title}`}
+            content={`${item.sequence.toString().padStart(4, "0")}  ${item.title}`}
           />
         ))}
       </scrollbox>
@@ -92,12 +102,12 @@ function PanelContent({
         ))}
       </scrollbox>
     ) : (
-      <EmptyState text="文件清单尚未加载" action="按 Ctrl+O 按需加载" theme={theme} />
+      <EmptyState text="暂无文件" theme={theme} />
     );
   }
   if (panel === "Context") {
     const contextItems = [
-      ...selectedContextFiles.map((path) => ({ path, reason: "用户显式选择" })),
+      ...selectedContextFiles.map((path) => ({ path, reason: "" })),
       ...state.context.filter(
         (item) => !selectedContextFiles.includes(item.path),
       ),
@@ -107,12 +117,14 @@ function PanelContent({
         {contextItems.map((item) => (
           <box key={`${item.path}-${item.reason}`} flexDirection="column" marginBottom={1}>
             <text fg={theme.textPrimary} content={item.path} />
-            <text fg={theme.textMuted} content={`  ${item.reason}`} />
+            {item.reason ? (
+              <text fg={theme.textMuted} content={`  ${item.reason}`} />
+            ) : null}
           </box>
         ))}
       </scrollbox>
     ) : (
-      <EmptyState text="当前还没有上下文来源" action="输入 @ 选择文件" theme={theme} />
+      <EmptyState text="暂无上下文" theme={theme} />
     );
   }
   if (panel === "Modules") {
@@ -136,45 +148,57 @@ function PanelContent({
                 >
                   <text
                     fg={moduleColor(module, selected, theme)}
-                    content={`${selected ? "›" : " "} ${modulePolicyIcon(module)} ${moduleDisplayName(module.moduleId)} · ${modulePolicyLabel(module)}`}
+                    content={`${selected ? "›" : " "} ${modulePolicyIcon(module)} ${moduleDisplayName(module.moduleId)}`}
                   />
                 </box>
               );
             })}
           </scrollbox>
           <box flexDirection="column" marginTop={1}>
-            <box height={1} width="100%">
-              <text
-                fg={theme.textMuted}
-                content={`可用性 ${moduleAvailabilityLabel(selectedModule.availability)} · 依赖 ${selectedModule.dependencies.join(", ") || "无"}`}
-              />
-            </box>
+            {selectedModule.availability === "AVAILABLE" ? null : (
+              <box height={1} width="100%">
+                <text
+                  fg={theme.warning}
+                  content={moduleAvailabilityLabel(selectedModule.availability)}
+                />
+              </box>
+            )}
+            {selectedModule.dependencies.length === 0 ? null : (
+              <box height={1} width="100%">
+                <text
+                  fg={theme.textMuted}
+                  content={`依赖 ${selectedModule.dependencies.join(", ")}`}
+                />
+              </box>
+            )}
             {selectedModule.availabilityAction === null ||
             selectedModule.availabilityAction === undefined ? null : (
               <box height={1} width="100%">
                 <text
                   fg={theme.warning}
-                  content={`下一步：${selectedModule.availabilityAction}`}
+                  content={`→ ${selectedModule.availabilityAction}`}
                 />
               </box>
             )}
             {selectedModule.lastError === null ? null : (
               <box height={1} width="100%">
-                <text fg={theme.danger} content={`异常：${selectedModule.lastError}`} />
+                <text fg={theme.danger} content={`! ${selectedModule.lastError}`} />
               </box>
             )}
-            <box height={1} width="100%">
-              <text
-                fg={theme.accent}
-                content={`↑↓ 选择 · ${moduleActionHints(selectedModule).join(" · ")}`}
-              />
-            </box>
+            {moduleActionHints(selectedModule).length === 0 ? null : (
+              <box height={1} width="100%">
+                <text
+                  fg={theme.accent}
+                  content={`${state.moduleStatuses.length > 1 ? "↑↓ · " : ""}${moduleActionHints(selectedModule).join(" · ")}`}
+                />
+              </box>
+            )}
           </box>
         </box>
       );
     }
     return (
-      <EmptyState text="能力策略尚未加载" action="执行 /modules list" theme={theme} />
+      <EmptyState text="暂无能力" theme={theme} />
     );
   }
   if (panel === "Sessions") {
@@ -184,12 +208,12 @@ function PanelContent({
           <text
             key={session}
             fg={session === state.sessionId ? theme.accent : theme.textSecondary}
-            content={`${session === state.sessionId ? "●" : "○"} ${session}`}
+            content={`${session === state.sessionId ? "●" : "○"} ${compactIdentifier(session)}`}
           />
         ))}
       </scrollbox>
     ) : (
-      <EmptyState text="当前没有可恢复会话" action="提交任务后会自动保存" theme={theme} />
+      <EmptyState text="暂无会话" theme={theme} />
     );
   }
   if (panel === "Evidence") {
@@ -210,79 +234,75 @@ function PanelContent({
     if (evidence === null) {
       return (
         <EmptyState
-          text={selectedTransactionId === null ? "当前没有历史事务" : "正在复核事务证据"}
-          action={selectedTransactionId === null ? "完成 /fix 后重试" : selectedTransactionId}
+          text={selectedTransactionId === null ? "暂无证据" : "加载中"}
           theme={theme}
         />
       );
     }
-    const lines = [
-      "近期事务（↑↓ 选择）",
-      ...state.transactions.slice(0, 12).map(
-        (transaction, index) =>
-          `${index === safeTransactionIndex ? "›" : " "} ${transaction.transactionId} · ${transaction.state}${transaction.applyEligible ? " · 可 Apply" : ""}`,
-      ),
-      "",
-      `Transaction：${evidence.transactionId || selectedTransactionId || "无"}`,
-      `状态：${evidence.state} · Verdict：${evidence.verdictStatus}`,
-      `Apply：${evidence.applyEligible ? "后端允许（仍需显式确认）" : "不允许"}`,
-      `Evidence 完整性：${evidence.evidenceVerified ? "已复核" : "尚未发布"}`,
-      `Evidence：${evidence.evidenceId ?? "无"}`,
-      `Patch：${evidence.patchId ?? "无"}`,
-      `AcceptanceSpec SHA-256：${evidence.acceptanceSha256}`,
-      `Patch SHA-256：${evidence.patchSha256}`,
-      `Manifest SHA-256：${evidence.manifestSha256}`,
-      `Changed Files：\n${evidence.changedFiles.join(", ") || "无"}`,
-      `Changed Symbols：\n${evidence.changedSymbols.join(", ") || "无"}`,
-      "V0–V10 验证矩阵",
-      ...evidence.verificationResults.map(
-        (result) =>
-          `${result.kind} · ${result.status} · ${result.required ? "required" : "optional"} · ${result.durationMs}ms · exit=${result.exitCode ?? "-"}\n  ${result.stepId}\n  argv: ${JSON.stringify(result.argv)}${result.logPath === null ? "" : `\n  log: ${result.logPath} · ${result.logSha256 ?? "无哈希"}`}`,
-      ),
-      "Evidence 文件索引",
-      ...evidence.files.map(
-        (file) => `${file.path} · ${file.sizeBytes} B\n  ${file.sha256}`,
-      ),
-      `下一步：${evidence.nextAction}`,
-      "L / Enter：惰性加载首个失败步骤日志",
-      ...(state.evidenceLog !== null &&
-      state.evidenceLog.transactionId === evidence.transactionId
-        ? [
-            "",
-            `日志：${state.evidenceLog.stepId} · ${state.evidenceLog.status}`,
-            `${state.evidenceLog.logPath} · ${state.evidenceLog.logSha256}`,
-            state.evidenceLog.content || "（空日志）",
-            state.evidenceLog.truncated ? "…日志展示已截断" : "",
-          ]
-        : []),
-    ];
+    const model = evidencePanelModel({
+      evidence,
+      evidenceLog: state.evidenceLog,
+      transactions: state.transactions,
+      selectedIndex: safeTransactionIndex,
+      expanded: evidenceExpanded,
+    });
     return (
       <scrollbox flexGrow={1} focused={true}>
-        {lines.map((line, index) => (
-          <text key={`${index}:${line}`} fg={theme.textSecondary} content={line} />
+        {model.lines.map((line) => (
+          <text
+            key={line.key}
+            fg={evidenceLineColor(line.tone, theme)}
+            content={line.text}
+          />
         ))}
       </scrollbox>
     );
   }
-  const content: Record<"Plan" | "Verify" | "Evidence", [string, string]> = {
-    Plan: [state.plan.phase, state.plan.summary],
-    Verify: [state.verifyStatus, verificationHint(state.verifyStatus)],
-    Evidence: [state.evidenceId, "证据由后端哈希校验"],
-  };
-  const [title, detail] = content[panel];
+  const lines =
+    panel === "Plan"
+      ? [planLabel(state)]
+      : [verificationLabel(state.verifyStatus)];
   return (
     <box flexDirection="column" gap={1}>
-      <text fg={theme.textPrimary} content={title} />
-      <text fg={theme.textSecondary} content={detail} />
+      {lines.map((line, index) => (
+        <text
+          key={`${panel}-${index}`}
+          fg={index === 0 ? theme.textPrimary : theme.textSecondary}
+          content={line}
+        />
+      ))}
     </box>
   );
 }
 
+const PANEL_TITLES: Readonly<Record<PanelName, string>> = {
+  Plan: "计划",
+  Context: "上下文",
+  Files: "文件",
+  Diff: "修改",
+  Verify: "验证",
+  Evidence: "证据",
+  Modules: "能力",
+  Trace: "轨迹",
+  Sessions: "会话",
+};
+
+function panelTitle(panel: PanelName): string {
+  return PANEL_TITLES[panel];
+}
+
+function evidenceLineColor(tone: EvidenceLineTone, theme: RivetTheme): string {
+  if (tone === "accent") return theme.accent;
+  if (tone === "success") return theme.success;
+  if (tone === "warning") return theme.warning;
+  if (tone === "danger") return theme.danger;
+  if (tone === "muted") return theme.textMuted;
+  return theme.textPrimary;
+}
+
 function moduleActionHints(module: ModuleStatus): string[] {
-  if (module.policy === "LOCKED" || !module.manualControl) return ["Kernel 管理"];
-  if (["required", "eager"].includes(module.activation)) {
-    return ["系统常驻"];
-  }
+  if (module.policy === "LOCKED" || !module.manualControl) return [];
+  if (["required", "eager"].includes(module.activation)) return [];
   if (!module.configuredEnabled) {
     return ["E 启用"];
   }
@@ -308,15 +328,6 @@ const MODULE_NAMES: Readonly<Record<string, string>> = {
 
 function moduleDisplayName(moduleId: string): string {
   return MODULE_NAMES[moduleId] ?? moduleId;
-}
-
-function modulePolicyLabel(module: ModuleStatus): string {
-  const labels: Readonly<Record<string, string>> = {
-    LOCKED: "Kernel 管理",
-    ENABLED: "已启用",
-    DISABLED: "已禁用",
-  };
-  return labels[module.policy] ?? module.policy;
 }
 
 function modulePolicyIcon(module: ModuleStatus): string {
@@ -351,17 +362,14 @@ function moduleColor(
 
 function EmptyState({
   text,
-  action,
   theme,
 }: {
   text: string;
-  action: string;
   theme: RivetTheme;
 }) {
   return (
     <box flexGrow={1} alignItems="center" justifyContent="center" flexDirection="column">
       <text fg={theme.textSecondary} content={text} />
-      <text fg={theme.textMuted} content={action} />
     </box>
   );
 }
@@ -386,10 +394,18 @@ function panelPlacement(presentation: PanelPresentation): Partial<BoxProps> {
   };
 }
 
-function verificationHint(status: string): string {
-  if (status.toUpperCase() === "PASSED") return "验证通过，可以显式 Apply";
-  if (status.toUpperCase() === "FAILED") return "验证未通过，请查看 Evidence";
-  if (status.toUpperCase() === "INCONCLUSIVE") return "验证不确定，补丁不会被放行";
-  return "尚未执行验证";
+function verificationLabel(status: string): string {
+  const icons: Readonly<Record<string, string>> = {
+    PASSED: "✓",
+    FAILED: "×",
+    BLOCKED: "!",
+    INCONCLUSIVE: "!",
+  };
+  return `${icons[status.toUpperCase()] ?? "—"} ${verificationStatusText(status)}`;
+}
+
+function planLabel(state: RivetState): string {
+  if (state.plan.phase.toUpperCase() === "IDLE") return "暂无计划";
+  return state.plan.summary || state.plan.phase;
 }
 import type { BoxProps } from "@opentui/react";

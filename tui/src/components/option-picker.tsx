@@ -34,8 +34,11 @@ export function OptionPicker({
   onSelect(option: PickerOption): void;
   onHover(index: number): void;
 }) {
-  const height = Math.max(8, Math.min(compact ? 14 : 18, viewportHeight));
-  const visibleCount = Math.max(2, Math.min(compact ? 7 : 10, height - 6));
+  const height = Math.max(
+    8,
+    Math.min(compact ? 14 : 18, viewportHeight, options.length + 7),
+  );
+  const visibleCount = Math.max(2, Math.min(compact ? 8 : 12, height - 5));
   const visible = windowedOptions(options, selectedIndex, visibleCount);
   return (
     <box
@@ -67,7 +70,7 @@ export function OptionPicker({
       />
       <box flexGrow={1} flexDirection="column">
         {visible.items.length === 0 ? (
-          <text fg={theme.textMuted} content="没有匹配结果" />
+          <text fg={theme.textMuted} content="无匹配" />
         ) : (
           visible.items.map((option, index) => {
             const absoluteIndex = visible.startIndex + index;
@@ -117,7 +120,6 @@ export function OptionPicker({
           })
         )}
       </box>
-      <text fg={theme.textMuted} content="↑↓ 选择 · Enter 确认 · Esc 关闭" />
     </box>
   );
 }

@@ -35,6 +35,13 @@ describe("unified command registry", () => {
     expect(new Set(ids).size).toBe(ids.length);
   });
 
+  test("keeps command-palette copy within a concise display budget", () => {
+    for (const command of COMMAND_REGISTRY) {
+      expect(command.title.length).toBeLessThanOrEqual(4);
+      expect(command.description.length).toBeLessThanOrEqual(15);
+    }
+  });
+
   test("supports exact, prefix, recent, fuzzy, Chinese and alias search", () => {
     expect(searchCommands(COMMAND_REGISTRY, "verify")[0]?.command.name).toBe(
       "verify",
@@ -61,17 +68,17 @@ describe("unified command registry", () => {
     };
     expect(commandAvailability(findCommand("ask")!, unavailable)).toEqual({
       available: false,
-      reason: "尚未配置模型凭据",
+      reason: "未配置模型凭据",
     });
     expect(commandAvailability(findCommand("apply")!, unavailable).reason).toBe(
-      "当前没有活动事务",
+      "无活动事务",
     );
     expect(
       commandAvailability(findCommand("apply")!, {
         ...unavailable,
         transactionId: "tx_one",
       }).reason,
-    ).toBe("只有验证通过的事务可以应用");
+    ).toBe("事务未通过验证");
     expect(findCommand("apply")?.dangerous).toBeTrue();
     expect(findCommand("clean")?.dangerous).toBeTrue();
   });

@@ -38,9 +38,8 @@ import {
   type WorkMode,
 } from "./ui/command-registry.ts";
 import {
+  COMPOSER_PLACEHOLDER,
   explicitTaskMode,
-  PLACEHOLDERS,
-  TIPS,
   type Overlay,
 } from "./ui/app-model.ts";
 import { createAppCommandActions } from "./ui/app-command-actions.ts";
@@ -89,6 +88,7 @@ export function RivetApp({
   const [selectedModel, setSelectedModel] = useState(initialState.model);
   const [themeName, setThemeName] = useState<ThemeName>("dark");
   const [openPanel, setOpenPanel] = useState<PanelName | null>(null);
+  const [evidenceExpanded, setEvidenceExpanded] = useState(false);
   const [overlays, setOverlays] = useState<Overlay[]>([]);
   const [overlayQuery, setOverlayQuery] = useState("");
   const [selectedIndex, setSelectedIndex] = useState(0);
@@ -106,7 +106,6 @@ export function RivetApp({
   const [configurationErrors, setConfigurationErrors] = useState<string[]>([]);
   const [configurationSaving, setConfigurationSaving] = useState(false);
   const [activeRequestId, setActiveRequestId] = useState<string | null>(null);
-  const [welcomeIndex, setWelcomeIndex] = useState(0);
   const modelTouched = useRef(false);
   const contextFilesRef = useRef(contextFiles);
   const attachmentsRef = useRef(attachments);
@@ -143,13 +142,8 @@ export function RivetApp({
   }, [input, mode]);
 
   useEffect(() => {
-    if (screen !== "welcome" || input.length > 0) return;
-    const timer = setInterval(
-      () => setWelcomeIndex((index) => (index + 1) % PLACEHOLDERS.length),
-      8_000,
-    );
-    return () => clearInterval(timer);
-  }, [input.length, screen]);
+    if (openPanel !== "Evidence") setEvidenceExpanded(false);
+  }, [openPanel]);
 
   const argumentRequest = commandArgumentRequest(input);
   const argumentCommand =
@@ -321,7 +315,6 @@ export function RivetApp({
     setHistory,
     setRecentCommandIds,
     setInlineError,
-    setNotice,
     setActiveRequestId,
     pushOverlay,
     closeTopOverlay,
@@ -345,6 +338,7 @@ export function RivetApp({
       running,
       activeRequestId,
       selectedIndex,
+      evidenceExpanded,
       slashResults,
       paletteResults,
       rankedFiles,
@@ -363,6 +357,7 @@ export function RivetApp({
       setMode,
       setHistoryCursor,
       setSelectedIndex,
+      setEvidenceExpanded,
       closeTopOverlay,
       pushOverlay: (overlay) => {
         if (overlay.kind === "palette" || overlay.kind === "history") {
@@ -389,7 +384,7 @@ export function RivetApp({
     setConfigurationErrors(errors);
     if (errors.length > 0) return;
     if (client === undefined || state.connection !== "ready") {
-      setConfigurationErrors(["Worker 尚未就绪，无法保存配置"]);
+      setConfigurationErrors(["Worker 未就绪"]);
       return;
     }
     setConfigurationSaving(true);
@@ -413,7 +408,7 @@ export function RivetApp({
           apiKey: "",
           apiKeyAction: "keep",
         }));
-        setNotice("配置已保存；API Key 仅在当前 Worker 会话生效");
+        setNotice("已保存");
         closeTopOverlay();
       })
       .catch((error: unknown) => {
@@ -431,10 +426,9 @@ export function RivetApp({
   const composer = (
     <Composer
       value={input}
-      placeholder={PLACEHOLDERS[welcomeIndex] ?? PLACEHOLDERS[0]}
+      placeholder={COMPOSER_PLACEHOLDER}
       mode={mode}
       modelLabel={modelLabel}
-      modelCount={state.models.length}
       credentialConfigured={state.credentialConfigured}
       focused={composerFocused}
       compact={compact}
@@ -445,7 +439,7 @@ export function RivetApp({
         inlineError ??
         (state.error === null
           ? null
-          : `${state.error}${state.connection === "crashed" ? " · Ctrl+Shift+R 恢复 Worker" : ""}`)
+          : `${state.error}${state.connection === "crashed" ? " · Ctrl+Shift+R 重连" : ""}`)
       }
       theme={theme}
       onInput={handleInput}
@@ -470,10 +464,8 @@ export function RivetApp({
           ...current,
           attachment,
         ]);
-        setNotice("大段粘贴已保存为附件，不会自动提交");
       }}
       onPathPaste={(path) => {
-        setNotice("检测到文件路径，是否加入上下文？");
         setFileQuery(path);
         pushOverlay({ kind: "files" });
       }}
@@ -494,13 +486,11 @@ export function RivetApp({
           state={state}
           layout={layout}
           theme={theme}
-          tip={TIPS[welcomeIndex] ?? TIPS[0]}
           composer={composer}
         />
       ) : (
         <SessionScreen
           state={state}
-          mode={mode}
           running={running}
           openPanel={openPanel}
           layout={layout}
@@ -508,6 +498,7 @@ export function RivetApp({
           composer={composer}
           selectedContextFiles={contextFiles}
           selectedModuleIndex={selectedIndex}
+          evidenceExpanded={evidenceExpanded}
         />
       )}
       <AppOverlays

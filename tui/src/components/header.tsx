@@ -1,34 +1,23 @@
 import type { RivetState } from "../state/reducer.ts";
-import type { WorkMode } from "../ui/command-registry.ts";
 import type { RivetTheme } from "./theme.ts";
 
 export function Header({
   state,
-  mode,
-  running,
   theme,
 }: {
   state: RivetState;
-  mode: WorkMode;
-  running: boolean;
   theme: RivetTheme;
 }) {
-  const transaction = state.transaction === "无" ? "" : `transaction ${state.transaction}`;
   const usage = usageLabel(state);
   return (
     <box
-      height={2}
+      height={1}
       backgroundColor={theme.background}
       paddingX={2}
-      paddingTop={1}
       flexDirection="row"
       justifyContent="space-between"
     >
-      <text
-        fg={running ? theme.warning : theme.accent}
-        content={`Rivet · ${mode} · ${running ? "RUNNING" : state.plan.phase}`}
-      />
-      <text fg={theme.textSecondary} content={transaction} />
+      <text fg={theme.accent} content="RIVET" />
       <text fg={theme.textMuted} content={usage} />
     </box>
   );

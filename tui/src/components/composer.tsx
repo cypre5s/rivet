@@ -31,7 +31,6 @@ export function Composer({
   placeholder,
   mode,
   modelLabel,
-  modelCount,
   credentialConfigured,
   focused,
   compact,
@@ -53,7 +52,6 @@ export function Composer({
   placeholder: string;
   mode: WorkMode;
   modelLabel: string;
-  modelCount: number;
   credentialConfigured: boolean;
   focused: boolean;
   compact: boolean;
@@ -98,13 +96,13 @@ export function Composer({
 
   const attachmentRows = contextFiles.length + attachments.length;
   const editorHeight = compact ? 1 : 2;
-  const metadataHeight = compact ? 1 : 2;
+  const metadataHeight = 1;
   const totalHeight = editorHeight + metadataHeight + Math.min(attachmentRows, 2) + 2;
 
   return (
     <box
       height={totalHeight}
-      minHeight={compact ? 4 : 6}
+      minHeight={compact ? 4 : 5}
       backgroundColor={theme.surface}
       flexDirection="row"
     >
@@ -131,7 +129,7 @@ export function Composer({
               >
                 <text
                   fg={theme.textSecondary}
-                  content={`粘贴 ${attachment.lines} 行 · ${attachment.characters} 字 ×`}
+                  content={`${attachment.lines} 行 ×`}
                 />
               </box>
             ))}
@@ -167,28 +165,19 @@ export function Composer({
             <box onMouseDown={onOpenModels}>
               <text
                 fg={theme.textSecondary}
-                content={`${mode} · 模型 ${modelLabel} ▾ · ${modelCount} 个可用模型`}
+                content={`${mode} · ${modelLabel} ▾`}
               />
             </box>
-            {compact ? null : (
+            {credentialConfigured ? null : (
               <box onMouseDown={onOpenConfig}>
                 <text
-                  fg={credentialConfigured ? theme.success : theme.warning}
-                  content={credentialConfigured ? "Key ●" : "Key ○ · Ctrl+G 配置"}
+                  fg={theme.warning}
+                  content={compact ? "Key ○" : "Key ○ · Ctrl+G"}
                 />
               </box>
             )}
           </box>
-          <text
-            fg={running ? theme.warning : theme.textMuted}
-            content={
-              running
-                ? "◌ 运行中 · Ctrl+C 取消"
-                : compact
-                  ? "Enter 发送"
-                  : "Enter 发送 · Shift+Enter 换行"
-            }
-          />
+          {running ? <text fg={theme.warning} content="◌ · Ctrl+C" /> : null}
         </box>
         {error === null ? null : (
           <text fg={theme.danger} content={`! ${error}`} />

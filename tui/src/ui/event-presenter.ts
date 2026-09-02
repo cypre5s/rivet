@@ -1,4 +1,5 @@
 import type { IpcEvent, JsonValue } from "../contracts/ipc.ts";
+import { compactIdentifier } from "./evidence-presentation.ts";
 
 export type TimelineKind = "assistant" | "tool" | "status" | "error" | "user";
 export type TimelineStatus = "running" | "success" | "failed" | "blocked" | "cancelled";
@@ -11,51 +12,51 @@ export interface PresentedEvent {
 }
 
 const EVENT_TITLES: Record<string, string> = {
-  "worker.ready": "Rivet 已就绪",
-  "worker.recovered": "Rivet 已恢复连接",
-  "worker.stopping": "正在安全退出",
-  "module.activated": "按需能力已激活",
-  "module.slept": "按需模块已休眠",
-  "module.operation.requested": "模块操作已请求",
-  "module.operation.started": "正在执行模块操作",
-  "module.state.changed": "模块运行状态已更新",
-  "module.enablement.changed": "模块启用策略已更新",
-  "module.operation.completed": "模块操作已完成",
-  "module.operation.blocked": "模块操作被安全边界阻止",
-  "module.operation.failed": "模块操作失败",
-  "modules.snapshot": "模块状态已刷新",
-  "module.requested": "任务请求按需能力",
-  "module.released": "任务已释放按需能力",
-  "module.activation_failed": "按需能力激活失败",
-  "module.release_failed": "按需能力释放失败",
-  "context.selected": "已选择相关上下文",
-  "workspace.tree_updated": "仓库文件清单已更新",
-  "tool.started": "正在执行工具",
-  "tool.completed": "工具执行完成",
-  "tool.failed": "工具执行失败",
-  "transaction.started": "已创建隔离修改事务",
-  "patch.updated": "隔离补丁已更新",
-  "verification.started": "正在执行验证矩阵",
-  "verification.completed": "验证已完成",
-  "evidence.published": "验证证据已发布",
-  "evidence.snapshot": "Evidence 完整性已复核",
-  "evidence.log": "验证日志已按需加载",
-  "candidate.ready": "候选补丁已保存（不可 Apply）",
-  "permission.requested": "需要确认受限操作",
-  "permission.resolved": "权限请求已处理",
-  "agent.output.delta": "正在生成回复",
-  "agent.answered": "回复已生成",
-  "agent.planned": "计划已生成",
-  "agent.patch_ready": "补丁生成完成，等待独立验证",
-  "agent.completed": "Rivet 已完成回复",
-  "agent.cancelled": "当前任务已取消",
-  "plan.updated": "任务阶段已更新",
-  "budget.updated": "本次用量已更新",
-  "reader.completed": "文件读取完成",
-  "command.completed": "命令执行完成",
-  "sessions.snapshot": "近期会话已更新",
-  "transactions.snapshot": "近期事务已更新",
-  "config.updated": "运行配置已更新",
+  "worker.ready": "就绪",
+  "worker.recovered": "已恢复",
+  "worker.stopping": "退出中",
+  "module.activated": "能力激活",
+  "module.slept": "能力休眠",
+  "module.operation.requested": "能力变更请求",
+  "module.operation.started": "能力变更中",
+  "module.state.changed": "能力状态变更",
+  "module.enablement.changed": "能力策略变更",
+  "module.operation.completed": "能力变更完成",
+  "module.operation.blocked": "能力变更阻塞",
+  "module.operation.failed": "能力变更失败",
+  "modules.snapshot": "能力刷新",
+  "module.requested": "能力请求",
+  "module.released": "能力释放",
+  "module.activation_failed": "能力激活失败",
+  "module.release_failed": "能力释放失败",
+  "context.selected": "上下文选择",
+  "workspace.tree_updated": "文件刷新",
+  "tool.started": "工具运行中",
+  "tool.completed": "工具完成",
+  "tool.failed": "工具失败",
+  "transaction.started": "事务创建",
+  "patch.updated": "补丁更新",
+  "verification.started": "验证中",
+  "verification.completed": "验证完成",
+  "evidence.published": "证据生成",
+  "evidence.snapshot": "证据复核",
+  "evidence.log": "日志加载",
+  "candidate.ready": "候选补丁保存",
+  "permission.requested": "等待确认",
+  "permission.resolved": "权限处理",
+  "agent.output.delta": "回复中",
+  "agent.answered": "已回答",
+  "agent.planned": "计划完成",
+  "agent.patch_ready": "待验证",
+  "agent.completed": "完成",
+  "agent.cancelled": "已取消",
+  "plan.updated": "阶段变更",
+  "budget.updated": "用量更新",
+  "reader.completed": "读取完成",
+  "command.completed": "命令完成",
+  "sessions.snapshot": "会话刷新",
+  "transactions.snapshot": "事务刷新",
+  "config.updated": "配置更新",
 };
 
 export function presentTraceEvent(event: IpcEvent): PresentedEvent {
@@ -65,10 +66,10 @@ export function presentTraceEvent(event: IpcEvent): PresentedEvent {
     text(payload.summary) ||
     text(payload.human_message);
   const suggestedAction = text(payload.suggested_action);
-  const title = specializedTitle(event.event_type, payload) ?? EVENT_TITLES[event.event_type] ?? "运行状态已更新";
+  const title = specializedTitle(event.event_type, payload) ?? EVENT_TITLES[event.event_type] ?? "状态已更新";
   const detailParts = [
     explicitSummary === event.event_type ? "" : explicitSummary,
-    suggestedAction ? `建议：${suggestedAction}` : "",
+    suggestedAction ? `→ ${suggestedAction}` : "",
   ].filter(Boolean);
   return {
     title,
@@ -84,61 +85,63 @@ function specializedTitle(
 ): string | null {
   if (eventType === "module.activated") {
     const moduleId = text(payload.module_id);
-    return moduleId ? `已激活 ${moduleId}` : null;
+    return moduleId ? `${moduleId} · 激活` : null;
   }
   if (eventType === "module.requested") {
     const moduleId = text(payload.module_id);
-    return moduleId ? `正在请求 ${moduleId}` : null;
+    return moduleId ? `${moduleId} · 请求` : null;
   }
   if (eventType === "module.released") {
     const moduleId = text(payload.module_id);
-    return moduleId ? `已释放 ${moduleId}` : null;
+    return moduleId ? `${moduleId} · 释放` : null;
   }
   if (eventType === "module.slept") {
     const moduleId = text(payload.module_id);
-    return moduleId ? `${moduleId} 已休眠` : null;
+    return moduleId ? `${moduleId} · 休眠` : null;
   }
   if (eventType.startsWith("module.operation.")) {
     const moduleId = text(payload.module_id);
     const operation = moduleOperation(text(payload.operation));
     if (!moduleId || !operation) return null;
-    if (eventType.endsWith("requested")) return `已请求${operation} ${moduleId}`;
-    if (eventType.endsWith("started")) return `正在${operation} ${moduleId}`;
-    if (eventType.endsWith("completed")) return `${moduleId} ${operation}完成`;
-    if (eventType.endsWith("blocked")) return `${moduleId} ${operation}被阻止`;
-    if (eventType.endsWith("failed")) return `${moduleId} ${operation}失败`;
+    if (eventType.endsWith("requested")) return `${moduleId} · ${operation}请求`;
+    if (eventType.endsWith("started")) return `${moduleId} · ${operation}中`;
+    if (eventType.endsWith("completed")) return `${moduleId} · ${operation}完成`;
+    if (eventType.endsWith("blocked")) return `${moduleId} · ${operation}阻塞`;
+    if (eventType.endsWith("failed")) return `${moduleId} · ${operation}失败`;
   }
   if (eventType === "tool.started") {
     const tool = text(payload.tool) || text(payload.tool_name);
-    return tool ? `正在执行 ${tool}` : null;
+    return tool ? `${tool} · 运行` : null;
   }
   if (eventType === "tool.completed") {
     const tool = text(payload.tool) || text(payload.tool_name);
-    return tool ? `${tool} 执行完成` : null;
+    return tool ? `${tool} · 完成` : null;
   }
   if (eventType === "context.selected") {
     const path = text(payload.path);
-    return path ? `已选择 ${path}` : null;
+    return path ? `+ ${path}` : null;
   }
   if (eventType === "transaction.started") {
     const transactionId = text(payload.transaction_id);
-    return transactionId ? `已创建隔离事务 ${transactionId}` : null;
+    return transactionId
+      ? `${compactIdentifier(transactionId, 22)} · 创建`
+      : null;
   }
   if (eventType === "verification.completed") {
     const status = text(payload.status).toUpperCase();
-    if (status === "PASSED") return "验证通过";
-    if (status === "FAILED") return "验证未通过";
-    if (status === "BLOCKED") return "验证被阻塞";
-    if (status === "INCONCLUSIVE") return "验证结果不确定";
+    if (status === "PASSED") return "通过";
+    if (status === "FAILED") return "失败";
+    if (status === "BLOCKED") return "阻塞";
+    if (status === "INCONCLUSIVE") return "不确定";
   }
   if (eventType === "agent.patch_ready") {
-    return "补丁生成完成，等待独立验证";
+    return "待验证";
   }
   if (eventType === "reader.completed") {
     const status = text(payload.status).toUpperCase();
-    if (status === "DEGRADED") return "文件读取已降级";
-    if (status === "TRUNCATED") return "文件读取已截断";
-    if (status === "FAILED") return "文件读取失败";
+    if (status === "DEGRADED") return "读取降级";
+    if (status === "TRUNCATED") return "读取截断";
+    if (status === "FAILED") return "读取失败";
   }
   return null;
 }

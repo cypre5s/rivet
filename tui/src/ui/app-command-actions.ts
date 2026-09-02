@@ -57,7 +57,6 @@ export interface AppCommandEnvironment {
   setHistory: Dispatch<SetStateAction<string[]>>;
   setRecentCommandIds: Dispatch<SetStateAction<string[]>>;
   setInlineError: Dispatch<SetStateAction<string | null>>;
-  setNotice: Dispatch<SetStateAction<string | null>>;
   setActiveRequestId: Dispatch<SetStateAction<string | null>>;
   pushOverlay(overlay: Overlay): void;
   closeTopOverlay(): void;
@@ -113,9 +112,9 @@ export function createAppCommandActions(
           params: { ...outcome.params, candidate_only: true },
         },
         displayInput: value,
-        title: "独立验收尚未就绪",
-        description: "本次只能生成候选补丁：无 Evidence、不可 Apply，也不能声明修复完成",
-        impact: `${environment.rivetState.acceptanceReason}。继续会产生模型费用，但不会运行 Verify、不会生成 Evidence，事务也不能 Apply。下一步：${environment.rivetState.acceptanceAction}`,
+        title: "缺少独立验收",
+        description: "仅生成候选补丁；不验证，不可 Apply",
+        impact: `${environment.rivetState.acceptanceReason} · 仍会产生模型费用 · ${environment.rivetState.acceptanceAction}`,
       });
       return false;
     }
@@ -163,7 +162,7 @@ export function createAppCommandActions(
       environment.client !== undefined &&
       environment.rivetState.connection !== "ready"
     ) {
-      environment.setInlineError("Rivet 正在连接 Worker，请稍后重试");
+      environment.setInlineError("Worker 连接中");
       return false;
     }
     const contextFiles = environment.getContextFiles();
@@ -181,7 +180,9 @@ export function createAppCommandActions(
     environment.setScreen("session");
     environment.setInput("");
     environment.setAttachments([]);
-    environment.dispatch({ kind: "local-message", summary: displayInput });
+    if (command?.name !== "modules") {
+      environment.dispatch({ kind: "local-message", summary: displayInput });
+    }
     if (environment.client === undefined) return true;
     const tracked = environment.client.beginRequest(outcome.method, params);
     environment.setActiveRequestId(tracked.requestId);
@@ -189,7 +190,7 @@ export function createAppCommandActions(
       .catch((error: unknown) => {
         environment.setInlineError(
           error instanceof WorkerResponseError
-            ? `${error.code}：${error.message}；建议：${error.nextAction}`
+            ? `${error.code}：${error.message} · ${error.nextAction}`
             : error instanceof Error
               ? error.message
               : "任务提交失败",
@@ -218,7 +219,6 @@ export function createAppCommandActions(
     }
     if (action === "clear-timeline") {
       environment.dispatch({ kind: "timeline-clear" });
-      environment.setNotice("已清理当前显示；持久化 Trace 未删除");
       return;
     }
     if (action === "quit") {
@@ -266,7 +266,7 @@ export function createAppCommandActions(
     }
     if (action === "open-help") {
       showInfo(
-        "Rivet 帮助",
+        "帮助",
         COMMAND_REGISTRY.map(
           (item) => `${item.usage.padEnd(28)} ${item.title}`,
         ),
@@ -279,7 +279,7 @@ export function createAppCommandActions(
     }
     if (action === "show-status") {
       showInfo(
-        "任务状态",
+        "状态",
         statusLines(
           environment.rivetState,
           environment.mode,
@@ -289,7 +289,7 @@ export function createAppCommandActions(
       return;
     }
     if (action === "show-cost") {
-      showInfo("用量与费用", costLines(environment.rivetState));
+      showInfo("用量", costLines(environment.rivetState));
       return;
     }
     if (action === "open-context") {
@@ -348,7 +348,6 @@ export function createAppCommandActions(
     }
     environment.setInput((current) => replaceFileMention(current, path));
     if (!keepOpen) environment.closeTopOverlay();
-    environment.setNotice(`已将 @${path} 加入上下文`);
   }
 
   function manageContext(argument: string) {
@@ -360,7 +359,6 @@ export function createAppCommandActions(
     }
     if (normalized === "clear") {
       environment.setContextFiles([]);
-      environment.setNotice("已清除下次请求使用的显式上下文");
       return;
     }
     const separator = normalized.indexOf(" ");
@@ -372,7 +370,6 @@ export function createAppCommandActions(
     }
     if (operation === "add") {
       if (environment.contextFiles.includes(path)) {
-        environment.setNotice(`@${path} 已在上下文中`);
         return;
       }
       if (environment.contextFiles.length >= MAX_CONTEXT_FILES) {
@@ -380,7 +377,6 @@ export function createAppCommandActions(
         return;
       }
       environment.setContextFiles((current) => [...current, path]);
-      environment.setNotice(`已将 @${path} 加入上下文`);
       return;
     }
     if (operation === "remove") {
@@ -391,7 +387,6 @@ export function createAppCommandActions(
       environment.setContextFiles((current) =>
         current.filter((item) => item !== path),
       );
-      environment.setNotice(`已从上下文移除 @${path}`);
       return;
     }
     environment.setInlineError("/context 仅支持 add、remove、list 或 clear");
@@ -405,11 +400,6 @@ export function createAppCommandActions(
     environment.markModelTouched();
     environment.setSelectedModel(model);
     closeAllTransientOverlays();
-    environment.setNotice(
-      environment.rivetState.credentialConfigured
-        ? `后续模型请求将使用 ${model}`
-        : `已选择 ${model}；按 Ctrl+G 可立即配置会话 API Key`,
-    );
   }
 
   function closeAllTransientOverlays() {

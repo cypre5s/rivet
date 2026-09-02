@@ -17,38 +17,38 @@ function event(eventType: string, payload: IpcEvent["payload"] = {}): IpcEvent {
 
 describe("trace event presentation", () => {
   test("turns internal event names into restrained user language", () => {
-    expect(presentTraceEvent(event("worker.ready")).title).toBe("Rivet 已就绪");
+    expect(presentTraceEvent(event("worker.ready")).title).toBe("就绪");
     expect(
       presentTraceEvent(event("tool.started", { tool: "search_text" })),
-    ).toMatchObject({ title: "正在执行 search_text", status: "running" });
+    ).toMatchObject({ title: "search_text · 运行", status: "running" });
     expect(
       presentTraceEvent(
         event("module.activated", { module_id: "context.syntax" }),
       ).title,
-    ).toBe("已激活 context.syntax");
+    ).toBe("context.syntax · 激活");
     expect(
       presentTraceEvent(
         event("module.released", { module_id: "context.syntax" }),
       ).title,
-    ).toBe("已释放 context.syntax");
+    ).toBe("context.syntax · 释放");
     expect(
       presentTraceEvent(
         event("verification.completed", { status: "PASSED" }),
       ),
-    ).toMatchObject({ title: "验证通过", status: "success" });
+    ).toMatchObject({ title: "通过", status: "success" });
     expect(
       presentTraceEvent(
         event("agent.patch_ready", { status: "READY_FOR_VERIFICATION" }),
       ),
     ).toMatchObject({
-      title: "补丁生成完成，等待独立验证",
+      title: "待验证",
       status: "running",
     });
     expect(
       presentTraceEvent(event("agent.answered", { status: "ANSWERED" })),
-    ).toMatchObject({ title: "回复已生成", kind: "assistant" });
+    ).toMatchObject({ title: "已回答", kind: "assistant" });
     expect(presentTraceEvent(event("config.updated"))).toMatchObject({
-      title: "运行配置已更新",
+      title: "配置更新",
       kind: "status",
       status: "success",
     });
@@ -56,7 +56,7 @@ describe("trace event presentation", () => {
 
   test("keeps unknown events generic instead of exposing raw protocol names", () => {
     expect(presentTraceEvent(event("future.internal.event"))).toMatchObject({
-      title: "运行状态已更新",
+      title: "状态已更新",
       kind: "status",
     });
   });

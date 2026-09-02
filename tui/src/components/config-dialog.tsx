@@ -161,6 +161,7 @@ export function ConfigDialog({
   const height = Math.max(10, Math.min(27, viewportHeight));
   const selected = (field: FieldName) => FIELDS[activeField] === field;
   const commonInput = {
+    flexGrow: 1,
     backgroundColor: theme.surfaceHover,
     focusedBackgroundColor: theme.surfaceHover,
     textColor: theme.textPrimary,
@@ -182,15 +183,8 @@ export function ConfigDialog({
       padding={1}
     >
       <box height={2} flexDirection="column">
-        <text fg={theme.accent} content="连接与模型配置" />
-        <text
-          fg={theme.textMuted}
-          content={
-            compact
-              ? "API Key 仅驻留当前 Worker 会话"
-              : "API Key 仅保存在当前 Worker 会话；其余设置原子写入用户配置"
-          }
-        />
+        <text fg={theme.accent} content="配置" />
+        <text fg={theme.textMuted} content="Key 仅用于当前会话" />
       </box>
       <scrollbox
         ref={fieldsView}
@@ -216,17 +210,17 @@ export function ConfigDialog({
               draft.apiKey
                 ? maskApiKey(draft.apiKey)
                 : draft.apiKeyAction === "clear"
-                  ? "保存后清除当前会话 Key"
+                  ? "将清除"
                   : credentialConfigured
-                    ? "已配置 · 留空保持不变"
-                    : "输入或粘贴 API Key"
+                    ? "●"
+                    : "○"
             }
           />
         </box>
         </ConfigRow>
         <ConfigRow
           field="baseUrl"
-          label="API 地址"
+          label="地址"
           active={selected("baseUrl")}
           theme={theme}
         >
@@ -240,7 +234,7 @@ export function ConfigDialog({
         </ConfigRow>
         <ConfigRow
           field="model"
-          label="默认模型"
+          label="模型"
           active={selected("model")}
           theme={theme}
         >
@@ -254,7 +248,7 @@ export function ConfigDialog({
         </ConfigRow>
         <ConfigRow
           field="modelsText"
-          label="模型列表"
+          label="可选模型"
           active={selected("modelsText")}
           theme={theme}
         >
@@ -268,7 +262,7 @@ export function ConfigDialog({
         </ConfigRow>
         <ConfigRow
           field="maxRounds"
-          label="最大轮次"
+          label="轮次"
           active={selected("maxRounds")}
           theme={theme}
         >
@@ -282,7 +276,7 @@ export function ConfigDialog({
         </ConfigRow>
         <ConfigRow
           field="maxTotalTokens"
-          label="Token 上限"
+          label="Token"
           active={selected("maxTotalTokens")}
           theme={theme}
         >
@@ -296,7 +290,7 @@ export function ConfigDialog({
         </ConfigRow>
         <ConfigRow
           field="maxCostUsd"
-          label="费用上限 $"
+          label="费用 $"
           active={selected("maxCostUsd")}
           theme={theme}
         >
@@ -305,13 +299,13 @@ export function ConfigDialog({
           value={draft.maxCostUsd}
           focused={selected("maxCostUsd")}
           maxLength={24}
-          placeholder="留空表示不限"
+          placeholder="不限"
           onInput={(maxCostUsd) => onChange({ ...draft, maxCostUsd })}
         />
         </ConfigRow>
         <ConfigRow
           field="safeMode"
-          label="Safe Mode"
+          label="安全模式"
           active={selected("safeMode")}
           theme={theme}
         >
@@ -325,7 +319,7 @@ export function ConfigDialog({
         >
           <text
             fg={draft.safeMode ? theme.success : theme.textSecondary}
-            content={draft.safeMode ? "● 已启用" : "○ 已关闭"}
+            content={draft.safeMode ? "●" : "○"}
           />
         </box>
         </ConfigRow>
@@ -341,8 +335,8 @@ export function ConfigDialog({
           saving
             ? "正在保存…"
             : compact
-              ? "Tab 切换 · Ctrl+S 保存 · Esc 取消"
-              : "Tab/↑↓ 切换 · Ctrl+S 保存 · Ctrl+D 清除会话 Key · Esc 取消"
+              ? "Ctrl+S 保存"
+              : "Ctrl+S 保存 · Ctrl+D 清除 Key"
         }
       />
     </box>
@@ -365,7 +359,7 @@ function ConfigRow({
   return (
     <box id={`config-field-${field}`} height={2} flexDirection="row" gap={1}>
       <text
-        width={14}
+        width={11}
         fg={active ? theme.accent : theme.textSecondary}
         content={`${active ? "›" : " "} ${label}`}
       />

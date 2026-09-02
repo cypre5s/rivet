@@ -8,15 +8,14 @@ export function LeaderHelp({ theme }: { theme: RivetTheme }) {
       bottom={2}
       left="8%"
       width="84%"
-      height={5}
+      height={4}
       backgroundColor={theme.surfaceHover}
       paddingX={1}
       flexDirection="column"
     >
-      <text fg={theme.accent} content="Leader" />
-      <text fg={theme.textSecondary} content="p Plan  ·  f Fix  ·  v Verify  ·  d Diff" />
-      <text fg={theme.textSecondary} content="e Evidence  ·  t Trace  ·  m Modules" />
-      <text fg={theme.textSecondary} content="c Context  ·  s Sessions  ·  h Help  ·  q Quit" />
+      <text fg={theme.textSecondary} content="p 计划 · f 修复 · v 验证 · d 修改" />
+      <text fg={theme.textSecondary} content="e 证据 · t 轨迹 · m 能力" />
+      <text fg={theme.textSecondary} content="c 上下文 · s 会话 · h 帮助 · q 退出" />
     </box>
   );
 }

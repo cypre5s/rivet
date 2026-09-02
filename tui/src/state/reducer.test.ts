@@ -83,7 +83,7 @@ describe("Trace-driven reducer", () => {
     expect(state.taskModules).toEqual(["reader.pdf"]);
     expect(state.budget.tokens).toBe(120);
     expect(state.timeline).toHaveLength(7);
-    expect(state.timeline[0]?.title).toBe("Rivet 已就绪");
+    expect(state.timeline[0]?.title).toBe("就绪");
     expect(state.timeline[0]?.title).not.toContain("worker.ready");
   });
 

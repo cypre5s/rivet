@@ -37,12 +37,12 @@ export function CommandPalette({
     selected === null ? null : commandAvailability(selected, context);
   const height = Math.max(
     8,
-    Math.min(compact ? 14 : 19, viewportHeight),
+    Math.min(compact ? 14 : 19, viewportHeight, results.length + 7),
   );
   const visible = windowedOptions(
     results,
     selectedIndex,
-    Math.max(2, Math.min(compact ? 7 : 10, height - 7)),
+    Math.max(2, Math.min(compact ? 7 : 12, height - 7)),
   );
   const width = compact ? "96%" : "70%";
 
@@ -72,7 +72,7 @@ export function CommandPalette({
         {variant === "palette" ? (
           <input
             value={query}
-            placeholder="搜索命令、面板和资源"
+            placeholder="搜索"
             focused={true}
             flexGrow={1}
             maxLength={256}
@@ -86,19 +86,34 @@ export function CommandPalette({
         ) : (
           <text
             fg={query ? theme.textPrimary : theme.textMuted}
-            content={query || "全部操作"}
+            content={query}
           />
         )}
       </box>
       <box flexGrow={1} flexDirection="column">
         {visible.items.length === 0 ? (
-          <text fg={theme.textMuted} content="没有匹配的操作" />
+          <text fg={theme.textMuted} content="无匹配" />
         ) : (
           visible.items.map(({ command }, index) => {
             const commandState = commandAvailability(command, context);
             const absoluteIndex = visible.startIndex + index;
             const selectedRow = absoluteIndex === selectedIndex;
-            const marker = command.dangerous ? "!" : commandState.available ? "·" : "×";
+            const resource = command.id.startsWith("resource.");
+            const marker = !commandState.available
+              ? "×"
+              : command.dangerous
+                ? "!"
+                : "✓";
+            const markerColor = !commandState.available
+              ? theme.danger
+              : command.dangerous
+                ? theme.warning
+                : theme.success;
+            const commandColor = commandState.available
+              ? selectedRow
+                ? theme.accent
+                : theme.textPrimary
+              : theme.textMuted;
             return (
               <box
                 key={command.id}
@@ -108,46 +123,61 @@ export function CommandPalette({
                 onMouseOver={() => onHover(absoluteIndex)}
                 onMouseDown={() => onSelect(command)}
               >
-                <text
-                  fg={
-                    commandState.available
-                      ? selectedRow
-                        ? theme.accent
-                        : theme.textPrimary
-                      : theme.textMuted
-                  }
-                  content={`${selectedRow ? "›" : " "} ${marker} /${command.name}`}
-                  width={22}
-                />
-                <text
-                  fg={commandState.available ? theme.textSecondary : theme.textMuted}
-                  content={command.title}
-                  flexGrow={1}
-                />
+                {resource ? (
+                  <>
+                    <text
+                      fg={selectedRow ? theme.accent : theme.textMuted}
+                      content={`${selectedRow ? "›" : " "} `}
+                      width={2}
+                    />
+                    <text fg={markerColor} content={`${marker} `} width={2} />
+                    <text
+                      fg={commandColor}
+                      content={`/${command.name}`}
+                      flexGrow={1}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <text
+                      fg={selectedRow ? theme.accent : theme.textMuted}
+                      content={`${selectedRow ? "›" : " "} `}
+                      width={2}
+                    />
+                    <text fg={markerColor} content={`${marker} `} width={2} />
+                    <text
+                      fg={commandColor}
+                      content={`/${command.name}`}
+                      width={16}
+                    />
+                    <text
+                      fg={commandState.available ? theme.textSecondary : theme.textMuted}
+                      content={command.title}
+                      flexGrow={1}
+                    />
+                  </>
+                )}
                 <text
                   fg={theme.textMuted}
-                  content={command.shortcut ?? command.category}
+                  content={resource || compact ? "" : command.shortcut ?? ""}
                 />
               </box>
             );
           })
         )}
       </box>
-      <box height={compact ? 2 : 3} flexDirection="column">
+      <box height={1} flexDirection="column">
         <text
           fg={availability?.available === false ? theme.warning : theme.textSecondary}
           content={
             selected === null
-              ? "输入关键词搜索"
-              : availability?.reason ?? selected.description
+              ? ""
+              : availability?.reason ??
+                (compact
+                  ? selected.description
+                  : `${selected.description}${selected.argumentKind === "none" ? "" : ` · ${selected.usage}`}`)
           }
         />
-        {compact || selected === null ? null : (
-          <text
-            fg={theme.textMuted}
-            content={`${selected.usage}  ·  ↑↓ 选择  Tab 补全  Enter 执行  Esc 关闭`}
-          />
-        )}
       </box>
     </box>
   );

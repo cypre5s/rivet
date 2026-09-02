@@ -7,6 +7,10 @@ import {
   type PanelName,
   type WorkMode,
 } from "./command-registry.ts";
+import {
+  compactIdentifier,
+  verificationStatusText,
+} from "./evidence-presentation.ts";
 
 export type Overlay =
   | { kind: "palette" }
@@ -30,19 +34,7 @@ export type Overlay =
 
 export const MODES: readonly WorkMode[] = ["ASK", "PLAN", "FIX"];
 export const MAX_CONTEXT_FILES = 20;
-export const PLACEHOLDERS = [
-  "修复失败的测试并给出验证证据",
-  "解释这个仓库的技术架构",
-  "为当前修改生成计划",
-  "读取 @report.pdf 并落实其中的需求",
-] as const;
-export const TIPS = [
-  "输入 / 可以查看 Rivet 的全部操作",
-  "输入 @ 可以把仓库文件加入上下文",
-  "修改只发生在隔离事务，验证通过后才能 Apply",
-  "Ctrl+G 快速配置会话 Key、API 地址和模型目录",
-  "Ctrl+X 打开 Leader 快捷键提示",
-] as const;
+export const COMPOSER_PLACEHOLDER = "输入任务…";
 
 export function descriptorForInput(
   value: string,
@@ -145,28 +137,28 @@ export function resultPaths(result: JsonValue): string[] {
 export function dangerousImpact(command: string, state: RivetState): string {
   if (command === "apply") return `主工作区 · ${state.transaction}`;
   if (command === "abort") return `隔离事务 · ${state.transaction}`;
-  if (command === "clean") return "仅带 Rivet ownership marker 的运行产物";
-  if (command === "init") return "当前仓库的 .rivet 项目配置";
-  if (command === "modules") return "能力启用策略、可用性与依赖关系";
-  return "当前命令声明的受控范围";
+  if (command === "clean") return "Rivet 标记的运行产物";
+  if (command === "init") return "当前仓库的 .rivet 配置";
+  if (command === "modules") return "能力策略及依赖";
+  return "命令声明的受控范围";
 }
 
 export function keyHelpLines(): string[] {
   return [
-    "Ctrl+P      全局命令面板",
-    "Ctrl+O      文件选择器",
-    "Ctrl+R      输入历史",
-    "↑ / ↓       快速复用历史输入",
-    "Ctrl+K      快速选择已配置模型",
-    "Ctrl+G      连接、Key 与模型配置",
-    "Ctrl+X      Leader 快捷键",
-    "Tab         ASK → PLAN → FIX",
-    "Shift+Tab   反向切换模式",
+    "Ctrl+P      命令",
+    "Ctrl+O      文件",
+    "Ctrl+R      历史",
+    "↑ / ↓       历史",
+    "Ctrl+K      模型",
+    "Ctrl+G      配置",
+    "Ctrl+X      快捷操作",
+    "Tab         模式",
+    "Shift+Tab   反向模式",
     "Enter       提交",
     "Shift+Enter 换行",
-    "Ctrl+J      换行兼容键",
-    "Esc         关闭最上层视图",
-    "Ctrl+C      取消 / 清空 / 二次安全退出",
+    "Ctrl+J      换行",
+    "Esc         关闭",
+    "Ctrl+C      取消 / 清空 / 退出",
   ];
 }
 
@@ -175,24 +167,30 @@ export function statusLines(
   mode: WorkMode,
   running: boolean,
 ): string[] {
-  return [
-    `连接：${state.connection}`,
-    `模式：${mode}`,
-    `阶段：${running ? "RUNNING" : state.plan.phase}`,
-    `模型：${state.model}（${state.models.length} 个可用）`,
-    `凭据：${state.credentialConfigured ? "当前会话已配置" : "未配置"}`,
-    `独立验收：${state.acceptanceReady ? "READY" : "NOT READY"}`,
-    `会话：${state.sessionId ?? "无"}`,
-    `事务：${state.transaction}`,
-    `验证：${state.verifyStatus}`,
+  const connection =
+    state.connection === "ready" ? "●" : state.connection === "crashed" ? "×" : "◌";
+  const lines = [
+    `${connection} ${mode} · ${running ? "RUNNING" : state.plan.phase}`,
+    `${state.model} · Key ${state.credentialConfigured ? "●" : "○"}`,
+    `验收 ${state.acceptanceReady ? "✓" : "×"} · 验证 ${verificationStatusText(state.verifyStatus)}`,
   ];
+  if (state.sessionId !== null) {
+    lines.push(`会话 ${compactIdentifier(state.sessionId)}`);
+  }
+  if (state.transaction !== "无") {
+    lines.push(`事务 ${compactIdentifier(state.transaction)}`);
+  }
+  return lines;
 }
 
 export function costLines(state: RivetState): string[] {
   return [
-    `Token：${state.budget.tokens}`,
-    `费用：$${state.budget.costUsd.toFixed(4)}`,
-    `耗时：${state.budget.elapsedMs} ms`,
-    "零值在空闲状态栏中自动隐藏",
+    `${state.budget.tokens} tok · $${state.budget.costUsd.toFixed(4)} · ${formatElapsed(state.budget.elapsedMs)}`,
   ];
+}
+
+function formatElapsed(elapsedMs: number): string {
+  return elapsedMs < 1_000
+    ? `${elapsedMs}ms`
+    : `${(elapsedMs / 1_000).toFixed(1)}s`;
 }

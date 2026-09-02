@@ -26,9 +26,13 @@ export function FilePicker({
   onSelect(path: string): void;
   onHover(index: number): void;
 }) {
-  const height = Math.max(8, Math.min(compact ? 15 : 20, viewportHeight));
+  const ranked = rankFilePaths(files, query, selectedPaths);
+  const height = Math.max(
+    8,
+    Math.min(compact ? 15 : 20, viewportHeight, ranked.length + 7),
+  );
   const visible = windowedOptions(
-    rankFilePaths(files, query, selectedPaths),
+    ranked,
     selectedIndex,
     Math.max(2, Math.min(compact ? 8 : 13, height - 5)),
   );
@@ -51,7 +55,7 @@ export function FilePicker({
         <text fg={theme.accent} content="@  " />
         <input
           value={query}
-          placeholder="搜索仓库内文件"
+          placeholder="搜索"
           focused={true}
           flexGrow={1}
           maxLength={512}
@@ -64,14 +68,14 @@ export function FilePicker({
         />
       </box>
       <box flexGrow={1} flexDirection="column">
-        {loading ? <text fg={theme.textMuted} content="◌ 正在加载文件清单…" /> : null}
+        {loading ? <text fg={theme.textMuted} content="◌ 加载中" /> : null}
         {!loading && visible.items.length === 0 ? (
-          <text fg={theme.textMuted} content="没有匹配的仓库内文件" />
+          <text fg={theme.textMuted} content="无匹配" />
         ) : null}
         {visible.items.map((path, index) => {
           const absoluteIndex = visible.startIndex + index;
           const selected = absoluteIndex === selectedIndex;
-          const marker = selectedPaths.includes(path) ? "✓" : fileMarker(path);
+          const marker = selectedPaths.includes(path) ? "✓" : " ";
           return (
             <box
               key={path}
@@ -92,7 +96,7 @@ export function FilePicker({
       </box>
       <text
         fg={theme.textMuted}
-        content="仅显示 Git 可见路径 · Enter 加入 · Shift+Enter 连续选择 · Esc 关闭"
+        content="⇧Enter 连选"
       />
     </box>
   );
@@ -129,13 +133,4 @@ function fileScore(path: string, query: string): number {
     if (character === query[queryIndex]) queryIndex++;
   }
   return queryIndex === query.length ? 300 : -1;
-}
-
-function fileMarker(path: string): string {
-  const suffix = path.split(".").at(-1)?.toLocaleLowerCase();
-  if (["py", "pyi"].includes(suffix ?? "")) return "PY";
-  if (["ts", "tsx", "js", "jsx"].includes(suffix ?? "")) return "TS";
-  if (["md", "txt", "rst"].includes(suffix ?? "")) return "TX";
-  if (["json", "toml", "yaml", "yml"].includes(suffix ?? "")) return "CF";
-  return "· ";
 }

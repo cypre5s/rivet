@@ -7,8 +7,6 @@ export interface LayoutDecision {
   logoSize: LogoSize;
   panelPresentation: PanelPresentation;
   contentWidth: number | `${number}%`;
-  showShortcutHints: boolean;
-  showTip: boolean;
 }
 
 export function computeLayout(width: number, height: number): LayoutDecision {
@@ -21,8 +19,6 @@ export function computeLayout(width: number, height: number): LayoutDecision {
       logoSize: "text",
       panelPresentation: "fullscreen",
       contentWidth: "100%",
-      showShortcutHints: false,
-      showTip: false,
     };
   }
   if (width < 80) {
@@ -31,8 +27,6 @@ export function computeLayout(width: number, height: number): LayoutDecision {
       logoSize: "small",
       panelPresentation: "fullscreen",
       contentWidth: "94%",
-      showShortcutHints: height >= 18,
-      showTip: height >= 18,
     };
   }
   if (width < 120) {
@@ -41,8 +35,6 @@ export function computeLayout(width: number, height: number): LayoutDecision {
       logoSize: width >= 96 && height >= 24 ? "large" : "small",
       panelPresentation: "drawer",
       contentWidth: width >= 100 ? 76 : "88%",
-      showShortcutHints: height >= 18,
-      showTip: height >= 22,
     };
   }
   return {
@@ -50,7 +42,5 @@ export function computeLayout(width: number, height: number): LayoutDecision {
     logoSize: "large",
     panelPresentation: "sidebar",
     contentWidth: 82,
-    showShortcutHints: true,
-    showTip: height >= 22,
   };
 }

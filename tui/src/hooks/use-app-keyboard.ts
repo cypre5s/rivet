@@ -42,6 +42,7 @@ export interface AppKeyboardState {
   running: boolean;
   activeRequestId: string | null;
   selectedIndex: number;
+  evidenceExpanded: boolean;
   slashResults: CommandSearchResult[];
   paletteResults: CommandSearchResult[];
   rankedFiles: string[];
@@ -61,6 +62,7 @@ export interface AppKeyboardActions {
   setMode: Dispatch<SetStateAction<WorkMode>>;
   setHistoryCursor: Dispatch<SetStateAction<number>>;
   setSelectedIndex: Dispatch<SetStateAction<number>>;
+  setEvidenceExpanded: Dispatch<SetStateAction<boolean>>;
   closeTopOverlay(): void;
   pushOverlay(overlay: Overlay): void;
   selectCommand(command: CommandDescriptor, autocomplete: boolean): void;
@@ -124,7 +126,6 @@ export function useAppKeyboard(
       } else if (key.name === "n" || key.name === "escape") {
         key.preventDefault();
         actions.closeTopOverlay();
-        actions.setNotice("已取消危险操作");
       }
       return;
     }
@@ -137,7 +138,7 @@ export function useAppKeyboard(
       const commandName = resolveLeaderCommand(key.name);
       actions.closeTopOverlay();
       if (commandName === null) {
-        actions.setNotice("未定义的 Leader 快捷键");
+        actions.setNotice("未绑定快捷键");
       } else {
         executeLeader(commandName);
       }
@@ -224,11 +225,11 @@ export function useAppKeyboard(
       if (services.client !== undefined && state.activeRequestId !== null) {
         services.client.cancel(state.activeRequestId);
       }
-      actions.setNotice("正在取消当前任务；再次按 Ctrl+C 安全退出");
+      actions.setNotice("取消中 · 再按 Ctrl+C 退出");
     } else if (intent === "close-overlay") {
       lastCtrlCAt.current = now;
       actions.closeTopOverlay();
-      actions.setNotice("已关闭弹层；再次按 Ctrl+C 安全退出");
+      actions.setNotice("再按 Ctrl+C 退出");
     } else if (intent === "clear-input") {
       lastCtrlCAt.current = null;
       actions.setInput("");
@@ -239,7 +240,7 @@ export function useAppKeyboard(
       services.onExit?.();
     } else {
       lastCtrlCAt.current = now;
-      actions.setNotice("再次按 Ctrl+C 安全退出");
+      actions.setNotice("再按 Ctrl+C 退出");
     }
   }
 
@@ -268,7 +269,6 @@ export function useAppKeyboard(
   function executeLeader(commandName: string) {
     if (commandName === "plan" || commandName === "fix") {
       actions.setMode(commandName === "plan" ? "PLAN" : "FIX");
-      actions.setNotice(`已切换到 ${commandName.toUpperCase()} 模式`);
       return;
     }
     if (commandName === "quit") {
@@ -317,17 +317,17 @@ export function useAppKeyboard(
       module.activation === "required" ||
       module.activation === "eager"
     ) {
-      actions.setNotice("该模块受 Kernel 策略保护，不能手动控制");
+      actions.setNotice("仅由 Kernel 管理");
       return true;
     }
     const operation = { e: "enable", d: "disable" }[key.name];
     if (operation === undefined) return false;
     if (operation === "enable" && module.configuredEnabled) {
-      actions.setNotice("模块已经启用");
+      actions.setNotice("已启用");
       return true;
     }
     if (operation === "disable" && !module.configuredEnabled) {
-      actions.setNotice("能力已经禁用");
+      actions.setNotice("已禁用");
       return true;
     }
     actions.executeInput(`/modules ${operation} ${module.moduleId}`);
@@ -343,9 +343,14 @@ export function useAppKeyboard(
     if (key.name === "up" || key.name === "down") {
       if (transactions.length === 0) return true;
       const delta = key.name === "up" ? -1 : 1;
+      actions.setEvidenceExpanded(false);
       actions.setSelectedIndex((current) =>
         clampIndex(current + delta, transactions.length),
       );
+      return true;
+    }
+    if (key.name === "d") {
+      actions.setEvidenceExpanded((current) => !current);
       return true;
     }
     if (key.name !== "l" && key.name !== "return") return false;
@@ -354,15 +359,15 @@ export function useAppKeyboard(
         ?.transactionId ??
       (state.rivet.transaction === "无" ? null : state.rivet.transaction);
     if (transactionId === null || services.client === undefined) {
-      actions.setNotice("当前没有可读取的 Evidence 日志");
+      actions.setNotice("暂无日志");
       return true;
     }
+    actions.setEvidenceExpanded(true);
     void services.client
       .request("evidence.log", { transaction_id: transactionId })
-      .then(() => actions.setNotice("已惰性加载一个验证步骤日志"))
       .catch((error: unknown) =>
         actions.setInlineError(
-          error instanceof Error ? error.message : "Evidence 日志加载失败",
+          error instanceof Error ? error.message : "日志加载失败",
         ),
       );
     return true;
