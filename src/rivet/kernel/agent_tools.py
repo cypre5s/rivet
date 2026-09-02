@@ -18,6 +18,16 @@ class AgentToolValidationError(ValueError):
     """表示模型参数没有通过工具自己的本地 Schema。"""
 
 
+class AgentToolRejectedError(RuntimeError):
+    """表示单次工具调用被本地边界拒绝，但 Agent 可以修正后继续。"""
+
+    def __init__(self, code: str, summary: str, *, retryable: bool = True) -> None:
+        super().__init__(summary)
+        self.code = code
+        self.summary = summary
+        self.retryable = retryable
+
+
 @dataclass(frozen=True, slots=True)
 class AgentTool:
     """保存向模型公开的 Schema 和仅在本地运行的执行器。"""

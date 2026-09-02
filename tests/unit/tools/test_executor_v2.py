@@ -14,9 +14,11 @@ from rivet.contracts.guard import (
     AuthorizationDecision,
     AuthorizationStatus,
     PermissionRequest,
+    PermissionScope,
 )
 from rivet.contracts.modules import ModuleManifest
 from rivet.contracts.tools import ToolCall
+from rivet.kernel.agent_tools import AgentToolRejectedError
 from rivet.kernel.application import RivetKernel
 from rivet.kernel.capability_demand import DemandContext
 from rivet.kernel.module_api import ModuleActivationContext
@@ -339,6 +341,77 @@ async def test_read_only_tool_without_capability_never_activates_module(
 
 
 @pytest.mark.asyncio
+async def test_transaction_scoped_git_diff_with_path_does_not_build_invalid_permission(
+    tmp_path: Path,
+) -> None:
+    requests: list[PermissionRequest] = []
+
+    async def capture(request: PermissionRequest) -> AuthorizationDecision:
+        requests.append(request)
+        return await _allow(request)
+
+    kernel, trace, executor, observations, _ = await _runtime(
+        tmp_path,
+        mode="fix",
+        authorizer=capture,
+    )
+
+    result = await executor.execute(
+        ToolCall(
+            tool_call_id="call_diff_path",
+            tool_name="git_diff",
+            arguments={"path": "calculator.py"},
+        )
+    )
+
+    assert result == "handled"
+    assert observations == ["transaction.worktree"]
+    assert len(requests) == 1
+    assert requests[0].scope is PermissionScope.TRANSACTION
+    assert requests[0].paths == ()
+    assert not any(item.event.event_type == "tool.failed" for item in trace.events())
+    await kernel.shutdown()
+    await trace.close()
+
+
+@pytest.mark.asyncio
+async def test_read_only_tool_failure_is_visible_without_persisting_error_text(
+    tmp_path: Path,
+) -> None:
+    kernel, trace, executor, _, _ = await _runtime(
+        tmp_path,
+        mode="ask",
+        handler_error=RuntimeError("private-tool-detail"),
+    )
+
+    with pytest.raises(RuntimeError, match="private-tool-detail"):
+        await executor.execute(
+            ToolCall(
+                tool_call_id="call_failed_info",
+                tool_name="workspace_info",
+                arguments={},
+            )
+        )
+
+    failures = [
+        item.event for item in trace.events() if item.event.event_type == "tool.failed"
+    ]
+    assert len(failures) == 1
+    assert failures[0].payload == {
+        "error_code": None,
+        "error_type": "RuntimeError",
+        "operation_id": "call_failed_info",
+        "status": "FAILED",
+        "tool_name": "workspace_info",
+    }
+    assert "private-tool-detail" not in trace.paths.events_path.read_text(
+        encoding="utf-8"
+    )
+    await kernel.shutdown()
+    await trace.close()
+
+
+@pytest.mark.asyncio
 async def test_authorization_denial_precedes_capability_activation(
     tmp_path: Path,
 ) -> None:
@@ -346,7 +419,7 @@ async def test_authorization_denial_precedes_capability_activation(
         tmp_path, mode="ask", authorizer=_deny
     )
 
-    with pytest.raises(RuntimeError, match="授权被拒绝"):
+    with pytest.raises(AgentToolRejectedError, match="test denied"):
         await executor.execute(
             ToolCall(
                 tool_call_id="call_context",

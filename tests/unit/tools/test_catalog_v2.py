@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
+from rivet.contracts.guard import PermissionScope
 from rivet.tools.catalog import TOOL_CATALOG, catalog_for_mode
 
 
@@ -41,6 +42,12 @@ def test_catalog_declares_exact_capabilities_and_modes() -> None:
         "context_search",
         "file_read",
     )
+    assert all(
+        (spec.path_argument is not None)
+        == (spec.permission_scope is PermissionScope.SPECIFIC_PATHS)
+        for spec in TOOL_CATALOG
+    )
+    assert by_name["git_diff"].path_argument is None
 
 
 def test_importing_catalog_does_not_import_runtime_implementations() -> None:

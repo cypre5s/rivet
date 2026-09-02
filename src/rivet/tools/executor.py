@@ -17,7 +17,11 @@ from rivet.contracts.guard import (
     TaintSource,
 )
 from rivet.contracts.tools import SideEffectClass, ToolCall
-from rivet.kernel.agent_tools import AgentTool, AgentToolValidationError
+from rivet.kernel.agent_tools import (
+    AgentTool,
+    AgentToolRejectedError,
+    AgentToolValidationError,
+)
 from rivet.kernel.application import RivetKernel
 from rivet.kernel.capability_demand import DemandHandle
 from rivet.kernel.module_runtime import (
@@ -25,6 +29,7 @@ from rivet.kernel.module_runtime import (
     release_capability_leases,
 )
 from rivet.tools.catalog import TOOL_CATALOG, ToolSpec, tool_spec
+from rivet.tools.errors import WorkspaceToolError
 from rivet.trace.builder import TraceEventBuilder
 from rivet.trace.models import PersistedTraceEvent
 from rivet.trace.store import TraceStore
@@ -240,6 +245,33 @@ class SideEffectJournal:
             parent_event_id=parent_event_id,
         )
 
+    async def tool_failed(
+        self,
+        *,
+        call: ToolCall,
+        error: BaseException,
+        context: ToolExecutionContext,
+        parent_event_id: str,
+    ) -> None:
+        """记录任意工具的脱敏失败事实，包括只读工具。"""
+        await self._trace.emit(
+            self._builder.build(
+                event_type="tool.failed",
+                run_id=context.run_id,
+                session_id=context.session_id,
+                transaction_id=context.transaction_id,
+                parent_event_id=parent_event_id,
+                result_summary=f"{call.tool_name} failed",
+                payload={
+                    "error_code": getattr(error, "code", None),
+                    "error_type": type(error).__name__,
+                    "operation_id": call.tool_call_id,
+                    "status": "FAILED",
+                    "tool_name": call.tool_name,
+                },
+            )
+        )
+
     def unknown_operations(self, *, run_id: str) -> tuple[str, ...]:
         """STARTED 且没有 SUCCEEDED/FAILED 的操作在恢复时视为 UNKNOWN。"""
         return tuple(
@@ -396,37 +428,59 @@ class CatalogToolExecutor:
             reason=f"model requested {call.tool_name}",
             operation_id=call.tool_call_id,
         )
-        request = self._permission_request(spec, arguments)
-        decision = await self._authorizer(request)
-        if decision.status is AuthorizationStatus.PROMPT:
-            raise ToolPermissionRequired(request)
-        if decision.status is not AuthorizationStatus.ALLOWED:
-            raise ToolExecutionError(f"工具授权被拒绝：{decision.code}")
-
-        leases: list[CapabilityLease[object]] = []
-        capabilities: dict[str, object] = {}
         try:
-            for capability_id in spec.required_capabilities:
-                lease = await self._kernel.acquire_required(
-                    capability_id,
-                    parent=tool_demand,
-                    reason=f"{call.tool_name} requires {capability_id}",
-                    operation_id=call.tool_call_id,
+            request = self._permission_request(spec, arguments)
+            decision = await self._authorizer(request)
+            if decision.status is AuthorizationStatus.PROMPT:
+                raise ToolPermissionRequired(request)
+            if decision.status is not AuthorizationStatus.ALLOWED:
+                raise AgentToolRejectedError(
+                    decision.code,
+                    decision.summary,
+                    retryable=True,
                 )
-                leases.append(lease)
-                capabilities[capability_id] = lease.capability
-            return await self._execute_handler(
-                spec,
-                call,
-                arguments,
-                capabilities,
-                parent_event_id=tool_demand.event_id,
-            )
-        finally:
+
+            leases: list[CapabilityLease[object]] = []
+            capabilities: dict[str, object] = {}
             try:
-                await release_capability_leases(leases)
-            except BaseException as release_error:
-                raise ToolExecutionError("工具能力 Lease 释放失败") from release_error
+                for capability_id in spec.required_capabilities:
+                    lease = await self._kernel.acquire_required(
+                        capability_id,
+                        parent=tool_demand,
+                        reason=f"{call.tool_name} requires {capability_id}",
+                        operation_id=call.tool_call_id,
+                    )
+                    leases.append(lease)
+                    capabilities[capability_id] = lease.capability
+                return await self._execute_handler(
+                    spec,
+                    call,
+                    arguments,
+                    capabilities,
+                    parent_event_id=tool_demand.event_id,
+                )
+            finally:
+                try:
+                    await release_capability_leases(leases)
+                except BaseException as release_error:
+                    raise ToolExecutionError(
+                        "工具能力 Lease 释放失败"
+                    ) from release_error
+        except Exception as error:
+            if self._journal is not None:
+                await self._journal.tool_failed(
+                    call=call,
+                    error=error,
+                    context=self._context,
+                    parent_event_id=tool_demand.event_id,
+                )
+            if isinstance(error, WorkspaceToolError):
+                raise AgentToolRejectedError(
+                    error.code,
+                    error.summary,
+                    retryable=True,
+                ) from error
+            raise
 
     async def _execute_handler(
         self,

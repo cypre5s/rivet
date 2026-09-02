@@ -459,6 +459,21 @@ async def test_fix_verifies_then_explicit_apply_changes_main_workspace(
             _response(
                 tool_calls=(
                     ToolCall(
+                        tool_call_id="call_read_allowed",
+                        tool_name="file_read",
+                        arguments={"path": "calc.py"},
+                    ),
+                    ToolCall(
+                        tool_call_id="call_read_forbidden_oracle",
+                        tool_name="file_read",
+                        arguments={"path": ".rivet/project.toml"},
+                    ),
+                ),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            ),
+            _response(
+                tool_calls=(
+                    ToolCall(
                         tool_call_id="call_replace",
                         tool_name="file_replace",
                         arguments={
@@ -467,6 +482,16 @@ async def test_fix_verifies_then_explicit_apply_changes_main_workspace(
                             "new_text": "return 2",
                             "expected_count": 1,
                         },
+                    ),
+                ),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            ),
+            _response(
+                tool_calls=(
+                    ToolCall(
+                        tool_call_id="call_diff_path",
+                        tool_name="git_diff",
+                        arguments={"path": "calc.py"},
                     ),
                 ),
                 finish_reason=ModelFinishReason.TOOL_CALLS,
@@ -514,6 +539,8 @@ async def test_fix_verifies_then_explicit_apply_changes_main_workspace(
     assert code == 0
     assert payload["state"] == "VERIFIED"
     assert payload["evidence_verified"] is True
+    assert "workspace.read_scope_denied" in provider.requests[1].messages[-1].content
+    assert "return 2" in provider.requests[-1].messages[-1].content
     assert "return 1" in (repository / "calc.py").read_text(encoding="utf-8")
     transaction_id = payload["transaction_id"]
     runtime_paths = RuntimePaths.for_repository(repository, environment=environment)
@@ -529,6 +556,14 @@ async def test_fix_verifies_then_explicit_apply_changes_main_workspace(
         for event in trace_events
         if event["event_type"] == "verification.completed"
     )
+    rejected_read = next(
+        event
+        for event in trace_events
+        if event["event_type"] == "tool.failed"
+        and event["payload"]["operation_id"] == "call_read_forbidden_oracle"
+    )
+    assert rejected_read["payload"]["error_code"] == "workspace.read_scope_denied"
+    assert rejected_read["payload"]["error_type"] == "PathBoundaryError"
     verification_demand = next(
         event
         for event in trace_events

@@ -67,7 +67,7 @@ describe("trace event presentation", () => {
       ),
     ).toMatchObject({
       title: "待验证",
-      status: "running",
+      status: "success",
     });
     expect(
       presentTraceEvent(event("agent.answered", { status: "ANSWERED" })),
@@ -75,6 +75,19 @@ describe("trace event presentation", () => {
     expect(presentTraceEvent(event("acceptance.proposed"))).toMatchObject({
       title: "验收提案待确认",
       status: "success",
+    });
+    expect(
+      presentTraceEvent(
+        event("command.failed", {
+          status: "FAILED",
+          summary: "候选补丁为空，事务已回滚",
+          suggested_action: "重新运行 /fix",
+        }),
+      ),
+    ).toMatchObject({
+      title: "命令失败",
+      status: "failed",
+      detail: "候选补丁为空，事务已回滚 · → 重新运行 /fix",
     });
     expect(
       presentTraceEvent(

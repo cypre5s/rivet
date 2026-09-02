@@ -28,7 +28,11 @@ from rivet.kernel.agent_models import (
     AgentTask,
     AgentTerminationReason,
 )
-from rivet.kernel.agent_tools import AgentTool, AgentToolValidationError
+from rivet.kernel.agent_tools import (
+    AgentTool,
+    AgentToolRejectedError,
+    AgentToolValidationError,
+)
 from rivet.kernel.model_provider import ModelProvider, ModelTextDeltaCallback
 
 Clock = Callable[[], datetime]
@@ -296,6 +300,19 @@ class AgentLoop:
                         call,
                         cancel_event=cancel_event,
                         timeout_seconds=remaining_seconds,
+                    )
+                except AgentToolRejectedError as error:
+                    observation = json.dumps(
+                        {
+                            "error": {
+                                "code": error.code,
+                                "retryable": error.retryable,
+                                "summary": error.summary,
+                            }
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
                     )
                 except _RunCancelled:
                     return result(

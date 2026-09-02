@@ -19,7 +19,7 @@ import {
   type CommandOutcome,
   type PanelName,
 } from "./command-registry.ts";
-import { parseCommandInput, replaceFileMention } from "./commands.ts";
+import { parseCommandInput, removeFileMention } from "./commands.ts";
 
 export interface AppCommandEnvironment {
   rivetState: RivetState;
@@ -169,7 +169,7 @@ export function createAppCommandActions(
         ...COMMAND_REGISTRY.map(
           (item) => `${item.usage.padEnd(28)} ${item.title}`,
         ),
-        "@文件                        附加仓库文本文件",
+        "@文件（可放在命令末尾）      附加只读 Context",
       ],
     });
   }
@@ -208,7 +208,9 @@ export function createAppCommandActions(
     if (!environment.selectedFiles.includes(path)) {
       environment.setSelectedFiles((current) => [...current, path]);
     }
-    environment.setInput((current) => replaceFileMention(current, path));
+    // 文件会显示为独立的只读 Context 标签；不要把 @mention 留在命令或任务文本中。
+    // 因此既支持先选文件再输入 /fix，也支持在完整 /fix 末尾再输入 @文件。
+    environment.setInput((current) => removeFileMention(current));
     if (!keepOpen) environment.closeTopOverlay();
   }
 

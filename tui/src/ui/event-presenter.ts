@@ -47,6 +47,8 @@ const EVENT_TITLES: Record<string, string> = {
   "agent.cancelled": "已取消",
   "budget.updated": "用量更新",
   "command.completed": "命令完成",
+  "command.failed": "命令失败",
+  "command.cancelled": "命令已取消",
   "transactions.snapshot": "事务刷新",
 };
 
@@ -175,7 +177,7 @@ function eventStatus(
 ): TimelineStatus {
   const status = text(payload.status).toUpperCase();
   if (eventType === "agent.output.delta") return "running";
-  if (status === "READY_FOR_VERIFICATION") return "running";
+  if (status === "READY_FOR_VERIFICATION") return "success";
   if (eventType.endsWith("started") || status === "RUNNING") return "running";
   if (eventType.includes("cancel") || status === "CANCELLED") return "cancelled";
   if (status === "BLOCKED" || status === "INCONCLUSIVE") return "blocked";

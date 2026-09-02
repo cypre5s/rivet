@@ -22,34 +22,13 @@ export interface TimelineItem {
 
 export interface PermissionPrompt {
   requestId: string;
-  permission: string;
-  reason: string;
   goal: string;
   readScope: string[];
   writeScope: string[];
   allowedNewPaths: string[];
-  forbiddenPaths: string[];
   expectedBehaviors: string[];
-  preservedBehaviors: string[];
   acceptanceCommands: string[][];
   regressionCommands: string[][];
-  budgets: PermissionBudgets;
-  investigation: string;
-  proposalRunId: string;
-  acceptanceSha256: string;
-  baseCommit: string;
-  argv: string;
-  cwd: string;
-  paths: string;
-  network: string;
-  timeoutSeconds: number;
-}
-
-export interface PermissionBudgets {
-  maxWallSeconds: number;
-  maxTokens: number;
-  maxToolCalls: number;
-  maxCostUsd: string | number | null;
 }
 
 export interface TransactionSummary {
@@ -254,6 +233,10 @@ export function reduceTraceEvent(state: RivetState, event: IpcEvent): RivetState
       return { ...next, permission: null };
     case "tool.failed":
       return { ...next, error: text(event.payload.summary, "工具执行失败") };
+    case "command.failed":
+      return { ...next, error: text(event.payload.summary, "命令执行失败") };
+    case "command.cancelled":
+      return { ...next, error: null };
     case "command.completed":
       return { ...next, error: null };
     default:
@@ -315,11 +298,26 @@ function projectState(
 
 function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem[] {
   const presented = presentTraceEvent(event);
+  const currentTimeline =
+    event.event_type === "command.failed" ||
+    event.event_type === "command.cancelled"
+      ? timeline.map((item) =>
+          item.status === "running"
+            ? {
+                ...item,
+                status:
+                  event.event_type === "command.cancelled"
+                    ? ("cancelled" as const)
+                    : ("failed" as const),
+              }
+            : item,
+        )
+      : timeline;
   if (
     event.event_type === "worker.ready" &&
-    timeline.some((item) => item.eventType === "worker.ready")
+    currentTimeline.some((item) => item.eventType === "worker.ready")
   ) {
-    return timeline;
+    return currentTimeline;
   }
   const responseId = text(event.payload.response_id, "");
   const streamingEventId = responseId ? `agent_stream_${responseId}` : event.event_id;
@@ -337,19 +335,19 @@ function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem
     ...presented,
   };
   if (event.event_type === "agent.output.delta" && responseId) {
-    const existingIndex = timeline.findIndex(
+    const existingIndex = currentTimeline.findIndex(
       (existing) => existing.eventId === streamingEventId,
     );
     if (existingIndex >= 0) {
-      return timeline.map((existing, index) =>
+      return currentTimeline.map((existing, index) =>
         index === existingIndex ? item : existing,
       );
     }
   }
   const withoutPartial =
     responseId && item.kind === "assistant"
-      ? timeline.filter((existing) => existing.eventId !== streamingEventId)
-      : timeline;
+      ? currentTimeline.filter((existing) => existing.eventId !== streamingEventId)
+      : currentTimeline;
   const appended: TimelineItem[] = [
     ...withoutPartial,
     item,
@@ -360,42 +358,13 @@ function appendTimeline(timeline: TimelineItem[], event: IpcEvent): TimelineItem
 function permissionPrompt(payload: Record<string, JsonValue>): PermissionPrompt {
   return {
     requestId: text(payload.request_id, "request_unknown"),
-    permission: text(payload.permission, "UNKNOWN"),
-    reason: text(payload.reason, "未说明"),
     goal: text(payload.goal, "未提供 Goal"),
     readScope: stringArray(payload.read_scope),
     writeScope: stringArray(payload.write_scope),
     allowedNewPaths: stringArray(payload.allowed_new_paths),
-    forbiddenPaths: stringArray(payload.forbidden_paths),
     expectedBehaviors: stringArray(payload.expected_behaviors),
-    preservedBehaviors: stringArray(payload.preserved_behaviors),
     acceptanceCommands: stringMatrix(payload.acceptance_commands),
     regressionCommands: stringMatrix(payload.regression_commands),
-    budgets: permissionBudgets(payload.budgets),
-    investigation: text(payload.investigation, "未提供调查结论"),
-    proposalRunId: text(payload.proposal_run_id, ""),
-    acceptanceSha256: text(payload.acceptance_sha256, ""),
-    baseCommit: text(payload.base_commit, ""),
-    argv: text(payload.argv, "无"),
-    cwd: text(payload.cwd, "."),
-    paths: text(payload.paths, "无"),
-    network: text(payload.network, "禁用"),
-    timeoutSeconds: number(payload.timeout_seconds, 0),
-  };
-}
-
-function permissionBudgets(value: JsonValue | undefined): PermissionBudgets {
-  const payload: Record<string, JsonValue> =
-    value !== null && !Array.isArray(value) && typeof value === "object"
-      ? value as Record<string, JsonValue>
-      : {};
-  const cost = payload.max_cost_usd;
-  return {
-    maxWallSeconds: number(payload.max_wall_seconds, 0),
-    maxTokens: number(payload.max_tokens, 0),
-    maxToolCalls: number(payload.max_tool_calls, 0),
-    maxCostUsd:
-      typeof cost === "string" || typeof cost === "number" ? cost : null,
   };
 }
 

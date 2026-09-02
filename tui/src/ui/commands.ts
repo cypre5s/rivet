@@ -121,11 +121,8 @@ export function fileMentionQuery(value: string): string | null {
   return match?.[1] ?? null;
 }
 
-export function replaceFileMention(value: string, path: string): string {
-  return value.replace(/(?:^|\s)@[^\s@]*$/, (match) => {
-    const prefix = match.startsWith(" ") ? " " : "";
-    return `${prefix}@${path} `;
-  });
+export function removeFileMention(value: string): string {
+  return value.replace(/(?:^|\s)@[^\s@]*$/, "").trimEnd();
 }
 
 export function commandArgumentRequest(

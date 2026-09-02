@@ -96,7 +96,7 @@ export function FilePicker({
       </box>
       <text
         fg={theme.textMuted}
-        content="⇧Enter 连选"
+        content="Enter 选择 · ⇧Enter 连选 · 只读 Context"
       />
     </box>
   );

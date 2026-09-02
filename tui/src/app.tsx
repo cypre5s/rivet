@@ -342,7 +342,6 @@ export function RivetApp({
       ) : (
         <WorkbenchScreen
           state={state}
-          running={running}
           openPanel={openPanel}
           layout={layout}
           theme={theme}

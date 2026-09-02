@@ -1,35 +1,21 @@
-import { SyntaxStyle } from "@opentui/core";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 
 import type { RivetState, TimelineItem } from "../state/reducer.ts";
+import { terminalMarkdown } from "../ui/terminal-markdown.ts";
 import type { RivetTheme } from "./theme.ts";
 
 export function TimelinePanel({
   state,
   theme,
-  running,
 }: {
   state: RivetState;
   theme: RivetTheme;
-  running: boolean;
 }) {
   const visible = state.timeline.filter(showInTimeline).slice(-120);
   const entries = useMemo(() => groupTimeline(visible), [visible]);
   const [expandedGroups, setExpandedGroups] = useState<ReadonlySet<string>>(
     () => new Set(),
   );
-  const syntaxStyle = useMemo(
-    () =>
-      SyntaxStyle.fromStyles({
-        default: { fg: theme.textPrimary },
-        heading: { fg: theme.accent, bold: true },
-        code: { fg: theme.accent },
-        link: { fg: theme.accent, underline: true },
-      }),
-    [theme.accent, theme.textPrimary],
-  );
-  useEffect(() => () => syntaxStyle.destroy(), [syntaxStyle]);
-
   return (
     <box
       backgroundColor={theme.background}
@@ -78,15 +64,22 @@ export function TimelinePanel({
               );
             }
             if (item.kind === "assistant") {
+              const lines = terminalMarkdown(item.detail || item.title);
               return (
                 <box key={item.eventId} flexDirection="column" marginBottom={1}>
                   <text fg={theme.accent} content="◆" />
-                  <markdown
-                    content={item.detail || item.title}
-                    syntaxStyle={syntaxStyle}
-                    conceal={true}
-                    streaming={running && item === visible.at(-1)}
-                  />
+                  {lines.map((line, index) =>
+                    line.kind === "blank" ? (
+                      <box key={`${item.eventId}-${index}`} height={1} />
+                    ) : (
+                      <text
+                        key={`${item.eventId}-${index}`}
+                        fg={markdownColor(line.kind, theme)}
+                        attributes={line.kind === "heading" ? 1 : 0}
+                        content={line.kind === "code" ? `  ${line.content}` : line.content}
+                      />
+                    ),
+                  )}
                 </box>
               );
             }
@@ -102,6 +95,15 @@ export function TimelinePanel({
       )}
     </box>
   );
+}
+
+function markdownColor(
+  kind: ReturnType<typeof terminalMarkdown>[number]["kind"],
+  theme: RivetTheme,
+): string {
+  if (kind === "heading" || kind === "code") return theme.accent;
+  if (kind === "quote") return theme.textMuted;
+  return theme.textPrimary;
 }
 
 const QUIET_TIMELINE_EVENTS = new Set([

@@ -205,6 +205,47 @@ describe("focused Rivet TUI", () => {
     await act(async () => setup.renderer.destroy());
   });
 
+  test("renders completed Markdown as terminal content without raw markers", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 100, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.typeText("测试 Markdown"));
+    await act(async () => setup.mockInput.pressEnter());
+    await act(async () => Bun.sleep(20));
+    await act(async () =>
+      transport.emitEvent("agent.answered", {
+        response_id: "response_markdown",
+        status: "ANSWERED",
+        summary: [
+          "# 修复结果",
+          "",
+          "- **已修复** `calculator.py`",
+          "- 测试全部通过",
+          "",
+          "| 检查 | 结果 |",
+          "| --- | --- |",
+          "| Behavior | PASSED |",
+        ].join("\n"),
+      }),
+    );
+    await act(async () => Bun.sleep(20));
+    await setup.flush();
+    const frame = setup.captureCharFrame();
+    expect(frame).toContain("修复结果");
+    expect(frame).toContain("已修复");
+    expect(frame).toContain("calculator.py");
+    expect(frame).toContain("Behavior");
+    expect(frame).toContain("PASSED");
+    expect(frame).not.toContain("# 修复结果");
+    expect(frame).not.toContain("**已修复**");
+    expect(frame).not.toContain("| --- | --- |");
+    await act(async () => setup.renderer.destroy());
+  });
+
   test("selects a Worker-advertised model without a config surface", async () => {
     const transport = new CaptureTransport();
     const client = new WorkerClient(transport, { requireHandshake: false });
@@ -314,9 +355,66 @@ describe("focused Rivet TUI", () => {
     await act(async () => Bun.sleep(20));
     const fix = requests(transport).find((request) => request.method === "command.fix");
     expect(fix?.params.context_paths).toEqual(["src/service.py"]);
+    expect(fix?.params.query).toBe("修复");
     expect(fix?.params.write_scope).toEqual(["src/app.py"]);
     expect(fix?.params.allowed_new_paths).toEqual(["src/generated.py"]);
     expect(fix?.params.write_scope).not.toContain("src/service.py");
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("keeps a Slash command intact when @ context is selected last", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 120, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () =>
+      setup.mockInput.typeText(
+        "/fix --write src/app.py -- 修复解析器 @service",
+      ),
+    );
+    await act(async () => Bun.sleep(160));
+    await setup.flush();
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+    expect(setup.captureCharFrame()).toContain("src/service.py");
+    await act(async () => setup.mockInput.pressEnter());
+    await act(async () => Bun.sleep(20));
+    const fix = requests(transport).find((request) => request.method === "command.fix");
+    expect(fix?.params).toMatchObject({
+      context_paths: ["src/service.py"],
+      query: "修复解析器",
+      write_scope: ["src/app.py"],
+    });
+    await act(async () => setup.renderer.destroy());
+  });
+
+  test("allows selecting @ context before typing a Slash command", async () => {
+    const transport = new CaptureTransport();
+    const client = new WorkerClient(transport, { requireHandshake: false });
+    const setup = await testRender(
+      <RivetApp initialState={readyState()} noColor={true} client={client} />,
+      { width: 120, height: 30 },
+    );
+    await act(async () => setup.renderOnce());
+    await act(async () => setup.mockInput.typeText("@service"));
+    await act(async () => Bun.sleep(160));
+    await setup.flush();
+    await act(async () => setup.mockInput.pressEnter());
+    await setup.flush();
+    await act(async () =>
+      setup.mockInput.typeText("/fix --write src/app.py -- 修复解析器"),
+    );
+    await act(async () => setup.mockInput.pressEnter());
+    await act(async () => Bun.sleep(20));
+    const fix = requests(transport).find((request) => request.method === "command.fix");
+    expect(fix?.params).toMatchObject({
+      context_paths: ["src/service.py"],
+      query: "修复解析器",
+      write_scope: ["src/app.py"],
+    });
     await act(async () => setup.renderer.destroy());
   });
 
@@ -347,38 +445,19 @@ describe("focused Rivet TUI", () => {
     await act(async () => setup.renderer.destroy());
   });
 
-  test("shows every frozen permission field in a compact layout", async () => {
+  test("shows only decision-critical FIX permission fields", async () => {
     const setup = await testRender(
       <RivetApp
         initialState={readyState({
           permission: {
             requestId: "permission_one",
-            permission: "EXECUTE",
-            reason: "确认真实提案",
             goal: "修复解析器边界",
             readScope: ["src/parser.py", "src/context.py"],
             writeScope: ["src/parser.py"],
             allowedNewPaths: ["src/generated.py"],
-            forbiddenPaths: ["tests/test_parser.py"],
             expectedBehaviors: ["拒绝负数端口"],
-            preservedBehaviors: ["正常端口仍可解析"],
             acceptanceCommands: [["pytest", "tests/test_parser.py", "-q"]],
             regressionCommands: [["pytest", "-q"]],
-            budgets: {
-              maxWallSeconds: 900,
-              maxTokens: 8192,
-              maxToolCalls: 64,
-              maxCostUsd: "1.25",
-            },
-            investigation: "负数端口缺少拒绝分支",
-            proposalRunId: "run_proposal_one",
-            acceptanceSha256: `sha256:${"a".repeat(64)}`,
-            baseCommit: "b".repeat(40),
-            argv: "rivet fix --allow-write src/parser.py --yes --acceptance-sha256 sha256:aaaaaaaa --base-commit bbbbbbbb",
-            cwd: "批准后创建独立 Git Worktree",
-            paths: "src/parser.py",
-            network: "按 Guard 策略执行",
-            timeoutSeconds: 900,
           },
         })}
         noColor={true}
@@ -392,11 +471,12 @@ describe("focused Rivet TUI", () => {
     expect(frame).toContain("src/context.py");
     expect(frame).toContain("src/generated.py");
     expect(frame).toContain("拒绝负数端口");
-    expect(frame).toContain("负数端口缺少拒绝分支");
     expect(frame).toContain("tests/test_parser.py");
-    expect(frame).toContain("64 tools");
-    expect(frame).toContain("aaaaaaaa");
-    expect(frame).toContain("bbbbbbbb");
+    expect(frame).toContain("隔离 Worktree");
+    expect(frame).not.toContain("SHA");
+    expect(frame).not.toContain("Budgets");
+    expect(frame).not.toContain("Forbidden");
+    expect(frame).not.toContain("确认命令");
     expect(frame).toContain("A 允许 · D 拒绝");
     await act(async () => setup.renderer.destroy());
   });

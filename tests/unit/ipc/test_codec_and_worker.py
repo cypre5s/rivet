@@ -16,6 +16,7 @@ from rivet.ipc.codec import MAX_IPC_LINE_BYTES, IpcProtocolError, decode_ipc_lin
 from rivet.ipc.worker import (
     BaseWorkerApplication,
     EmitEvent,
+    WorkerMethodError,
     WorkerSession,
     read_bounded_ipc_line,
 )
@@ -234,6 +235,61 @@ async def test_worker_rejects_unknown_method_and_sanitizes_internal_error(
     serialized = "".join(lines)
     assert "ipc.worker_internal" in serialized
     assert "private-detail" not in serialized
+
+
+@pytest.mark.asyncio
+async def test_failed_command_emits_terminal_event_before_error_response(
+    tmp_path: Path,
+) -> None:
+    lines: list[str] = []
+
+    async def write(message: str) -> None:
+        lines.append(message)
+
+    class FailingCommandApplication:
+        async def handle(
+            self,
+            request: IpcRequest,
+            *,
+            emit: EmitEvent,
+            cancel_event: asyncio.Event,
+        ) -> JsonValue:
+            del request, emit, cancel_event
+            raise WorkerMethodError(
+                "transaction.patch_empty",
+                "候选补丁为空，事务已回滚",
+                "修正任务描述后重新运行 /fix",
+            )
+
+    session = WorkerSession(
+        tmp_path,
+        write_message=write,
+        application=FailingCommandApplication(),
+    )
+    await session.receive(_request("request_handshake", "worker.handshake"))
+    await session.receive(_request("request_failed_fix", "command.fix"))
+    await asyncio.sleep(0)
+    await session.close()
+
+    messages = _messages(lines)
+    terminal = next(
+        message for message in messages if message.get("event_type") == "command.failed"
+    )
+    assert terminal["payload"] == {
+        "command": "fix",
+        "request_id": "request_failed_fix",
+        "status": "FAILED",
+        "summary": "候选补丁为空，事务已回滚",
+        "suggested_action": "修正任务描述后重新运行 /fix",
+    }
+    response = next(
+        message
+        for message in messages
+        if message.get("request_id") == "request_failed_fix"
+    )
+    assert cast(dict[str, object], response["error"])["code"] == (
+        "transaction.patch_empty"
+    )
 
 
 @pytest.mark.asyncio

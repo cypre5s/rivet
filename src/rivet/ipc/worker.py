@@ -314,6 +314,15 @@ class WorkerSession:
             )
             await self._send_success(request.request_id, result)
         except asyncio.CancelledError:
+            if request.method.startswith("command."):
+                await self.emit(
+                    "command.cancelled",
+                    {
+                        "command": request.method.removeprefix("command."),
+                        "request_id": request.request_id,
+                        "summary": "请求已取消",
+                    },
+                )
             await self._send_error(
                 request.request_id,
                 code="ipc.request_cancelled",
@@ -321,6 +330,17 @@ class WorkerSession:
                 next_action="可修改任务后重新提交",
             )
         except WorkerMethodError as error:
+            if request.method.startswith("command."):
+                await self.emit(
+                    "command.failed",
+                    {
+                        "command": request.method.removeprefix("command."),
+                        "request_id": request.request_id,
+                        "status": "FAILED",
+                        "summary": error.summary,
+                        "suggested_action": error.next_action,
+                    },
+                )
             await self._send_error(
                 request.request_id,
                 code=error.code,
@@ -330,6 +350,17 @@ class WorkerSession:
                 trace_event_id=error.trace_event_id,
             )
         except Exception:
+            if request.method.startswith("command."):
+                await self.emit(
+                    "command.failed",
+                    {
+                        "command": request.method.removeprefix("command."),
+                        "request_id": request.request_id,
+                        "status": "FAILED",
+                        "summary": "Worker 发生已脱敏内部错误",
+                        "suggested_action": "查看 stderr 诊断并重新启动 Worker",
+                    },
+                )
             await self._send_error(
                 request.request_id,
                 code="ipc.worker_internal",

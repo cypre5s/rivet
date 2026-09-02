@@ -82,6 +82,11 @@ class ToolSpec:
     def __post_init__(self) -> None:
         if not self.executor or self.executor.strip() != self.executor:
             raise ValueError("ToolSpec executor key 不得为空或包含边界空白")
+        if self.permission_scope is PermissionScope.SPECIFIC_PATHS:
+            if self.path_argument is None:
+                raise ValueError("具体路径权限必须声明 path_argument")
+        elif self.path_argument is not None:
+            raise ValueError("非路径权限不得声明 path_argument")
 
     @property
     def definition(self) -> ToolDefinition:
@@ -122,7 +127,7 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
     ),
     ToolSpec(
         "file_read",
-        "读取仓库内有界 UTF-8 文本；二进制内容会被拒绝",
+        "读取授权范围内的有界 UTF-8 文本；FIX 仅可读取冻结 read_scope，二进制内容会被拒绝",
         FileReadArguments,
         SideEffectClass.READ_ONLY,
         Permission.READ,
@@ -201,7 +206,6 @@ TOOL_CATALOG: tuple[ToolSpec, ...] = (
         ("transaction.worktree",),
         _FIX_ONLY,
         executor="git_diff",
-        path_argument="path",
     ),
 )
 

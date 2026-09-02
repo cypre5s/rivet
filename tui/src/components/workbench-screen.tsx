@@ -9,7 +9,6 @@ import { TimelinePanel } from "./timeline-panel.tsx";
 
 export function WorkbenchScreen({
   state,
-  running,
   openPanel,
   layout,
   theme,
@@ -19,7 +18,6 @@ export function WorkbenchScreen({
   onSelectPanel,
 }: {
   state: RivetState;
-  running: boolean;
   openPanel: PanelName | null;
   layout: LayoutDecision;
   theme: RivetTheme;
@@ -31,7 +29,7 @@ export function WorkbenchScreen({
   return (
     <box flexGrow={1} flexDirection="column" backgroundColor={theme.background}>
       <box flexGrow={1} flexDirection="row">
-        <TimelinePanel state={state} running={running} theme={theme} />
+        <TimelinePanel state={state} theme={theme} />
         {openPanel !== null && layout.panelPresentation === "sidebar" ? (
           <DetailPanel
             panel={openPanel}

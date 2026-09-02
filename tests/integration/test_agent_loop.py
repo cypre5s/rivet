@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import fields
 from datetime import UTC, datetime
@@ -33,7 +34,7 @@ from rivet.kernel.agent_models import (
     AgentTaskMode,
     AgentTerminationReason,
 )
-from rivet.kernel.agent_tools import AgentTool
+from rivet.kernel.agent_tools import AgentTool, AgentToolRejectedError
 from rivet.kernel.resources import ResourceScope
 from rivet.providers.deepseek import DeepSeekProvider
 from rivet.providers.models import DeepSeekConfig
@@ -457,6 +458,45 @@ async def test_extra_tool_argument_is_rejected_by_local_pydantic() -> None:
 
     assert result.state is AgentLoopState.FAILED
     assert result.termination_reason is AgentTerminationReason.TOOL_VALIDATION_FAILED
+
+
+@pytest.mark.asyncio
+async def test_rejected_tool_call_becomes_observation_and_agent_can_recover() -> None:
+    async def reject(_arguments: BaseModel) -> str:
+        raise AgentToolRejectedError(
+            "workspace.read_scope_denied",
+            "读取路径不在冻结调查范围内",
+        )
+
+    tool = AgentTool.from_model(
+        name="test_echo",
+        description="测试边界拒绝",
+        input_model=EchoArguments,
+        executor=reject,
+    )
+    provider = ScriptedProvider(
+        (
+            _response(
+                tool_calls=(_tool_call({"text": "forbidden"}),),
+                finish_reason=ModelFinishReason.TOOL_CALLS,
+            ),
+            _response(content="已改用冻结范围内的信息完成任务。"),
+        )
+    )
+
+    result = await AgentLoop(provider, tools=(tool,), clock=lambda: NOW).run(_task())
+
+    assert result.state is AgentLoopState.COMPLETE
+    assert result.tool_call_count == 1
+    observation = provider.requests[1].messages[-1]
+    assert observation.role == "tool"
+    assert json.loads(observation.content) == {
+        "error": {
+            "code": "workspace.read_scope_denied",
+            "retryable": True,
+            "summary": "读取路径不在冻结调查范围内",
+        }
+    }
 
 
 @pytest.mark.asyncio

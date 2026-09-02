@@ -124,6 +124,35 @@ describe("focused Trace reducer", () => {
     expect(state.timeline[0]).toMatchObject({ status: "success", detail: "结论如下。" });
   });
 
+  test("turns unfinished streaming rows into an explicit terminal failure", () => {
+    let state = reduceTraceEvent(
+      initialRivetState(),
+      event(0, "agent.output.delta", {
+        response_id: "response_failed",
+        content: "正在生成候选补丁",
+      }),
+    );
+    state = reduceTraceEvent(
+      state,
+      event(1, "command.failed", {
+        status: "FAILED",
+        summary: "候选补丁生成失败，事务已回滚",
+        suggested_action: "重新运行 /fix",
+      }),
+    );
+
+    expect(state.error).toBe("候选补丁生成失败，事务已回滚");
+    expect(state.timeline[0]).toMatchObject({
+      eventType: "agent.output.delta",
+      status: "failed",
+    });
+    expect(state.timeline[1]).toMatchObject({
+      eventType: "command.failed",
+      title: "命令失败",
+      status: "failed",
+    });
+  });
+
   test("opens and resolves permission prompts", () => {
     const requested = reduceTraceEvent(
       initialRivetState(),
@@ -160,21 +189,9 @@ describe("focused Trace reducer", () => {
       readScope: ["src/parser.py", "src/context.py"],
       writeScope: ["src/parser.py"],
       allowedNewPaths: ["src/generated.py"],
-      forbiddenPaths: ["tests/test_parser.py"],
       expectedBehaviors: ["拒绝负数端口"],
-      preservedBehaviors: ["正常端口仍可解析"],
       acceptanceCommands: [["pytest", "tests/test_parser.py", "-q"]],
       regressionCommands: [["pytest", "-q"]],
-      budgets: {
-        maxWallSeconds: 900,
-        maxTokens: 8192,
-        maxToolCalls: 64,
-        maxCostUsd: "1.25",
-      },
-      investigation: "负数分支缺失",
-      proposalRunId: "run_proposal_one",
-      acceptanceSha256: `sha256:${"a".repeat(64)}`,
-      baseCommit: "b".repeat(40),
     });
     const resolved = reduceTraceEvent(
       requested,

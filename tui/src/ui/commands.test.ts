@@ -8,7 +8,7 @@ import {
   fileMentionQuery,
   parseCommandInput,
   parseFixArgument,
-  replaceFileMention,
+  removeFileMention,
   slashQuery,
 } from "./commands.ts";
 
@@ -122,8 +122,12 @@ describe("focused command parsing", () => {
     expect(slashQuery("/ver")).toBe("ver");
     expect(slashQuery("/verify tx")).toBeNull();
     expect(fileMentionQuery("explain @src/app")).toBe("src/app");
-    expect(replaceFileMention("explain @app", "src/app.ts")).toBe(
-      "explain @src/app.ts ",
-    );
+    expect(removeFileMention("explain @app")).toBe("explain");
+    expect(removeFileMention("@src/app")).toBe("");
+    expect(
+      removeFileMention(
+        "/fix --write calculator.py -- 修复 total_with_tax @test_calc",
+      ),
+    ).toBe("/fix --write calculator.py -- 修复 total_with_tax");
   });
 });
