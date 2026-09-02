@@ -15,6 +15,22 @@ from rivet.contracts.common import (
 )
 
 IPC_PROTOCOL_VERSION = 1
+IPC_CONTROL_METHODS = ("worker.handshake", "worker.shutdown")
+IPC_APPLICATION_METHODS = (
+    "command.ask",
+    "command.fix",
+    "command.diff",
+    "command.verify",
+    "command.apply",
+    "command.abort",
+    "permission.resolve",
+    "workspace.files",
+    "transactions.list",
+    "evidence.get",
+    "evidence.log",
+)
+IPC_REQUEST_METHODS = (*IPC_CONTROL_METHODS, *IPC_APPLICATION_METHODS)
+"""列出版本 1 唯一公开的 Worker 请求面。"""
 
 
 class IpcRequest(ContractModel):

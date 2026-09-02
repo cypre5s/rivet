@@ -10,7 +10,7 @@ from rivet.kernel.errors import CapabilityConflictError, CapabilityNotFoundError
 
 
 class CapabilityRegistry:
-    """注册全部模块的能力并在构造期拒绝动态启用后的歧义。"""
+    """注册全部模块能力并在构造期拒绝提供者歧义。"""
 
     def __init__(self, manifests: Iterable[ModuleManifest]) -> None:
         all_providers: dict[str, ModuleManifest] = {}
@@ -23,32 +23,15 @@ class CapabilityRegistry:
                         f"{previous.module_id} 与 {manifest.module_id} 提供"
                     )
                 all_providers[capability_id] = manifest
-        self._all_providers = all_providers
-        self._providers = {
-            capability_id: manifest
-            for capability_id, manifest in all_providers.items()
-            if manifest.enabled
-        }
+        self._providers = all_providers
 
     def provider_for(self, capability_id: CapabilityId) -> ModuleManifest:
-        """返回当前启用的唯一提供者，缺失时给出稳定错误。"""
+        """返回唯一提供者，缺失时给出稳定错误。"""
         provider = self._providers.get(capability_id)
         if provider is None:
-            raise CapabilityNotFoundError(
-                f"没有启用模块提供 capability {capability_id}"
-            )
+            raise CapabilityNotFoundError(f"没有模块提供 capability {capability_id}")
         return provider
 
     def capabilities(self) -> tuple[str, ...]:
         """按稳定顺序列出全部可解析能力。"""
         return tuple(sorted(self._providers))
-
-    def set_module_enabled(self, module_id: str, enabled: bool) -> None:
-        """同步运行时启用策略，同时保留全量静态冲突校验。"""
-        for capability_id, manifest in self._all_providers.items():
-            if manifest.module_id != module_id:
-                continue
-            if enabled:
-                self._providers[capability_id] = manifest
-            else:
-                self._providers.pop(capability_id, None)

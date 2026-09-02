@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Literal, cast
@@ -184,20 +183,16 @@ def _arguments(arguments: str) -> dict[str, JsonValue]:
     return cast(dict[str, JsonValue], raw_arguments)
 
 
-def _local_tool_name(
-    wire_name: str,
-    tool_names: Mapping[str, str] | None,
-) -> str:
-    """在 Provider 提供映射时拒绝模型返回未声明的工具别名。"""
+def _tool_name(wire_name: str, tool_names: frozenset[str] | None) -> str:
+    """只接受本轮声明过的原样 snake_case 工具名。"""
     if tool_names is None:
         return wire_name
-    try:
-        return tool_names[wire_name]
-    except KeyError as error:
+    if wire_name not in tool_names:
         raise _protocol_error(
             "provider.tool_name_unknown",
-            "模型 Tool Call 使用了未声明的厂商工具名",
-        ) from error
+            "模型 Tool Call 使用了未声明的工具名",
+        )
+    return wire_name
 
 
 def _local_tool_call_id(wire_id: str) -> str:
@@ -211,13 +206,13 @@ def _local_tool_call_id(wire_id: str) -> str:
 def _tool_call(
     call: WireToolCall,
     *,
-    tool_names: Mapping[str, str] | None,
+    tool_names: frozenset[str] | None,
 ) -> ToolCall:
     """构造仍需业务 Schema 校验的本地 ToolCall。"""
     try:
         return ToolCall(
             tool_call_id=_local_tool_call_id(call.id),
-            tool_name=_local_tool_name(call.function.name, tool_names),
+            tool_name=_tool_name(call.function.name, tool_names),
             arguments=_arguments(call.function.arguments),
         )
     except ValidationError as error:
@@ -256,7 +251,7 @@ def parse_non_streaming_response(
     document: object,
     *,
     created_at: datetime,
-    tool_names: Mapping[str, str] | None = None,
+    tool_names: frozenset[str] | None = None,
 ) -> ModelResponse:
     """严格解析非流式响应的唯一 index=0 choice。"""
     try:
@@ -319,7 +314,7 @@ def _merge_once(current: str, fragment: str | None) -> str:
 class DeepSeekStreamAccumulator:
     """聚合 SSE JSON 中的 content、reasoning、usage 与多个 Tool Call。"""
 
-    def __init__(self, *, tool_names: Mapping[str, str] | None = None) -> None:
+    def __init__(self, *, tool_names: frozenset[str] | None = None) -> None:
         self._provider_request_id: str | None = None
         self._model: str | None = None
         self._content_parts: list[str] = []
@@ -410,7 +405,7 @@ class DeepSeekStreamAccumulator:
                     calls.append(
                         ToolCall(
                             tool_call_id=_local_tool_call_id(fragments.tool_call_id),
-                            tool_name=_local_tool_name(
+                            tool_name=_tool_name(
                                 fragments.name,
                                 self._tool_names,
                             ),

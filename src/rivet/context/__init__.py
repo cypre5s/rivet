@@ -1,5 +1,5 @@
-"""提供可解释、分级且按需升级的仓库上下文能力。"""
+"""只公开按真实模型需求激活的词法仓库搜索。"""
 
-from .engine import ProgressiveContext, ProgressiveContextResult
+from .lexical import LexicalContext, LexicalMatch, LexicalSearchResult
 
-__all__ = ["ProgressiveContext", "ProgressiveContextResult"]
+__all__ = ["LexicalContext", "LexicalMatch", "LexicalSearchResult"]

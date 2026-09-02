@@ -33,7 +33,6 @@ from rivet.kernel.model_provider import ModelProvider, ModelTextDeltaCallback
 
 Clock = Callable[[], datetime]
 MonotonicClock = Callable[[], float]
-ContextGatherer = Callable[[AgentTask], Awaitable[tuple[Message, ...]]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,17 +52,6 @@ class _RunCancelled(Exception):
     """在内部竞速中传播用户取消，不跨越 Kernel 公共边界。"""
 
 
-def _may_change_workspace(tool_name: str) -> bool:
-    """识别会使此前 Context 失效的事务写入或本地进程。"""
-    return tool_name in {
-        "file.write_transaction",
-        "file.replace_transaction",
-        "file.create_transaction",
-        "file.delete_transaction",
-        "process.run",
-    }
-
-
 class AgentLoop:
     """逐轮调用模型，并由本地规则决定工具执行和终止。"""
 
@@ -73,7 +61,6 @@ class AgentLoop:
         *,
         tools: tuple[AgentTool, ...],
         config: AgentLoopConfig | None = None,
-        context_gatherer: ContextGatherer | None = None,
         progress_callback: ProgressCallback | None = None,
         text_delta_callback: ModelTextDeltaCallback | None = None,
         clock: Clock | None = None,
@@ -81,7 +68,6 @@ class AgentLoop:
     ) -> None:
         self._provider = provider
         self._config = config or AgentLoopConfig()
-        self._context_gatherer = context_gatherer
         self._progress_callback = progress_callback
         self._text_delta_callback = text_delta_callback
         self._clock = clock or (lambda: datetime.now(UTC))
@@ -98,12 +84,12 @@ class AgentLoop:
     ) -> AgentLoopResult:
         """运行至本地成功条件或任一失败关闭条件。"""
         messages: list[Message] = list(task.messages)
-        round_count = task.initial_round_count
-        tool_call_count = task.initial_tool_call_count
-        prompt_tokens = task.initial_prompt_tokens
-        completion_tokens = task.initial_completion_tokens
-        reasoning_tokens = task.initial_reasoning_tokens
-        total_cost = task.initial_cost_usd
+        round_count = 0
+        tool_call_count = 0
+        prompt_tokens = 0
+        completion_tokens = 0
+        reasoning_tokens = 0
+        total_cost = Decimal(0)
         started_at = self._monotonic()
         last_action_fingerprint: str | None = None
         consecutive_repeats = 0
@@ -137,7 +123,6 @@ class AgentLoop:
                 completion_status=(
                     {
                         "ASK": AgentCompletionStatus.ANSWERED,
-                        "PLAN": AgentCompletionStatus.PLANNED,
                         "FIX": AgentCompletionStatus.READY_FOR_VERIFICATION,
                     }[task.mode.value]
                     if state is AgentLoopState.COMPLETE
@@ -154,9 +139,6 @@ class AgentLoop:
                 usage=usage,
             )
 
-        transition(AgentLoopState.RECEIVE)
-        transition(AgentLoopState.UNDERSTAND)
-        transition(AgentLoopState.GATHER_CONTEXT)
         if round_count >= self._config.max_rounds:
             return result(
                 AgentLoopState.FAILED,
@@ -175,37 +157,7 @@ class AgentLoop:
                 AgentLoopState.FAILED,
                 AgentTerminationReason.COST_BUDGET_EXCEEDED,
             )
-        if self._context_gatherer is not None:
-            if cancel_event is not None and cancel_event.is_set():
-                return result(
-                    AgentLoopState.CANCELLED,
-                    AgentTerminationReason.USER_CANCELLED,
-                )
-            try:
-                gathered = await self._gather_context_with_limits(
-                    task,
-                    cancel_event=cancel_event,
-                    timeout_seconds=self._config.max_wall_seconds,
-                )
-            except _RunCancelled:
-                return result(
-                    AgentLoopState.CANCELLED,
-                    AgentTerminationReason.USER_CANCELLED,
-                )
-            except TimeoutError:
-                return result(
-                    AgentLoopState.FAILED,
-                    AgentTerminationReason.WALL_TIME_EXCEEDED,
-                )
-            except Exception:
-                return result(
-                    AgentLoopState.FAILED,
-                    AgentTerminationReason.CONTEXT_FAILED,
-                )
-            messages.extend(gathered)
-        transition(AgentLoopState.PLAN)
         while True:
-            transition(AgentLoopState.PREPARE)
             if cancel_event is not None and cancel_event.is_set():
                 return result(
                     AgentLoopState.CANCELLED,
@@ -268,7 +220,6 @@ class AgentLoop:
                     AgentTerminationReason.PROVIDER_FAILED,
                 )
 
-            transition(AgentLoopState.PARSE_TOOL_CALLS)
             round_count += 1
             prompt_tokens += response.usage.prompt_tokens
             completion_tokens += response.usage.completion_tokens
@@ -300,7 +251,6 @@ class AgentLoop:
                 total_cost=total_cost,
             )
             if response.finish_reason is ModelFinishReason.STOP:
-                transition(AgentLoopState.EVALUATE)
                 return result(
                     AgentLoopState.COMPLETE,
                     AgentTerminationReason.FINAL_ANSWER,
@@ -313,9 +263,7 @@ class AgentLoop:
                 )
 
             round_made_progress = False
-            workspace_changed = False
             for call in response.message.tool_calls:
-                transition(AgentLoopState.AUTHORIZE)
                 fingerprint = self._tool_fingerprint(call)
                 if fingerprint == last_action_fingerprint:
                     consecutive_repeats += 1
@@ -339,7 +287,7 @@ class AgentLoop:
                         AgentTerminationReason.UNKNOWN_TOOL,
                     )
                 try:
-                    transition(AgentLoopState.EXECUTE_TOOLS)
+                    transition(AgentLoopState.EXECUTE)
                     remaining_seconds = self._config.max_wall_seconds - (
                         self._monotonic() - started_at
                     )
@@ -386,35 +334,7 @@ class AgentLoop:
                         created_at=self._clock(),
                     )
                 )
-                workspace_changed |= _may_change_workspace(call.tool_name)
                 transition(AgentLoopState.OBSERVE)
-            if workspace_changed and self._context_gatherer is not None:
-                try:
-                    refreshed = await self._gather_context_with_limits(
-                        task,
-                        cancel_event=cancel_event,
-                        timeout_seconds=max(
-                            0.001,
-                            self._config.max_wall_seconds
-                            - (self._monotonic() - started_at),
-                        ),
-                    )
-                except _RunCancelled:
-                    return result(
-                        AgentLoopState.CANCELLED,
-                        AgentTerminationReason.USER_CANCELLED,
-                    )
-                except TimeoutError:
-                    return result(
-                        AgentLoopState.FAILED,
-                        AgentTerminationReason.WALL_TIME_EXCEEDED,
-                    )
-                except Exception:
-                    return result(
-                        AgentLoopState.FAILED,
-                        AgentTerminationReason.CONTEXT_FAILED,
-                    )
-                messages.extend(refreshed)
             await self._save_progress(
                 messages,
                 round_count=round_count,
@@ -424,7 +344,6 @@ class AgentLoop:
                 reasoning_tokens=reasoning_tokens,
                 total_cost=total_cost,
             )
-            transition(AgentLoopState.EVALUATE)
             if round_made_progress:
                 no_progress_rounds = 0
             else:
@@ -503,51 +422,6 @@ class AgentLoop:
             if not provider_task.done():
                 provider_task.cancel()
                 await asyncio.gather(provider_task, return_exceptions=True)
-            if cancel_task is not None:
-                cancel_task.cancel()
-                await asyncio.gather(cancel_task, return_exceptions=True)
-
-    async def _gather_context_with_limits(
-        self,
-        task: AgentTask,
-        *,
-        cancel_event: asyncio.Event | None,
-        timeout_seconds: float,
-    ) -> tuple[Message, ...]:
-        """让上下文获取与模型和工具共享取消、墙钟失败关闭语义。"""
-        if self._context_gatherer is None:
-            return ()
-
-        async def invoke_gatherer() -> tuple[Message, ...]:
-            """把通用 Awaitable 收窄为 asyncio 可调度协程。"""
-            if self._context_gatherer is None:
-                return ()
-            return await self._context_gatherer(task)
-
-        gather_task = asyncio.create_task(invoke_gatherer())
-        cancel_task = (
-            asyncio.create_task(cancel_event.wait())
-            if cancel_event is not None
-            else None
-        )
-        waiters: set[asyncio.Task[object]] = {gather_task}
-        if cancel_task is not None:
-            waiters.add(cancel_task)
-        try:
-            done, _ = await asyncio.wait(
-                waiters,
-                timeout=max(0.0, timeout_seconds),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            if gather_task in done:
-                return await gather_task
-            if cancel_task is not None and cancel_task in done:
-                raise _RunCancelled
-            raise TimeoutError
-        finally:
-            if not gather_task.done():
-                gather_task.cancel()
-                await asyncio.gather(gather_task, return_exceptions=True)
             if cancel_task is not None:
                 cancel_task.cancel()
                 await asyncio.gather(cancel_task, return_exceptions=True)

@@ -7,6 +7,14 @@ class KernelError(RuntimeError):
     """作为薄 Kernel 可预期错误的公共基类。"""
 
 
+class DemandCausalityError(KernelError):
+    """表示 Demand 来源、父节点或运行身份不满足因果约束。"""
+
+
+class DemandJournalError(KernelError):
+    """表示 Demand 无法在能力激活前完成耐久写入。"""
+
+
 class ManifestError(KernelError):
     """表示 Manifest 不可读取或不满足静态契约。"""
 
@@ -27,35 +35,6 @@ class ModuleActivationError(KernelError):
     """表示模块 factory 或显式激活阶段失败。"""
 
 
-class ModuleUnavailableError(ModuleActivationError):
-    """表示模块尚未运行，但本机缺少声明的激活前提。"""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        availability: str,
-        missing_components: tuple[str, ...],
-        suggested_action: str | None,
-    ) -> None:
-        super().__init__(message)
-        self.availability = availability
-        self.missing_components = missing_components
-        self.suggested_action = suggested_action
-
-
-class ModuleQuarantinedError(ModuleActivationError):
-    """表示模块因上次未完成激活而被隔离。"""
-
-
-class SafeModeViolationError(ModuleActivationError):
-    """表示 Safe Mode 拒绝激活可选模块。"""
-
-
-class ActivationJournalError(KernelError):
-    """表示 pending activation journal 损坏或不可写。"""
-
-
 class ResourceScopeClosedError(KernelError):
     """表示关闭后仍尝试向 ResourceScope 注册资源。"""
 
@@ -70,7 +49,3 @@ class ResourceLeakError(KernelError):
 
 class ModuleShutdownError(KernelError):
     """表示模块关闭已尽力完成但至少一项失败。"""
-
-
-class ModuleOverridePersistenceError(KernelError):
-    """表示模块启用覆盖无法原子读取或持久化。"""

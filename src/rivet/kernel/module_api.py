@@ -24,9 +24,11 @@ class ModuleActivationContext:
     """向模块提供仓库身份和经过约束的初始化依赖。"""
 
     repository: Path
-    safe_mode: bool
     provider_base_url: str | None = None
     credential_accessor: CredentialAccessor | None = None
+    transaction_state_root: Path | None = None
+    evidence_state_root: Path | None = None
+    worktree_cache_root: Path | None = None
     module_id: ModuleId | None = None
     declared_capabilities: tuple[CapabilityId, ...] = ()
     dependencies: Mapping[CapabilityId, object] = field(

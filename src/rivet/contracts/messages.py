@@ -1,4 +1,4 @@
-"""定义会话消息与不进入普通 TUI 文本的 Provider 状态。"""
+"""定义单次模型循环消息与不进入普通 TUI 文本的 Provider 状态。"""
 
 from __future__ import annotations
 

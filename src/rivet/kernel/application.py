@@ -1,102 +1,172 @@
-"""提供只编排 Manifest 与 ModuleRuntime 的最小常驻 Kernel。"""
+"""提供无法绕过耐久 Demand 门禁的最小 Rivet Kernel。"""
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Iterable
-from contextlib import asynccontextmanager
+from collections.abc import Iterable
 from pathlib import Path
 
 from rivet.contracts.common import CapabilityId
-from rivet.contracts.modules import ModuleManifest
+from rivet.contracts.modules import ModuleManifest, ModuleState
+from rivet.kernel.capability_demand import (
+    CapabilityDemand,
+    DemandContext,
+    DemandHandle,
+    DemandJournal,
+)
+from rivet.kernel.errors import DemandCausalityError, DemandJournalError
 from rivet.kernel.manifests import ManifestLoader
 from rivet.kernel.module_api import ModuleActivationContext
-from rivet.kernel.module_lifecycle import (
-    InMemoryModuleOverrideRepository,
-    ModuleLifecycleService,
-    ModuleOverrideRepository,
-)
+from rivet.kernel.module_events import ModuleLifecycleSink
 from rivet.kernel.module_runtime import (
-    ActivationJournal,
     CapabilityLease,
     ModuleRuntime,
+    ModuleRuntimeSnapshot,
+    _ActivationPermit,  # pyright: ignore[reportPrivateUsage]
 )
+from rivet.kernel.resources import ResourceCounts
 
 
 class RivetKernel:
-    """保持薄边界，只负责模块运行时启动、解析与关闭。"""
+    """先落盘 Demand，再签发 Runtime 私有 Permit。"""
 
     def __init__(
         self,
         runtime: ModuleRuntime,
-        module_lifecycle: ModuleLifecycleService,
+        *,
+        demand_journal: DemandJournal,
+        activation_seal: object,
     ) -> None:
-        self.runtime = runtime
-        self.module_lifecycle = module_lifecycle
+        self._runtime = runtime
+        self._demand_journal = demand_journal
+        self._activation_seal = activation_seal
 
     @classmethod
     def from_manifests(
         cls,
         manifests: tuple[ModuleManifest, ...],
         *,
-        journal_path: Path,
-        safe_mode: bool = False,
-        enabled_overrides: dict[str, bool] | None = None,
-        persisted_overrides: dict[str, bool | None] | None = None,
-        override_repository: ModuleOverrideRepository | None = None,
-        activation_context: ModuleActivationContext | None = None,
+        demand_journal: DemandJournal,
+        lifecycle_sink: ModuleLifecycleSink,
+        activation_context: ModuleActivationContext,
     ) -> RivetKernel:
-        """从已验证 Manifest 构造无副作用 Kernel。"""
+        """构造只解析静态 Manifest、不会导入 factory 的 Kernel。"""
+        seal = object()
         runtime = ModuleRuntime(
             manifests,
-            journal=ActivationJournal(journal_path),
-            safe_mode=safe_mode,
-            enabled_overrides=enabled_overrides,
             activation_context=activation_context,
+            lifecycle_sink=lifecycle_sink,
+            activation_seal=seal,
         )
-        return cls(
-            runtime,
-            ModuleLifecycleService(
-                runtime,
-                override_repository or InMemoryModuleOverrideRepository(),
-                persisted_overrides=persisted_overrides,
-            ),
-        )
+        return cls(runtime, demand_journal=demand_journal, activation_seal=seal)
 
     @classmethod
     def from_manifest_paths(
         cls,
         paths: Iterable[Path],
         *,
-        journal_path: Path,
-        safe_mode: bool = False,
+        demand_journal: DemandJournal,
+        lifecycle_sink: ModuleLifecycleSink,
+        activation_context: ModuleActivationContext,
     ) -> RivetKernel:
-        """静态加载 TOML 后构造 Kernel，仍不导入 factory。"""
         manifests = ManifestLoader().load_paths(paths)
         return cls.from_manifests(
-            manifests, journal_path=journal_path, safe_mode=safe_mode
+            manifests,
+            demand_journal=demand_journal,
+            lifecycle_sink=lifecycle_sink,
+            activation_context=activation_context,
         )
 
     async def start(self) -> None:
-        """启动 required 模块。"""
-        await self.runtime.start()
+        """启动只读 Runtime 元数据；不得激活任何模块。"""
+        await self._runtime.start()
 
-    async def resolve(self, capability_id: CapabilityId) -> object:
-        """委托运行时按需解析能力。"""
-        return await self.runtime.resolve(capability_id)
+    async def begin_user_demand(
+        self,
+        target: str,
+        *,
+        reason: str,
+        context: DemandContext,
+        operation_id: str | None = None,
+    ) -> DemandHandle:
+        demand = CapabilityDemand.user_explicit(
+            target,
+            reason=reason,
+            context=context,
+            operation_id=operation_id,
+        )
+        return await self._persist(demand)
 
-    async def acquire(self, capability_id: CapabilityId) -> CapabilityLease[object]:
-        """委托运行时租用并返回真实 capability。"""
-        return await self.runtime.acquire(capability_id)
+    async def begin_model_tool_demand(
+        self,
+        tool_name: str,
+        *,
+        parent: DemandHandle,
+        reason: str,
+        operation_id: str,
+    ) -> DemandHandle:
+        """把模型工具调用耐久绑定到本次用户任务。"""
+        self._validate_parent(parent)
+        demand = CapabilityDemand.model_tool_call(
+            tool_name,
+            reason=reason,
+            context=parent.context,
+            operation_id=operation_id,
+            parent_demand_id=parent.demand_id,
+        )
+        return await self._persist(demand)
 
-    @asynccontextmanager
-    async def capability(self, capability_id: CapabilityId) -> AsyncGenerator[object]:
-        """以结构化上下文保证 capability Lease 必定归还。"""
-        lease = await self.acquire(capability_id)
-        try:
-            yield lease.capability
-        finally:
-            await lease.release()
+    async def acquire_required(
+        self,
+        capability_id: CapabilityId,
+        *,
+        parent: DemandHandle,
+        reason: str,
+        operation_id: str | None = None,
+    ) -> CapabilityLease[object]:
+        """耐久写入 KERNEL_REQUIRED 后，才允许 Runtime 激活能力。"""
+        self._validate_parent(parent)
+        demand = CapabilityDemand._kernel_required(  # pyright: ignore[reportPrivateUsage]
+            capability_id,
+            reason=reason,
+            context=parent.context,
+            operation_id=operation_id,
+            parent_demand_id=parent.demand_id,
+        )
+        handle = await self._persist(demand)
+        permit = _ActivationPermit(
+            handle=handle,
+            requested_capability_id=capability_id,
+            _seal=self._activation_seal,
+        )
+        return await self._runtime._acquire(  # pyright: ignore[reportPrivateUsage]
+            permit
+        )
+
+    def state(self, module_id: str) -> ModuleState:
+        return self._runtime.state(module_id)
+
+    def snapshots(self) -> tuple[ModuleRuntimeSnapshot, ...]:
+        return self._runtime.snapshots()
+
+    def resource_counts(self) -> ResourceCounts:
+        return self._runtime.resource_counts()
+
+    def provider_module_id(self, capability_id: CapabilityId) -> str:
+        return self._runtime.provider_module_id(capability_id)
 
     async def shutdown(self) -> None:
-        """关闭运行时并执行资源归零门禁。"""
-        await self.runtime.shutdown()
+        await self._runtime.shutdown()
+
+    def _validate_parent(self, parent: DemandHandle) -> None:
+        if (
+            parent._kernel_seal  # pyright: ignore[reportPrivateUsage]
+            is not self._activation_seal
+        ):
+            raise DemandCausalityError("父 DemandHandle 不属于当前 Kernel")
+
+    async def _persist(self, demand: CapabilityDemand) -> DemandHandle:
+        """拒绝不自洽 Journal 收据，成功返回即代表 Demand 已耐久。"""
+        record = await self._demand_journal.append(demand)
+        if record.demand != demand:
+            raise DemandJournalError("Demand Journal 返回了不匹配的收据")
+        return DemandHandle(record=record, _kernel_seal=self._activation_seal)

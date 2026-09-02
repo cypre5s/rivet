@@ -84,7 +84,8 @@ CapabilityId = Annotated[
     str, StringConstraints(pattern=DOTTED_IDENTIFIER_PATTERN, max_length=160)
 ]
 ToolName = Annotated[
-    str, StringConstraints(pattern=DOTTED_IDENTIFIER_PATTERN, max_length=160)
+    str,
+    StringConstraints(pattern=r"^[a-z][a-z0-9_]{0,63}$", max_length=64),
 ]
 EventType = Annotated[
     str, StringConstraints(pattern=DOTTED_IDENTIFIER_PATTERN, max_length=160)
@@ -106,13 +107,6 @@ Sha256Digest = Annotated[
 GitCommit = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{40}$", max_length=40)]
 NonEmptyText = Annotated[str, StringConstraints(min_length=1, max_length=65_536)]
 SummaryText = Annotated[str, StringConstraints(min_length=1, max_length=4_096)]
-MediaType = Annotated[
-    str,
-    StringConstraints(
-        pattern=r"^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$",
-        max_length=160,
-    ),
-]
 
 
 def _validate_repository_path(value: str) -> str:
@@ -165,15 +159,6 @@ class SourceSpan(ContractModel):
         if end < start:
             raise ValueError("来源区间结束位置不得早于开始位置")
         return self
-
-
-class ArtifactReference(ContractModel):
-    """引用受控运行目录中带哈希和大小的产物。"""
-
-    path: RepositoryPath
-    sha256: Sha256Digest
-    size_bytes: int = Field(ge=0)
-    media_type: MediaType
 
 
 class ErrorDetail(ContractModel):

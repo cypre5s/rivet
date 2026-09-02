@@ -26,12 +26,9 @@ Command = tuple[CommandArgument, ...]
 
 
 class TransactionState(StrEnum):
-    """列出从创建到应用或终止的完整事务状态。"""
+    """列出从干净基线到应用或终止的事务状态。"""
 
-    CREATED = "CREATED"
-    SNAPSHOTTED = "SNAPSHOTTED"
-    BASELINED = "BASELINED"
-    PLANNED = "PLANNED"
+    ACCEPTANCE_FROZEN = "ACCEPTANCE_FROZEN"
     PATCHING = "PATCHING"
     VERIFYING = "VERIFYING"
     VERIFIED = "VERIFIED"
@@ -55,11 +52,11 @@ class AcceptanceSpec(ContractModel):
     allowed_new_paths: tuple[RepositoryPath, ...] = ()
     forbidden_paths: tuple[RepositoryPath, ...] = ()
     scope_reason: NonEmptyText = "完成用户任务所需的最小文件集合"
-    scope_source: Literal["explicit", "task", "plan", "project"] = "project"
+    scope_source: Literal["explicit", "task", "project"] = "project"
     expected_behaviors: tuple[NonEmptyText, ...] = Field(min_length=1)
-    preserved_behaviors: tuple[NonEmptyText, ...] = Field(min_length=1)
-    verification_commands: tuple[Command, ...] = Field(min_length=1)
-    behavior_verification_commands: tuple[Command, ...] = ()
+    preserved_behaviors: tuple[NonEmptyText, ...] = ()
+    verification_commands: tuple[Command, ...] = ()
+    behavior_verification_commands: tuple[Command, ...] = Field(min_length=1)
     max_wall_seconds: int = Field(gt=0)
     max_tokens: int = Field(gt=0)
     max_tool_calls: int = Field(gt=0)
@@ -112,7 +109,6 @@ class PatchSet(ContractModel):
     patch_sha256: Sha256Digest
     changed_files: tuple[RepositoryPath, ...]
     created_files: tuple[RepositoryPath, ...] = ()
-    changed_symbols: tuple[str, ...] = ()
     contains_binary_diff: bool = False
     created_at: Timestamp
 
@@ -128,12 +124,10 @@ class TransactionRecord(ContractModel):
     base_commit: GitCommit
     branch: str | None = Field(default=None, min_length=1, max_length=255)
     detached_head: bool
-    dirty: bool
-    dirty_snapshot_hash: GitCommit | None = None
     has_submodules: bool
     submodule_status_sha256: Sha256Digest
     git_config_summary: tuple[str, ...] = ()
-    acceptance_sha256: Sha256Digest | None = None
+    acceptance_sha256: Sha256Digest
     current_patch_id: PatchId | None = None
     evidence_id: EvidenceId | None = None
     evidence_manifest_path: RepositoryPath | None = None
@@ -143,7 +137,9 @@ class TransactionRecord(ContractModel):
 
     @model_validator(mode="after")
     def _validate_evidence_attestation(self) -> Self:
-        """要求三个证据绑定字段同时存在，并覆盖可交付状态。"""
+        """要求干净基线、冻结边界和证据绑定始终相互一致。"""
+        if self.base_commit != self.head_commit:
+            raise ValueError("clean-only 事务要求 base_commit 等于 head_commit")
         evidence_fields = (
             self.evidence_id,
             self.evidence_manifest_path,

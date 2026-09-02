@@ -25,7 +25,7 @@ SENSITIVE_FILENAMES = frozenset(
     }
 )
 
-WorkspaceMode = Literal["ASK", "PLAN", "FIX"]
+WorkspaceMode = Literal["ASK", "FIX"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -39,7 +39,7 @@ class WorkspaceView:
     mode: WorkspaceMode
 
     def as_dict(self) -> dict[str, str | None]:
-        """返回可写入 Trace、Session 与 IPC 的稳定 JSON 元数据。"""
+        """返回可写入 Trace 与 IPC 的稳定 JSON 元数据。"""
         return {
             "effective_root": str(self.effective_root),
             "mode": self.mode,
@@ -140,7 +140,7 @@ class WorkspaceBoundary:
 
     @property
     def effective_root(self) -> Path:
-        """返回所有读、搜、Git、Context、Reader 与进程共同观察的根。"""
+        """返回所有读、搜、Git、Context 与进程共同观察的根。"""
         return self.workspace_view.effective_root
 
     def resolve_repository(

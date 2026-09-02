@@ -10,6 +10,7 @@ from pydantic import Field, model_validator
 from rivet.contracts.common import (
     ContractModel,
     EvidenceId,
+    GitCommit,
     RepositoryPath,
     Sha256Digest,
     SummaryText,
@@ -21,19 +22,15 @@ from rivet.contracts.transactions import Command
 
 
 class VerificationKind(StrEnum):
-    """标识从环境检查到资源完整性的确定性验证层。"""
+    """标识独立 Evidence 所需的七类真实验证事实。"""
 
-    ENVIRONMENT = "V0_ENVIRONMENT"
-    BASELINE = "V1_BASELINE"
-    REPRODUCTION = "V2_REPRODUCTION"
-    TARGETED = "V3_TARGETED"
-    RELATED = "V4_RELATED"
-    REGRESSION = "V5_REGRESSION"
-    STATIC = "V6_STATIC"
-    SCOPE = "V7_SCOPE"
-    SECRET = "V8_SECRET"
-    ACCEPTANCE = "V9_ACCEPTANCE"
-    RESOURCE = "V10_RESOURCE"
+    BASELINE = "BASELINE"
+    BEHAVIOR = "BEHAVIOR"
+    REGRESSION = "REGRESSION"
+    SCOPE = "SCOPE"
+    SECRET = "SECRET"
+    BINDING = "BINDING"
+    RESOURCE = "RESOURCE"
 
 
 class VerificationStatus(StrEnum):
@@ -75,7 +72,9 @@ class Verdict(ContractModel):
     """使 passed 只能与程序化 PASSED 状态一致，拒绝自由伪造。"""
 
     transaction_id: TransactionId
+    base_commit: GitCommit
     acceptance_sha256: Sha256Digest
+    patch_sha256: Sha256Digest
     evidence_id: EvidenceId
     evidence_manifest_path: RepositoryPath
     status: VerificationStatus
@@ -122,11 +121,14 @@ class EvidenceFile(ContractModel):
 
 
 class EvidenceManifest(ContractModel):
-    """绑定证据包、事务、验收哈希与不可重复的文件清单。"""
+    """把证据包绑定到同一基线、验收条件和候选补丁。"""
 
     evidence_id: EvidenceId
     transaction_id: TransactionId
+    base_commit: GitCommit
     acceptance_sha256: Sha256Digest
+    patch_sha256: Sha256Digest
+    patch_redacted: bool = False
     files: tuple[EvidenceFile, ...]
     created_at: Timestamp
 

@@ -2,8 +2,7 @@
 
 from pydantic import BaseModel
 
-from rivet.contracts.common import ArtifactReference, ErrorDetail, SourceSpan
-from rivet.contracts.context import ContextBudget, ContextItem, ContextSelection
+from rivet.contracts.common import ErrorDetail, SourceSpan
 from rivet.contracts.events import TraceEventEnvelope
 from rivet.contracts.guard import (
     AuthorizationDecision,
@@ -18,16 +17,9 @@ from rivet.contracts.messages import (
     ToolMessage,
     UserMessage,
 )
-from rivet.contracts.modules import ModuleManifest, ResourceRecord
+from rivet.contracts.modules import ModuleManifest
 from rivet.contracts.provider import ModelRequest, ModelResponse, TokenUsage
-from rivet.contracts.readers import ReaderRequest, ReaderResult
-from rivet.contracts.tools import (
-    ToolCall,
-    ToolDefinition,
-    ToolError,
-    ToolOutput,
-    ToolResult,
-)
+from rivet.contracts.tools import ToolCall, ToolDefinition
 from rivet.contracts.transactions import AcceptanceSpec, PatchSet, TransactionRecord
 from rivet.contracts.verification import (
     EvidenceFile,
@@ -38,12 +30,8 @@ from rivet.contracts.verification import (
 )
 
 CONTRACT_MODELS: tuple[type[BaseModel], ...] = (
-    ArtifactReference,
     ErrorDetail,
     SourceSpan,
-    ContextBudget,
-    ContextItem,
-    ContextSelection,
     TraceEventEnvelope,
     AuthorizationDecision,
     CapabilityLease,
@@ -58,17 +46,11 @@ CONTRACT_MODELS: tuple[type[BaseModel], ...] = (
     ToolMessage,
     UserMessage,
     ModuleManifest,
-    ResourceRecord,
     ModelRequest,
     ModelResponse,
     TokenUsage,
-    ReaderRequest,
-    ReaderResult,
     ToolCall,
     ToolDefinition,
-    ToolError,
-    ToolOutput,
-    ToolResult,
     AcceptanceSpec,
     PatchSet,
     TransactionRecord,

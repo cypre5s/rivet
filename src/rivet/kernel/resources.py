@@ -164,12 +164,9 @@ class ResourceScope:
         process: asyncio.subprocess.Process,
         *,
         description: str,
-        kind: ResourceKind = ResourceKind.PROCESS,
     ) -> asyncio.subprocess.Process:
         """登记已有进程并按 TERM、有界等待、KILL、wait 回收。"""
         self._ensure_open()
-        if kind not in {ResourceKind.PROCESS, ResourceKind.SIDECAR}:
-            raise ValueError("进程资源只能标记为 process 或 sidecar")
 
         async def cleanup() -> None:
             if process.returncode is not None:
@@ -187,7 +184,7 @@ class ResourceScope:
                 await process.wait()
 
         self._register(
-            kind,
+            ResourceKind.PROCESS,
             cleanup,
             is_active=lambda: process.returncode is None,
             description=description,
@@ -321,8 +318,7 @@ class ResourceScope:
                 resource.kind is ResourceKind.TASK for resource in active_resources
             ),
             active_process_count=sum(
-                resource.kind in {ResourceKind.PROCESS, ResourceKind.SIDECAR}
-                for resource in active_resources
+                resource.kind is ResourceKind.PROCESS for resource in active_resources
             ),
             open_client_count=sum(
                 resource.kind is ResourceKind.CLIENT for resource in active_resources

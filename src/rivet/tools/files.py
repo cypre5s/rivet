@@ -27,31 +27,22 @@ class TextReadResult:
 
 
 def _decode_text(content: bytes) -> tuple[str, str]:
-    """识别 BOM、UTF-8 和 GB18030，并拒绝明显二进制。"""
-    if b"\x00" in content and not content.startswith(
-        (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
-    ):
+    """只接受 UTF-8（可带 BOM），并拒绝二进制与其他编码。"""
+    if b"\x00" in content:
         raise FileToolError("file.binary_content", "文件包含二进制 NUL 字节")
-    candidates: tuple[tuple[str, str], ...]
-    if content.startswith(codecs.BOM_UTF8):
-        candidates = (("utf-8-sig", "utf-8-sig"),)
-    elif content.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
-        candidates = (("utf-16", "utf-16"),)
-    else:
-        candidates = (("utf-8", "utf-8"), ("gb18030", "gb18030"))
-    for codec_name, label in candidates:
-        try:
-            decoded = content.decode(codec_name, errors="strict")
-        except UnicodeDecodeError:
-            continue
-        control_count = sum(
-            ord(character) < 32 and character not in "\n\r\t\f\b"
-            for character in decoded
-        )
-        if decoded and control_count / len(decoded) > 0.02:
-            break
-        return decoded, label
-    raise FileToolError("file.encoding_unsupported", "文件不是受支持的安全文本编码")
+    codec_name = "utf-8-sig" if content.startswith(codecs.BOM_UTF8) else "utf-8"
+    try:
+        decoded = content.decode(codec_name, errors="strict")
+    except UnicodeDecodeError as error:
+        raise FileToolError(
+            "file.encoding_unsupported", "文件不是受支持的 UTF-8 文本"
+        ) from error
+    control_count = sum(
+        ord(character) < 32 and character not in "\n\r\t\f\b" for character in decoded
+    )
+    if decoded and control_count / len(decoded) > 0.02:
+        raise FileToolError("file.binary_content", "文件包含过多二进制控制字符")
+    return decoded, codec_name
 
 
 class FileReader:

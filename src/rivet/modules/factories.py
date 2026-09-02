@@ -1,33 +1,25 @@
-"""提供在 Activation Journal 内构造真实服务的生产模块工厂。"""
+"""提供五个核心能力模块的惰性生产工厂。"""
 
 from __future__ import annotations
 
+import os
+import shutil
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import TYPE_CHECKING, cast
 
 from rivet.contracts.common import CapabilityId
 from rivet.kernel.module_api import ModuleActivationContext
 from rivet.kernel.resources import ResourceScope
 
 if TYPE_CHECKING:
-    from rivet.contracts.readers import ReaderRequest, ReaderResult
     from rivet.kernel.model_provider import ModelProvider
-    from rivet.readers.base import FileInspection
     from rivet.tools.paths import WorkspaceBoundary
     from rivet.tools.process import ProcessExecutor
-    from rivet.tools.registry import ToolAuthorizer, ToolRegistry
     from rivet.transaction.manager import TransactionManager
-    from rivet.verify.detector import ProjectConfiguration
     from rivet.verify.service import VerificationOutcome
 
-
-class _AsyncCloseable(Protocol):
-    """描述 Context 模块需要显式关闭的 capability。"""
-
-    async def close(self) -> None:
-        """关闭内部 sidecar。"""
-        ...
+    from .capabilities import GuardCapability
 
 
 def _create_deepseek_provider(
@@ -72,86 +64,42 @@ class ProviderCapabilityModule(_ScopeOwnedModule):
         return {"provider.chat.completions": provider}
 
 
-class ContextCapabilityModule:
-    """按 Manifest ID 构造真实渐进检索器或语义检索器。"""
+class ContextCapabilityService:
+    """把词法搜索器延迟绑定到每个任务的实际 WorkspaceBoundary。"""
 
-    def __init__(self) -> None:
-        self._closeable: _AsyncCloseable | None = None
+    def __init__(self, scope: ResourceScope) -> None:
+        self._scope = scope
+
+    async def search(
+        self,
+        boundary: WorkspaceBoundary,
+        query: str,
+        *,
+        max_results: int = 8,
+        paths: tuple[str, ...] = (".",),
+    ):
+        """ASK 搜主仓库，FIX 只搜候选 Worktree 的冻结读范围。"""
+        from rivet.context.lexical import LexicalContext
+
+        return await LexicalContext(
+            boundary.effective_root,
+            scope=self._scope,
+        ).search(query, max_results=max_results, paths=paths)
+
+
+class ContextCapabilityModule(_ScopeOwnedModule):
+    """只构造 Lexical Context 检索器。"""
 
     async def activate(
         self,
         context: ModuleActivationContext,
         scope: ResourceScope,
     ) -> Mapping[CapabilityId, object]:
-        """初始化当前层级的 Context service。"""
-        if context.module_id in {"context.lexical", "context.syntax"}:
-            from rivet.context.engine import ProgressiveContext
-
-            capability = ProgressiveContext(context.repository, scope=scope)
-            capability_id = (
-                "context.search.lexical"
-                if context.module_id == "context.lexical"
-                else "context.search.syntax"
-            )
-            return {capability_id: capability}
-        if context.module_id == "context.lsp":
-            from rivet.context.lsp_manifest import LspManifestRegistry
-            from rivet.context.semantic import SemanticContextRetriever
-
-            capability = SemanticContextRetriever(
-                context.repository,
-                scope=scope,
-                registry=LspManifestRegistry.load_builtin(
-                    repository_root=context.repository
-                ),
-            )
-            self._closeable = capability
-            return {"context.search.lsp": capability}
-        raise RuntimeError("Context factory 绑定了未知模块")
-
-    async def sleep(self) -> None:
-        """先关闭可能存在的 LSP sidecar，再由 Scope 执行资源归零。"""
-        closeable, self._closeable = self._closeable, None
-        if closeable is not None:
-            await closeable.close()
-
-    async def shutdown(self) -> None:
-        """程序退出与休眠使用同一幂等关闭路径。"""
-        await self.sleep()
-
-
-class ReaderCapabilityService:
-    """把格式检测和结构化读取绑定到同一个 Reader Scope。"""
-
-    def __init__(self, repository: Path, scope: ResourceScope) -> None:
-        from rivet.readers.service import ReaderService
-
-        self._service = ReaderService(repository, scope=scope)
-
-    def detect(self, source: Path, *, source_path: str) -> FileInspection:
-        """执行不导入具体 Reader 实现的格式检测。"""
-        from rivet.readers.detection import detect_file
-
-        return detect_file(source, source_path=source_path)
-
-    async def read(self, request: ReaderRequest) -> ReaderResult:
-        """委托已属于模块的 ReaderService。"""
-        return await self._service.read(request)
-
-
-class ReaderCapabilityModule(_ScopeOwnedModule):
-    """在激活边界构造 Reader service，并映射紧密相关能力。"""
-
-    async def activate(
-        self,
-        context: ModuleActivationContext,
-        scope: ResourceScope,
-    ) -> Mapping[CapabilityId, object]:
-        """构造 Reader service；具体重量实现仍按文件格式延迟导入。"""
-        service = ReaderCapabilityService(context.repository, scope)
-        return {
-            capability_id: service for capability_id in context.declared_capabilities
-        }
+        """初始化仅含 ripgrep/Git inventory 的 Context service。"""
+        if context.module_id != "context.lexical":
+            raise RuntimeError("Context factory 只允许绑定 context.lexical")
+        capability = ContextCapabilityService(scope)
+        return {"context.search.lexical": capability}
 
 
 class TransactionCapabilityModule(_ScopeOwnedModule):
@@ -165,7 +113,13 @@ class TransactionCapabilityModule(_ScopeOwnedModule):
         """初始化 Git backend，并在失败时保持模块非 ACTIVE。"""
         from rivet.transaction.manager import TransactionManager
 
-        manager = TransactionManager(context.repository, scope=scope)
+        manager = TransactionManager(
+            context.repository,
+            scope=scope,
+            state_root=context.transaction_state_root,
+            evidence_root=context.evidence_state_root,
+            cache_root=context.worktree_cache_root,
+        )
         await manager.inspect_repository()
         return {"transaction.worktree": manager}
 
@@ -173,25 +127,41 @@ class TransactionCapabilityModule(_ScopeOwnedModule):
 class VerificationCapabilityService:
     """将 Verify Scope 与已激活 TransactionManager 固定绑定。"""
 
-    def __init__(self, manager: TransactionManager, scope: ResourceScope) -> None:
+    def __init__(
+        self,
+        manager: TransactionManager,
+        guard: GuardCapability,
+        scope: ResourceScope,
+    ) -> None:
         self._manager = manager
+        self._guard = guard
         self._scope = scope
 
     async def verify(
         self,
         transaction_id: str,
-        *,
-        project_configuration: ProjectConfiguration | None,
-        configuration_confirmed: bool,
     ) -> VerificationOutcome:
-        """为本次任务构造独立验证器并执行 V0-V10。"""
+        """为本次任务构造独立七类验证器。"""
         from rivet.verify.service import VerificationService
+
+        def executor_factory(
+            boundary: WorkspaceBoundary,
+            runtime_scope: ResourceScope,
+            environment: Mapping[str, str],
+            allowlist: frozenset[str],
+        ) -> ProcessExecutor:
+            del allowlist
+            return self._guard.create_process_runner(
+                boundary,
+                scope=runtime_scope,
+                environment=environment,
+                max_capture_bytes=1024 * 1024,
+            )
 
         return await VerificationService(
             self._manager,
             scope=self._scope,
-            project_configuration=project_configuration,
-            configuration_confirmed=configuration_confirmed,
+            executor_factory=executor_factory,
         ).verify(transaction_id)
 
 
@@ -208,37 +178,51 @@ class VerificationCapabilityModule(_ScopeOwnedModule):
             "TransactionManager",
             context.dependencies["transaction.worktree"],
         )
-        service = VerificationCapabilityService(manager, scope)
+        guard = cast(
+            "GuardCapability",
+            context.dependencies["guard.local_execution"],
+        )
+        service = VerificationCapabilityService(manager, guard, scope)
         return {"verify.deterministic": service}
 
 
-class WorkspaceToolCapabilityService:
-    """确保任务级 Tool Registry 的进程资源归属于 Guard Scope。"""
+class GuardCapabilityService:
+    """用 Guard Scope 创建失败关闭的 Bubblewrap 进程执行器。"""
 
-    def __init__(self, scope: ResourceScope) -> None:
+    def __init__(
+        self,
+        scope: ResourceScope,
+        *,
+        executable: Path | None = None,
+    ) -> None:
         self._scope = scope
+        configured = os.environ.get("RIVET_BWRAP_PATH")
+        discovered = shutil.which("bwrap")
+        self._executable = Path(executable or configured or discovered or "bwrap")
 
-    def create_registry(
+    @property
+    def available(self) -> bool:
+        """写入或进程能力激活前即验证 bubblewrap 可执行文件。"""
+        return self._executable.is_file() and os.access(self._executable, os.X_OK)
+
+    def create_process_runner(
         self,
         boundary: WorkspaceBoundary,
         *,
-        model_preview_chars: int = 8_192,
-        tui_preview_chars: int = 65_536,
-        authorizer: ToolAuthorizer | None = None,
-        process_executor: ProcessExecutor | None = None,
-        read_only: bool = False,
-    ) -> ToolRegistry:
-        """使用正式 toolset factory 创建受管 Registry。"""
-        from rivet.tools.toolset import build_workspace_tool_registry
+        executable: Path | None = None,
+        scope: ResourceScope | None = None,
+        environment: Mapping[str, str] | None = None,
+        max_capture_bytes: int = 5 * 1024 * 1024,
+    ) -> ProcessExecutor:
+        """创建资源归属当前 Lease、沙箱不可用即拒绝裸跑的执行器。"""
+        from rivet.guard.sandbox import BubblewrapSandbox
 
-        return build_workspace_tool_registry(
+        return BubblewrapSandbox(
             boundary,
-            scope=self._scope,
-            model_preview_chars=model_preview_chars,
-            tui_preview_chars=tui_preview_chars,
-            authorizer=authorizer,
-            process_executor=process_executor,
-            read_only=read_only,
+            scope=scope or self._scope,
+            executable=executable or self._executable,
+            environment=environment,
+            max_capture_bytes=max_capture_bytes,
         )
 
 
@@ -251,7 +235,9 @@ class GuardCapabilityModule(_ScopeOwnedModule):
         scope: ResourceScope,
     ) -> Mapping[CapabilityId, object]:
         """构造不启动任何进程的本地工具 factory。"""
-        service = WorkspaceToolCapabilityService(scope)
+        service = GuardCapabilityService(scope)
+        if not service.available:
+            raise RuntimeError("bubblewrap not found")
         return {"guard.local_execution": service}
 
 
@@ -263,11 +249,6 @@ def create_provider_module() -> ProviderCapabilityModule:
 def create_context_module() -> ContextCapabilityModule:
     """构造上下文检索生命周期模块。"""
     return ContextCapabilityModule()
-
-
-def create_reader_module() -> ReaderCapabilityModule:
-    """构造文件读取生命周期模块。"""
-    return ReaderCapabilityModule()
 
 
 def create_transaction_module() -> TransactionCapabilityModule:

@@ -9,7 +9,7 @@ from typing import cast
 
 from pydantic import ValidationError
 
-from rivet.contracts.modules import ActivationPolicy, ModuleManifest
+from rivet.contracts.modules import ModuleManifest
 from rivet.kernel.errors import ManifestError
 
 
@@ -53,9 +53,6 @@ class ManifestLoader:
                 value = normalized.get(field_name)
                 if isinstance(value, list):
                     normalized[field_name] = tuple(cast(list[object], value))
-            activation = normalized.get("activation")
-            if isinstance(activation, str):
-                normalized["activation"] = ActivationPolicy(activation)
             return ModuleManifest.model_validate(normalized)
         except (
             OSError,

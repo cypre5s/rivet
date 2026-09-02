@@ -123,15 +123,14 @@ class PermissionRequest(ContractModel):
                 raise ValueError("具体域名范围只适用于网络权限")
         elif self.paths or self.domains:
             raise ValueError("工作区或事务范围不得附带路径和域名")
+        if self.scope is PermissionScope.TRANSACTION and self.transaction_id is None:
+            raise ValueError("事务或具体路径权限必须绑定事务")
         if (
-            self.scope
-            in {
-                PermissionScope.TRANSACTION,
-                PermissionScope.SPECIFIC_PATHS,
-            }
+            self.scope is PermissionScope.SPECIFIC_PATHS
+            and self.permission is not Permission.READ
             and self.transaction_id is None
         ):
-            raise ValueError("事务或具体路径权限必须绑定事务")
+            raise ValueError("写入具体路径权限必须绑定事务")
         if (
             self.permission is Permission.WRITE
             and self.scope is PermissionScope.WORKSPACE
