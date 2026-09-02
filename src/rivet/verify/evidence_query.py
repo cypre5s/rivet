@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import unicodedata
-from pathlib import Path
 from typing import cast
 
 from pydantic import JsonValue
@@ -38,10 +37,8 @@ class EvidenceQueryService:
         payload: dict[str, JsonValue] = {
             "acceptance_sha256": record.acceptance_sha256,
             "apply_eligible": record.state is TransactionState.VERIFIED,
+            "base_commit": record.base_commit,
             "changed_files": list(patch.changed_files) if patch is not None else [],
-            "changed_symbols": (
-                list(patch.changed_symbols) if patch is not None else []
-            ),
             "evidence_id": record.evidence_id,
             "evidence_verified": False,
             "manifest_sha256": record.evidence_manifest_sha256,
@@ -72,6 +69,7 @@ class EvidenceQueryService:
         payload.update(
             {
                 "acceptance_sha256": verdict.acceptance_sha256,
+                "base_commit": verdict.base_commit,
                 "decided_at": verdict.decided_at.isoformat(),
                 "evidence_verified": True,
                 "files": [
@@ -145,10 +143,10 @@ class EvidenceQueryService:
                 "transaction.evidence_log_hash_mismatch",
                 "验证日志未与 Evidence manifest 正确绑定",
             )
-        attempt = (
-            self._store.transaction_directory(transaction_id)
-            / Path(record.evidence_manifest_path).parent
-        )
+        attempt = self._store.evidence_manifest_path(
+            transaction_id,
+            record.evidence_manifest_path,
+        ).parent
         path = attempt / result.log_path
         if path.is_symlink() or not path.is_file():
             raise TransactionError(
@@ -183,14 +181,15 @@ class EvidenceQueryService:
         manifest_relative_path: str,
     ) -> EvidenceManifest:
         """在 Store 全量复核后读取同一受限 manifest 契约。"""
-        path = (
-            self._store.transaction_directory(transaction_id) / manifest_relative_path
+        path = self._store.evidence_manifest_path(
+            transaction_id,
+            manifest_relative_path,
         )
         return EvidenceManifest.model_validate_json(path.read_bytes())
 
     @staticmethod
     def _result_payload(result: VerificationResult) -> dict[str, JsonValue]:
-        """投影单个 V0–V10 事实，不回显未脱敏环境。"""
+        """投影单个验证事实，不回显未脱敏环境。"""
         return {
             "argv": list(result.step.command),
             "duration_ms": result.duration_ms,

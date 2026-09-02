@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import StrEnum
 from pathlib import Path
 
 from rivet.contracts.common import (
     ContractModel,
+    GitCommit,
     PatchId,
     Sha256Digest,
     Timestamp,
@@ -16,19 +16,15 @@ from rivet.contracts.common import (
 from rivet.contracts.transactions import AcceptanceSpec, PatchSet, TransactionRecord
 
 
-class DirtyPolicy(StrEnum):
-    """区分拒绝脏仓库和显式创建非破坏性快照。"""
-
-    REJECT = "reject"
-    SNAPSHOT = "snapshot"
-
-
 class ApplyIntent(ContractModel):
     """在修改主工作区前持久化可恢复的 apply 意图。"""
 
     transaction_id: TransactionId
     patch_id: PatchId
+    base_commit: GitCommit
+    acceptance_sha256: Sha256Digest
     patch_sha256: Sha256Digest
+    evidence_manifest_sha256: Sha256Digest
     repository_fingerprint: Sha256Digest
     created_at: Timestamp
 

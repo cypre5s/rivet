@@ -14,8 +14,10 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
+from rivet.contracts.transactions import AcceptanceSpec
 from rivet.contracts.verification import EvidenceFile, EvidenceManifest
 from rivet.trace.redaction import SecretRedactor
+from rivet.transaction.hashing import acceptance_sha256 as compute_acceptance_sha256
 from rivet.transaction.hashing import canonical_json_bytes, sha256_digest
 
 from .errors import VerificationError
@@ -24,19 +26,14 @@ from .security import contains_secret
 MANDATORY_EVIDENCE_FILES = frozenset(
     {
         "acceptance_spec.json",
-        "acceptance_spec.sha256",
         "patch.diff",
-        "changed_files.json",
-        "changed_symbols.json",
         "baseline.log",
-        "focused_tests.log",
-        "regression_tests.log",
-        "static_checks.log",
+        "behavior.log",
+        "regression.log",
         "scope_check.json",
         "secret_scan.json",
-        "acceptance_check.json",
+        "binding_check.json",
         "resource_check.json",
-        "risk_report.md",
         "matrix.json",
         "verdict.json",
         "summary.md",
@@ -74,7 +71,9 @@ class EvidenceBundleWriter:
         self,
         *,
         transaction_id: str,
+        base_commit: str,
         acceptance_sha256: str,
+        patch_sha256: str,
         files: Mapping[str, bytes],
         evidence_id: str | None = None,
         attempt_name: str | None = None,
@@ -90,6 +89,25 @@ class EvidenceBundleWriter:
             raise VerificationError(
                 "verification.evidence_manifest_reserved",
                 "manifest.json 只能由证据写入器生成",
+            )
+        try:
+            specification = AcceptanceSpec.model_validate_json(
+                files["acceptance_spec.json"]
+            )
+        except ValidationError as error:
+            raise VerificationError(
+                "verification.evidence_acceptance_invalid",
+                "Evidence 中的 AcceptanceSpec 无法校验",
+            ) from error
+        if compute_acceptance_sha256(specification) != acceptance_sha256:
+            raise VerificationError(
+                "verification.evidence_acceptance_mismatch",
+                "Evidence 未绑定冻结 AcceptanceSpec",
+            )
+        if sha256_digest(files["patch.diff"]) != patch_sha256:
+            raise VerificationError(
+                "verification.evidence_patch_mismatch",
+                "Evidence 未绑定冻结 PatchSet",
             )
         self._prepare_root()
         selected_attempt = attempt_name or self._next_attempt_name()
@@ -111,9 +129,12 @@ class EvidenceBundleWriter:
         try:
             evidence_files: list[EvidenceFile] = []
             total_bytes = 0
+            patch_redacted = False
             for relative_path in sorted(files):
                 self._validate_flat_path(relative_path)
                 content = self._sanitize(files[relative_path])
+                if relative_path == "patch.diff":
+                    patch_redacted = content != files[relative_path]
                 total_bytes += len(content)
                 if (
                     len(content) > MAX_EVIDENCE_FILE_BYTES
@@ -135,7 +156,10 @@ class EvidenceBundleWriter:
             manifest = EvidenceManifest(
                 evidence_id=evidence_id or f"evidence_{uuid.uuid4().hex}",
                 transaction_id=transaction_id,
+                base_commit=base_commit,
                 acceptance_sha256=acceptance_sha256,
+                patch_sha256=patch_sha256,
+                patch_redacted=patch_redacted,
                 files=tuple(evidence_files),
                 created_at=created_at,
             )

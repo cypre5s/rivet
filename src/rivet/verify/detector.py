@@ -38,11 +38,9 @@ class ProjectCommandCandidate:
 
 @dataclass(frozen=True, slots=True)
 class ProjectConfiguration:
-    """保存 `.rivet/project.toml` 中五类显式 argv。"""
+    """保存 FIX 前可冻结的独立验收与可选质量命令。"""
 
     acceptance: tuple[tuple[str, ...], ...] = ()
-    targeted: tuple[tuple[str, ...], ...] = ()
-    related: tuple[tuple[str, ...], ...] = ()
     regression: tuple[tuple[str, ...], ...] = ()
     static: tuple[tuple[str, ...], ...] = ()
 
@@ -96,8 +94,8 @@ def evidence_readiness(detection: ProjectDetection) -> EvidenceReadiness:
         suggestions=detection.candidates,
         reason=reason,
         next_action=(
-            "运行 rivet init 查看只读检测建议，确认后使用 rivet init --yes，"
-            "再在 .rivet/project.toml 中配置独立 verification.acceptance argv"
+            "在 .rivet/project.toml 中配置并确认独立 "
+            "verification.acceptance argv 后再运行 fix"
         ),
     )
 
@@ -242,8 +240,6 @@ class ProjectDetector:
         verification = cast(dict[str, object], raw_verification)
         allowed_groups = {
             "acceptance",
-            "targeted",
-            "related",
             "regression",
             "static",
         }
@@ -254,8 +250,6 @@ class ProjectDetector:
             )
         return ProjectConfiguration(
             acceptance=self._parse_commands(verification.get("acceptance", [])),
-            targeted=self._parse_commands(verification.get("targeted", [])),
-            related=self._parse_commands(verification.get("related", [])),
             regression=self._parse_commands(verification.get("regression", [])),
             static=self._parse_commands(verification.get("static", [])),
         )

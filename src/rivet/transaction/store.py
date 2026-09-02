@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import TypeVar
@@ -37,15 +39,23 @@ ModelT = TypeVar(
 TRANSACTION_ID_PATTERN = re.compile(r"^tx_[a-z0-9][a-z0-9_-]{0,62}$")
 PATCH_ID_PATTERN = re.compile(r"^patch_[a-z0-9][a-z0-9_-]{0,62}$")
 EVIDENCE_ATTEMPT_PATTERN = re.compile(r"^attempt_[0-9]{4}$")
+FROZEN_PUBLISH_STAGING_PATTERN = re.compile(
+    r"^\.tx_[a-z0-9][a-z0-9_-]{0,62}\.publish-[a-z0-9_]+$"
+)
 REQUIRED_ATTESTATION_FILES = frozenset(
     {
         "acceptance_spec.json",
-        "acceptance_spec.sha256",
         "patch.diff",
+        "baseline.log",
+        "behavior.log",
+        "regression.log",
         "scope_check.json",
         "secret_scan.json",
+        "binding_check.json",
         "resource_check.json",
+        "matrix.json",
         "verdict.json",
+        "summary.md",
     }
 )
 MAX_EVIDENCE_TOTAL_BYTES = 128 * 1024 * 1024
@@ -74,18 +84,28 @@ def _validated_patch_id(patch_id: str) -> str:
 class TransactionStore:
     """在私有状态根内原子保存可恢复事务事实。"""
 
-    def __init__(self, state_root: Path) -> None:
+    def __init__(self, state_root: Path, *, evidence_root: Path | None = None) -> None:
         self.state_root = state_root.resolve(strict=False)
+        self.evidence_root = (
+            evidence_root.resolve(strict=False)
+            if evidence_root is not None
+            else (self.state_root.parent / "evidence").resolve(strict=False)
+        )
 
     def prepare(self) -> None:
         """显式创建私有状态根并拒绝符号链接。"""
-        if self.state_root.is_symlink():
-            raise TransactionError(
-                "transaction.state_root_symlink",
-                "事务状态根不得是符号链接",
-            )
-        self.state_root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.state_root.chmod(0o700)
+        for root, label in (
+            (self.state_root, "事务状态根"),
+            (self.evidence_root, "Evidence 状态根"),
+        ):
+            if root.is_symlink():
+                raise TransactionError(
+                    "transaction.state_root_symlink",
+                    f"{label}不得是符号链接",
+                )
+            root.mkdir(parents=True, exist_ok=True, mode=0o700)
+            root.chmod(0o700)
+        self._cleanup_stale_frozen_publications()
 
     def transaction_directory(self, transaction_id: str) -> Path:
         """返回经过 ID 校验且不能逃逸的事务状态目录。"""
@@ -97,6 +117,46 @@ class TransactionStore:
                 "事务状态路径不得是符号链接",
             )
         return path
+
+    def evidence_directory(self, transaction_id: str) -> Path:
+        """返回独立 Evidence 根内经过事务 ID 校验的目录。"""
+        validated = _validated_transaction_id(transaction_id)
+        path = self.evidence_root / validated
+        if path.is_symlink():
+            raise TransactionError(
+                "transaction.evidence_path_symlink",
+                "Evidence 事务目录不得是符号链接",
+            )
+        return path
+
+    def evidence_manifest_path(
+        self,
+        transaction_id: str,
+        manifest_relative_path: str,
+    ) -> Path:
+        """解析 `<tx>/<attempt>/manifest.json`，拒绝跨事务路径。"""
+        validated = _validated_transaction_id(transaction_id)
+        relative = Path(manifest_relative_path)
+        if (
+            relative.is_absolute()
+            or len(relative.parts) != 3
+            or relative.parts[0] != validated
+            or not EVIDENCE_ATTEMPT_PATTERN.fullmatch(relative.parts[1])
+            or relative.parts[2] != "manifest.json"
+        ):
+            raise TransactionError(
+                "transaction.evidence_path_invalid",
+                "Evidence manifest 路径无效",
+            )
+        cursor = self.evidence_root
+        for part in relative.parts:
+            cursor /= part
+            if cursor.is_symlink():
+                raise TransactionError(
+                    "transaction.evidence_path_symlink",
+                    "Evidence 路径不得包含符号链接",
+                )
+        return self.evidence_root / relative
 
     def record_path(self, transaction_id: str) -> Path:
         """返回事务记录路径。"""
@@ -133,15 +193,92 @@ class TransactionStore:
         return self.transaction_directory(transaction_id) / "apply_intent.json"
 
     def save_record(self, record: TransactionRecord) -> None:
-        """原子覆盖当前事务记录并 fsync。"""
+        """只在已原子发布的事务目录中覆盖记录并 fsync。"""
         directory = self.transaction_directory(record.transaction_id)
-        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        if not directory.is_dir():
+            raise TransactionError(
+                "transaction.record_parent_missing",
+                "事务尚未原子发布，不能单独保存记录",
+            )
         directory.chmod(0o700)
         self._atomic_write(
             self.record_path(record.transaction_id),
             canonical_json_bytes(record.model_dump(mode="json")) + b"\n",
             mode=0o600,
         )
+
+    def publish_frozen_transaction(
+        self,
+        record: TransactionRecord,
+        specification: AcceptanceSpec,
+    ) -> None:
+        """以一次目录 rename 原子发布首个记录、验收规范和规范哈希。"""
+        if (
+            record.state is not TransactionState.ACCEPTANCE_FROZEN
+            or record.current_patch_id is not None
+            or record.evidence_id is not None
+            or record.evidence_manifest_path is not None
+            or record.evidence_manifest_sha256 is not None
+        ):
+            raise TransactionError(
+                "transaction.frozen_publish_invalid",
+                "首个事务发布必须是无补丁、无证据的 ACCEPTANCE_FROZEN 记录",
+            )
+        digest = acceptance_sha256(specification)
+        if record.acceptance_sha256 != digest:
+            raise TransactionError(
+                "transaction.acceptance_hash_mismatch",
+                "首个事务记录未绑定给定 AcceptanceSpec",
+            )
+        final_directory = self.transaction_directory(record.transaction_id)
+        root_descriptor = self._open_state_root()
+        staging_directory: Path | None = None
+        published = False
+        try:
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX)
+            if final_directory.exists():
+                raise TransactionError(
+                    "transaction.already_exists",
+                    "事务 ID 已存在",
+                )
+            staging_directory = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{record.transaction_id}.publish-",
+                    dir=self.state_root,
+                )
+            )
+            staging_directory.chmod(0o700)
+            self._atomic_write(
+                staging_directory / "acceptance_spec.json",
+                canonical_json_bytes(specification.model_dump(mode="json")) + b"\n",
+                mode=0o400,
+            )
+            self._atomic_write(
+                staging_directory / "acceptance_spec.sha256",
+                f"{digest}\n".encode("ascii"),
+                mode=0o400,
+            )
+            self._atomic_write(
+                staging_directory / "record.json",
+                canonical_json_bytes(record.model_dump(mode="json")) + b"\n",
+                mode=0o600,
+            )
+            self._fsync_directory(staging_directory)
+            os.rename(staging_directory, final_directory)
+            published = True
+            os.fsync(root_descriptor)
+        except TransactionError:
+            raise
+        except OSError as error:
+            raise TransactionError(
+                "transaction.frozen_publish_failed",
+                "无法原子发布冻结事务事实",
+            ) from error
+        finally:
+            if staging_directory is not None and not published:
+                shutil.rmtree(staging_directory, ignore_errors=True)
+            fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+            os.close(root_descriptor)
 
     def load_record(self, transaction_id: str) -> TransactionRecord:
         """严格加载一个存在的事务记录。"""
@@ -152,29 +289,6 @@ class TransactionStore:
             missing_code="transaction.record_missing",
             invalid_code="transaction.record_invalid",
         )
-
-    def write_acceptance(
-        self,
-        transaction_id: str,
-        specification: AcceptanceSpec,
-    ) -> str:
-        """只写一次 AcceptanceSpec 与哈希，并将文件设为只读。"""
-        content = canonical_json_bytes(specification.model_dump(mode="json")) + b"\n"
-        digest = acceptance_sha256(specification)
-        specification_path = self.acceptance_path(transaction_id)
-        hash_path = self.acceptance_hash_path(transaction_id)
-        if specification_path.exists() or hash_path.exists():
-            existing = self.load_acceptance(transaction_id, expected_sha256=digest)
-            if existing != specification:
-                raise TransactionError(
-                    "transaction.acceptance_frozen",
-                    "AcceptanceSpec 已冻结且不可修改",
-                )
-            return digest
-        specification_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self._atomic_write(specification_path, content, mode=0o400)
-        self._atomic_write(hash_path, f"{digest}\n".encode("ascii"), mode=0o400)
-        return digest
 
     def load_acceptance(
         self,
@@ -297,7 +411,8 @@ class TransactionStore:
         self,
         verdict: Verdict,
         *,
-        expected_patch_sha256: str | None = None,
+        expected_base_commit: str,
+        expected_patch_sha256: str,
     ) -> str:
         """复核 Verdict 所指清单和全部文件，并返回 manifest 哈希。"""
         manifest_digest, persisted_verdict = self._verify_evidence_bundle(
@@ -305,6 +420,7 @@ class TransactionStore:
             acceptance_sha256=verdict.acceptance_sha256,
             evidence_id=verdict.evidence_id,
             manifest_relative_path=verdict.evidence_manifest_path,
+            expected_base_commit=expected_base_commit,
             expected_patch_sha256=expected_patch_sha256,
         )
         if persisted_verdict != verdict:
@@ -322,8 +438,7 @@ class TransactionStore:
     ) -> Verdict:
         """在 apply 前按事务记录重新验证 EvidenceBundle。"""
         if (
-            record.acceptance_sha256 is None
-            or record.evidence_id is None
+            record.evidence_id is None
             or record.evidence_manifest_path is None
             or record.evidence_manifest_sha256 is None
         ):
@@ -336,6 +451,7 @@ class TransactionStore:
             acceptance_sha256=record.acceptance_sha256,
             evidence_id=record.evidence_id,
             manifest_relative_path=record.evidence_manifest_path,
+            expected_base_commit=record.base_commit,
             expected_patch_sha256=expected_patch_sha256,
         )
         if manifest_digest != record.evidence_manifest_sha256:
@@ -371,31 +487,14 @@ class TransactionStore:
         acceptance_sha256: str,
         evidence_id: str,
         manifest_relative_path: str,
-        expected_patch_sha256: str | None,
+        expected_base_commit: str,
+        expected_patch_sha256: str,
     ) -> tuple[str, Verdict]:
         """验证受限 attempt 路径、manifest 契约和全量文件哈希。"""
-        relative = Path(manifest_relative_path)
-        if (
-            relative.is_absolute()
-            or len(relative.parts) != 3
-            or relative.parts[0] != "evidence"
-            or not EVIDENCE_ATTEMPT_PATTERN.fullmatch(relative.parts[1])
-            or relative.parts[2] != "manifest.json"
-        ):
-            raise TransactionError(
-                "transaction.evidence_path_invalid",
-                "Evidence manifest 路径无效",
-            )
-        transaction_directory = self.transaction_directory(transaction_id)
-        cursor = transaction_directory
-        for part in relative.parts:
-            cursor /= part
-            if cursor.is_symlink():
-                raise TransactionError(
-                    "transaction.evidence_path_symlink",
-                    "Evidence 路径不得包含符号链接",
-                )
-        manifest_path = transaction_directory / relative
+        manifest_path = self.evidence_manifest_path(
+            transaction_id,
+            manifest_relative_path,
+        )
         try:
             if manifest_path.stat().st_size > MAX_RECORD_BYTES:
                 raise TransactionError(
@@ -413,12 +512,14 @@ class TransactionStore:
             ) from error
         if (
             manifest.transaction_id != transaction_id
+            or manifest.base_commit != expected_base_commit
             or manifest.acceptance_sha256 != acceptance_sha256
+            or manifest.patch_sha256 != expected_patch_sha256
             or manifest.evidence_id != evidence_id
         ):
             raise TransactionError(
                 "transaction.evidence_manifest_mismatch",
-                "Evidence manifest 未绑定当前事务与验收条件",
+                "Evidence manifest 未绑定当前事务、基线、验收条件与补丁",
             )
         attempt_directory = manifest_path.parent
         expected_paths = {evidence_file.path for evidence_file in manifest.files}
@@ -427,17 +528,16 @@ class TransactionStore:
                 "transaction.evidence_files_missing",
                 "Evidence manifest 缺少交付门禁文件",
             )
-        if expected_patch_sha256 is not None:
-            patch_file = next(
-                evidence_file
-                for evidence_file in manifest.files
-                if evidence_file.path == "patch.diff"
+        patch_file = next(
+            evidence_file
+            for evidence_file in manifest.files
+            if evidence_file.path == "patch.diff"
+        )
+        if not manifest.patch_redacted and patch_file.sha256 != expected_patch_sha256:
+            raise TransactionError(
+                "transaction.evidence_patch_mismatch",
+                "Evidence patch 与冻结 PatchSet 不一致",
             )
-            if patch_file.sha256 != expected_patch_sha256:
-                raise TransactionError(
-                    "transaction.evidence_patch_mismatch",
-                    "通过结论中的 Evidence patch 与冻结 PatchSet 不一致",
-                )
         entries = tuple(attempt_directory.iterdir())
         if any(
             entry.is_symlink()
@@ -491,6 +591,22 @@ class TransactionStore:
                 "transaction.evidence_verdict_invalid",
                 "Evidence Verdict 无法读取或校验",
             ) from error
+        if (
+            persisted_verdict.transaction_id != transaction_id
+            or persisted_verdict.base_commit != expected_base_commit
+            or persisted_verdict.acceptance_sha256 != acceptance_sha256
+            or persisted_verdict.patch_sha256 != expected_patch_sha256
+            or persisted_verdict.evidence_id != evidence_id
+        ):
+            raise TransactionError(
+                "transaction.evidence_verdict_binding_mismatch",
+                "Evidence Verdict 未绑定当前事务事实",
+            )
+        if persisted_verdict.passed and manifest.patch_redacted:
+            raise TransactionError(
+                "transaction.evidence_patch_redacted",
+                "通过结论不得使用已脱敏而不可复算的补丁证据",
+            )
         return sha256_digest(manifest_content), persisted_verdict
 
     def record_directories(self) -> tuple[Path, ...]:
@@ -609,3 +725,51 @@ class TransactionStore:
                 os.close(file_descriptor)
             temporary_path.unlink(missing_ok=True)
             raise
+
+    def _open_state_root(self) -> int:
+        """打开同文件系统状态根，供发布锁和目录 fsync 共同使用。"""
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            return os.open(self.state_root, flags)
+        except OSError as error:
+            raise TransactionError(
+                "transaction.state_root_unreadable",
+                "事务状态根无法安全打开",
+            ) from error
+
+    @staticmethod
+    def _fsync_directory(directory: Path) -> None:
+        """在 rename 前确保 staging 目录项已经持久化。"""
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _cleanup_stale_frozen_publications(self) -> None:
+        """持锁删除崩溃遗留且从未成为公共事务的 staging 目录。"""
+        root_descriptor = self._open_state_root()
+        try:
+            fcntl.flock(root_descriptor, fcntl.LOCK_EX)
+            for candidate in self.state_root.iterdir():
+                if not FROZEN_PUBLISH_STAGING_PATTERN.fullmatch(candidate.name):
+                    continue
+                if candidate.is_symlink() or not candidate.is_dir():
+                    raise TransactionError(
+                        "transaction.frozen_staging_invalid",
+                        "冻结事务 staging 路径类型无效",
+                    )
+                shutil.rmtree(candidate)
+            os.fsync(root_descriptor)
+        except TransactionError:
+            raise
+        except OSError as error:
+            raise TransactionError(
+                "transaction.frozen_staging_cleanup_failed",
+                "无法清理未发布的冻结事务 staging",
+            ) from error
+        finally:
+            fcntl.flock(root_descriptor, fcntl.LOCK_UN)
+            os.close(root_descriptor)

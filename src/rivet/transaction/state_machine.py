@@ -7,20 +7,7 @@ from rivet.contracts.transactions import TransactionState
 from .errors import TransactionError
 
 ALLOWED_TRANSITIONS = {
-    TransactionState.CREATED: {
-        TransactionState.SNAPSHOTTED,
-        TransactionState.BASELINED,
-        TransactionState.ABORTED,
-    },
-    TransactionState.SNAPSHOTTED: {
-        TransactionState.BASELINED,
-        TransactionState.ABORTED,
-    },
-    TransactionState.BASELINED: {
-        TransactionState.PLANNED,
-        TransactionState.ABORTED,
-    },
-    TransactionState.PLANNED: {
+    TransactionState.ACCEPTANCE_FROZEN: {
         TransactionState.PATCHING,
         TransactionState.ABORTED,
     },

@@ -1,4 +1,4 @@
-"""从冻结验收条件生成 V0-V10，并纯函数计算 Verdict。"""
+"""从冻结验收条件生成七类验证事实，并纯函数计算 Verdict。"""
 
 from __future__ import annotations
 
@@ -14,13 +14,12 @@ from rivet.contracts.verification import (
     VerificationStep,
 )
 
-from .detector import ProjectConfiguration
 from .errors import VerificationError
 
 
 @dataclass(frozen=True, slots=True)
 class VerificationMatrix:
-    """保存按 V0-V10 和原命令顺序冻结的步骤。"""
+    """保存按七类事实和原命令顺序冻结的步骤。"""
 
     steps: tuple[VerificationStep, ...]
 
@@ -32,16 +31,8 @@ def _unique_commands(commands: tuple[Command, ...]) -> tuple[Command, ...]:
 
 def build_verification_matrix(
     specification: AcceptanceSpec,
-    *,
-    project_configuration: ProjectConfiguration | None = None,
-    configuration_confirmed: bool = False,
 ) -> VerificationMatrix:
-    """只将冻结命令和已确认项目命令编入矩阵。"""
-    configuration = (
-        project_configuration
-        if configuration_confirmed and project_configuration is not None
-        else ProjectConfiguration()
-    )
+    """只把 AcceptanceSpec 中已经冻结的命令编入矩阵。"""
     timeout_seconds = min(specification.max_wall_seconds, 3_600)
     steps: list[VerificationStep] = []
 
@@ -49,11 +40,6 @@ def build_verification_matrix(
         *specification.baseline_reproduction,
         *specification.verification_commands,
         *specification.behavior_verification_commands,
-        *configuration.acceptance,
-        *configuration.targeted,
-        *configuration.related,
-        *configuration.regression,
-        *configuration.static,
     )
     if any(command[0] == "rivet-internal" for command in external_commands):
         raise VerificationError(
@@ -86,60 +72,22 @@ def build_verification_matrix(
             )
 
     add(
-        VerificationKind.ENVIRONMENT,
-        "验证命令运行环境",
-        (("rivet-internal", "environment"),),
-        required=True,
-    )
-    add(
         VerificationKind.BASELINE,
         "记录修改前基线复现",
         specification.baseline_reproduction,
         required=True,
     )
     add(
-        VerificationKind.REPRODUCTION,
-        "确认补丁解决基线问题",
-        specification.baseline_reproduction,
-        required=True,
-    )
-    add(
-        VerificationKind.TARGETED,
-        "运行目标测试",
-        (*specification.verification_commands, *configuration.targeted),
-        required=True,
-    )
-    behavior_commands = (
-        *specification.behavior_verification_commands,
-        *configuration.acceptance,
-    )
-    add(
-        VerificationKind.TARGETED,
+        VerificationKind.BEHAVIOR,
         "运行独立行为验收",
-        behavior_commands,
-        required=bool(behavior_commands),
-        namespace="behavior",
+        specification.behavior_verification_commands,
+        required=True,
     )
-    related = configuration.related or (("rivet-internal", "related-unconfigured"),)
-    add(
-        VerificationKind.RELATED,
-        "运行相关测试",
-        related,
-        required=bool(configuration.related),
-    )
-    regression = configuration.regression or specification.verification_commands
     add(
         VerificationKind.REGRESSION,
-        "运行回归测试",
-        regression,
-        required=True,
-    )
-    static = configuration.static or (("rivet-internal", "static-unconfigured"),)
-    add(
-        VerificationKind.STATIC,
-        "运行静态检查与构建",
-        static,
-        required=bool(configuration.static),
+        "运行已冻结回归与质量检查",
+        specification.verification_commands,
+        required=bool(specification.verification_commands),
     )
     add(
         VerificationKind.SCOPE,
@@ -154,9 +102,9 @@ def build_verification_matrix(
         required=True,
     )
     add(
-        VerificationKind.ACCEPTANCE,
+        VerificationKind.BINDING,
         "绑定验收条目与执行证据",
-        (("rivet-internal", "acceptance"),),
+        (("rivet-internal", "binding"),),
         required=True,
     )
     add(
@@ -171,7 +119,9 @@ def build_verification_matrix(
 def compute_verdict(
     *,
     transaction_id: str,
+    base_commit: str,
     acceptance_sha256: str,
+    patch_sha256: str,
     evidence_id: str,
     evidence_manifest_path: str,
     results: tuple[VerificationResult, ...],
@@ -204,7 +154,9 @@ def compute_verdict(
         status = VerificationStatus.PASSED
     return Verdict(
         transaction_id=transaction_id,
+        base_commit=base_commit,
         acceptance_sha256=acceptance_sha256,
+        patch_sha256=patch_sha256,
         evidence_id=evidence_id,
         evidence_manifest_path=evidence_manifest_path,
         status=status,

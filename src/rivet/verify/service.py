@@ -1,4 +1,4 @@
-"""执行隔离 V0-V10 矩阵并发布程序化 EvidenceBundle。"""
+"""执行隔离七类验证并发布程序化 EvidenceBundle。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ from rivet.contracts.verification import (
     VerificationStatus,
     VerificationStep,
 )
-from rivet.guard.sandbox import BubblewrapSandbox
 from rivet.kernel.errors import ResourceCleanupError
 from rivet.kernel.resources import ResourceCounts, ResourceScope
 from rivet.tools.errors import ProcessToolError
@@ -35,7 +34,6 @@ from rivet.transaction.hashing import canonical_json_bytes, sha256_digest
 from rivet.transaction.manager import TransactionManager
 from rivet.transaction.models import TransactionVerificationContext
 
-from .detector import ProjectConfiguration, ProjectDetection, ProjectDetector
 from .errors import VerificationError
 from .evidence import EvidenceBundleWriter
 from .matrix import build_verification_matrix, compute_verdict
@@ -47,30 +45,22 @@ VerificationExecutorFactory = Callable[
     [WorkspaceBoundary, ResourceScope, Mapping[str, str], frozenset[str]],
     ProcessExecutor,
 ]
-MAX_COMMAND_CAPTURE_BYTES = 1024 * 1024
 MAX_RESULT_SUMMARY_CHARS = 4_096
 MAX_SECURITY_SCAN_BYTES = 32 * 1024 * 1024
 EXECUTION_KINDS = frozenset(
     {
         VerificationKind.BASELINE,
-        VerificationKind.REPRODUCTION,
-        VerificationKind.TARGETED,
-        VerificationKind.RELATED,
+        VerificationKind.BEHAVIOR,
         VerificationKind.REGRESSION,
-        VerificationKind.STATIC,
     }
 )
 LOG_PATHS = {
-    VerificationKind.ENVIRONMENT: "static_checks.log",
     VerificationKind.BASELINE: "baseline.log",
-    VerificationKind.REPRODUCTION: "focused_tests.log",
-    VerificationKind.TARGETED: "focused_tests.log",
-    VerificationKind.RELATED: "regression_tests.log",
-    VerificationKind.REGRESSION: "regression_tests.log",
-    VerificationKind.STATIC: "static_checks.log",
+    VerificationKind.BEHAVIOR: "behavior.log",
+    VerificationKind.REGRESSION: "regression.log",
     VerificationKind.SCOPE: "scope_check.json",
     VerificationKind.SECRET: "secret_scan.json",
-    VerificationKind.ACCEPTANCE: "acceptance_check.json",
+    VerificationKind.BINDING: "binding_check.json",
     VerificationKind.RESOURCE: "resource_check.json",
 }
 
@@ -138,48 +128,30 @@ class VerificationService:
         manager: TransactionManager,
         *,
         scope: ResourceScope,
-        project_configuration: ProjectConfiguration | None = None,
-        configuration_confirmed: bool = False,
         clock: Clock | None = None,
         cancelled: CancellationCheck | None = None,
-        reverse_patch_description: str | None = None,
         executor_factory: VerificationExecutorFactory | None = None,
-        sandbox_executable: Path | None = None,
     ) -> None:
         self._manager = manager
         self._scope = scope
-        self._project_configuration = project_configuration
-        self._configuration_confirmed = configuration_confirmed
         self._clock = clock or (lambda: datetime.now(UTC))
         self._cancelled = cancelled or (lambda: False)
-        self._reverse_patch_description = reverse_patch_description
         self._executor_factory = executor_factory
-        self._sandbox_executable = sandbox_executable
         self._redactor = SecretRedactor(environment={})
 
     async def verify(self, transaction_id: str) -> VerificationOutcome:
         """隔离执行矩阵、原子写证据，再将程序化 Verdict 交给事务。"""
         context = await self._manager.verification_context(transaction_id)
         acceptance_hash = context.record.acceptance_sha256
-        if acceptance_hash is None:
-            raise VerificationError(
-                "verification.acceptance_missing",
-                "验证上下文缺少冻结验收哈希",
-            )
-        detection = ProjectDetector().detect(context.worktree)
-        configuration = self._project_configuration or detection.configuration
-        matrix = build_verification_matrix(
-            context.acceptance,
-            project_configuration=configuration,
-            configuration_confirmed=self._configuration_confirmed,
-        )
+        matrix = build_verification_matrix(context.acceptance)
+        missing_executables = self._missing_executables(matrix.steps)
         evidence_writer = EvidenceBundleWriter(
             self._manager.evidence_root(transaction_id),
             clock=self._clock,
         )
         attempt_name = evidence_writer.next_attempt_name()
         evidence_id = f"evidence_{uuid.uuid4().hex}"
-        evidence_manifest_path = f"evidence/{attempt_name}/manifest.json"
+        evidence_manifest_path = f"{transaction_id}/{attempt_name}/manifest.json"
         deadline = time.monotonic() + context.acceptance.max_wall_seconds
         baseline: Path | None = None
         candidate: Path | None = None
@@ -215,9 +187,7 @@ class VerificationService:
                 candidate_error = error.code
 
             for step in matrix.steps:
-                if step.kind is VerificationKind.ENVIRONMENT:
-                    drafts.append(self._environment_result(step, matrix.steps))
-                elif step.kind is VerificationKind.BASELINE:
+                if step.kind is VerificationKind.BASELINE:
                     drafts.append(
                         await self._execute_step(
                             step,
@@ -249,7 +219,7 @@ class VerificationService:
                         candidate,
                     )
                     drafts.append(draft)
-                elif step.kind is VerificationKind.ACCEPTANCE:
+                elif step.kind is VerificationKind.BINDING:
                     draft, acceptance_report = self._acceptance_result(
                         step,
                         context,
@@ -282,6 +252,7 @@ class VerificationService:
         resource_draft, resource_report = await self._resource_result(
             resource_step,
             transaction_id=transaction_id,
+            missing_executables=missing_executables,
             cleanup_errors=tuple(cleanup_errors),
             candidate_signature_before=candidate_signature_before,
             candidate_signature_after=candidate_signature_after,
@@ -300,7 +271,9 @@ class VerificationService:
         )
         verdict = compute_verdict(
             transaction_id=transaction_id,
+            base_commit=context.record.base_commit,
             acceptance_sha256=acceptance_hash,
+            patch_sha256=context.patch.patch_sha256,
             evidence_id=evidence_id,
             evidence_manifest_path=evidence_manifest_path,
             results=results,
@@ -308,14 +281,15 @@ class VerificationService:
         )
         payloads = self._evidence_payloads(
             context=context,
-            detection=detection,
             matrix_steps=matrix.steps,
             verdict=verdict,
             log_payloads=log_payloads,
         )
         bundle = evidence_writer.write(
             transaction_id=transaction_id,
+            base_commit=context.record.base_commit,
             acceptance_sha256=acceptance_hash,
+            patch_sha256=context.patch.patch_sha256,
             files=payloads,
             evidence_id=evidence_id,
             attempt_name=attempt_name,
@@ -328,35 +302,6 @@ class VerificationService:
             manifest=verified_manifest,
             evidence_directory=bundle.directory,
             manifest_sha256=bundle.manifest_sha256,
-        )
-
-    def _environment_result(
-        self,
-        step: VerificationStep,
-        steps: tuple[VerificationStep, ...],
-    ) -> _StepDraft:
-        """检查所有实际 argv 的首个程序是否可执行。"""
-        environment, _ = _verification_environment()
-        executables = sorted(
-            {
-                candidate.command[0]
-                for candidate in steps
-                if candidate.command[0] != "rivet-internal"
-            }
-        )
-        missing = tuple(
-            executable
-            for executable in executables
-            if not self._is_executable(executable, environment["PATH"])
-        )
-        status = VerificationStatus.BLOCKED if missing else VerificationStatus.PASSED
-        return _StepDraft(
-            step=step,
-            status=status,
-            exit_code=None if missing else 0,
-            duration_ms=0,
-            stdout="验证命令环境可用" if not missing else "",
-            stderr=("缺少可执行文件：" + ", ".join(missing) if missing else ""),
         )
 
     async def _execute_step(
@@ -379,13 +324,14 @@ class VerificationService:
                 duration_ms=0,
                 stderr="验证已取消",
             )
-        if step.command[0] == "rivet-internal":
+        environment, allowlist = _verification_environment()
+        if not self._is_executable(step.command[0], environment["PATH"]):
             return _StepDraft(
                 step=step,
-                status=VerificationStatus.PASSED,
-                exit_code=0,
+                status=VerificationStatus.BLOCKED,
+                exit_code=None,
                 duration_ms=0,
-                stdout="该可选验证组未配置，未执行候选命令",
+                stderr=f"验证环境缺少可执行文件：{step.command[0]}",
             )
         if root is None:
             return _StepDraft(
@@ -404,23 +350,21 @@ class VerificationService:
                 duration_ms=self._duration_ms(started),
                 stderr="验证总墙钟预算已耗尽",
             )
-        environment, allowlist = _verification_environment()
         boundary = WorkspaceBoundary(repository_root, root)
         if self._executor_factory is None:
-            runner: ProcessExecutor = BubblewrapSandbox(
-                boundary,
-                scope=self._scope,
-                executable=self._sandbox_executable,
-                max_capture_bytes=MAX_COMMAND_CAPTURE_BYTES,
-                environment=environment,
+            return _StepDraft(
+                step=step,
+                status=VerificationStatus.BLOCKED,
+                exit_code=None,
+                duration_ms=self._duration_ms(started),
+                stderr="验证执行器未由 guard.sandbox 注入",
             )
-        else:
-            runner = self._executor_factory(
-                boundary,
-                self._scope,
-                environment,
-                allowlist,
-            )
+        runner = self._executor_factory(
+            boundary,
+            self._scope,
+            environment,
+            allowlist,
+        )
         try:
             completed = await runner.run(
                 step.command,
@@ -581,27 +525,18 @@ class VerificationService:
             for draft in prior_drafts
             if draft.step.kind is VerificationKind.BASELINE
         )
-        targeted = tuple(
-            draft
-            for draft in prior_drafts
-            if draft.step.kind
-            in {VerificationKind.REPRODUCTION, VerificationKind.TARGETED}
-        )
         behavior = tuple(
             draft
             for draft in prior_drafts
-            if draft.step.kind is VerificationKind.TARGETED
-            and draft.step.name == "运行独立行为验收"
+            if draft.step.kind is VerificationKind.BEHAVIOR
         )
         preserved = tuple(
             draft
             for draft in prior_drafts
-            if draft.step.kind
-            in {VerificationKind.RELATED, VerificationKind.REGRESSION}
-            and draft.step.required
+            if draft.step.kind is VerificationKind.REGRESSION and draft.step.required
         )
         dependency_status = _aggregate_status(
-            tuple(draft.status for draft in (*baseline, *targeted, *preserved))
+            tuple(draft.status for draft in (*baseline, *behavior, *preserved))
         )
         baseline_reproduced = any(
             draft.status is VerificationStatus.PASSED
@@ -611,7 +546,10 @@ class VerificationService:
         overlap = set(context.acceptance.expected_behaviors) & set(
             context.acceptance.preserved_behaviors
         )
-        if not behavior:
+        preservation_evidence_missing = (
+            bool(context.acceptance.preserved_behaviors) and not preserved
+        )
+        if not baseline or not behavior or preservation_evidence_missing:
             status = VerificationStatus.INCONCLUSIVE
         elif dependency_status is not VerificationStatus.PASSED:
             status = dependency_status
@@ -625,6 +563,7 @@ class VerificationService:
             "status": status.value,
             "baseline_reproduced": baseline_reproduced,
             "independent_behavior_verifier_configured": bool(behavior),
+            "preservation_evidence_missing": preservation_evidence_missing,
             "expected_behavior_bindings": {
                 behavior: expected_ids
                 for behavior in context.acceptance.expected_behaviors
@@ -656,6 +595,7 @@ class VerificationService:
         step: VerificationStep,
         *,
         transaction_id: str,
+        missing_executables: tuple[str, ...],
         cleanup_errors: tuple[str, ...],
         candidate_signature_before: dict[str, str] | None,
         candidate_signature_after: dict[str, str] | None,
@@ -683,6 +623,8 @@ class VerificationService:
         )
         if cleanup_errors:
             status = VerificationStatus.INCONCLUSIVE
+        elif missing_executables:
+            status = VerificationStatus.BLOCKED
         elif (
             integrity_error is not None
             or not candidate_unchanged
@@ -694,6 +636,14 @@ class VerificationService:
         report: dict[str, object] = {
             "status": status.value,
             "cleanup_errors": list(cleanup_errors),
+            "environment_preflight": {
+                "status": (
+                    VerificationStatus.BLOCKED.value
+                    if missing_executables
+                    else VerificationStatus.PASSED.value
+                ),
+                "missing_executables": list(missing_executables),
+            },
             "transaction_integrity_error": integrity_error,
             "candidate_changed_during_verification": not candidate_unchanged,
             "resource_counts": counts_payload,
@@ -707,7 +657,7 @@ class VerificationService:
                 stdout="资源与事务完整性通过"
                 if status is VerificationStatus.PASSED
                 else "",
-                stderr="资源清理或事务完整性检查未通过"
+                stderr="环境预检、资源清理或事务完整性检查未通过"
                 if status is not VerificationStatus.PASSED
                 else "",
             ),
@@ -726,9 +676,8 @@ class VerificationService:
         """把命令输出合并到固定日志，并把内部检查写为 JSON。"""
         log_parts: dict[str, list[str]] = {
             "baseline.log": [],
-            "focused_tests.log": [],
-            "regression_tests.log": [],
-            "static_checks.log": [],
+            "behavior.log": [],
+            "regression.log": [],
         }
         for draft in drafts:
             log_path = LOG_PATHS[draft.step.kind]
@@ -761,7 +710,7 @@ class VerificationService:
             if security_report is not None
             else {"status": VerificationStatus.INCONCLUSIVE.value}
         )
-        payloads["acceptance_check.json"] = self._json_bytes(acceptance_report)
+        payloads["binding_check.json"] = self._json_bytes(acceptance_report)
         payloads["resource_check.json"] = self._json_bytes(resource_report)
         return payloads
 
@@ -789,85 +738,42 @@ class VerificationService:
         self,
         *,
         context: TransactionVerificationContext,
-        detection: ProjectDetection,
         matrix_steps: tuple[VerificationStep, ...],
         verdict: Verdict,
         log_payloads: Mapping[str, bytes],
     ) -> dict[str, bytes]:
         """生成 EvidenceBundle 的固定最小集合和附加审计事实。"""
         acceptance_hash = context.record.acceptance_sha256
-        if acceptance_hash is None:
-            raise VerificationError(
-                "verification.acceptance_missing",
-                "证据生成缺少 AcceptanceSpec 哈希",
-            )
         failed_steps = [
             result.step.step_id
             for result in verdict.results
             if result.status is not VerificationStatus.PASSED
         ]
-        risk_lines = [
-            "# 风险报告",
-            "",
-            f"- 最终状态：{verdict.status.value}",
-            f"- 原始补丁哈希：`{context.patch.patch_sha256}`",
-            f"- 未通过步骤：{', '.join(failed_steps) if failed_steps else '无'}",
-            "- 验证命令在隔离副本运行；操作系统级网络沙箱由 Phase 11 接入。",
-            "- 可接受风险：",
-            *[f"  - {risk}" for risk in context.acceptance.acceptable_risks],
-            "- 明确非目标：",
-            *[f"  - {goal}" for goal in context.acceptance.non_goals],
-            "",
-        ]
         summary = (
             "# 验证摘要\n\n"
             f"事务 `{context.record.transaction_id}` 的确定性结论为 "
             f"`{verdict.status.value}`。\n"
+            f"- Base: `{context.record.base_commit}`\n"
+            f"- Acceptance: `{acceptance_hash}`\n"
+            f"- Patch: `{context.patch.patch_sha256}`\n"
+            f"- 未通过步骤：{', '.join(failed_steps) if failed_steps else '无'}\n"
             "该结论完全由 required 步骤状态计算，未使用模型完成声明。\n"
         )
-        detection_payload = {
-            "kinds": [kind.value for kind in detection.kinds],
-            "candidates": [
-                {
-                    "kind": candidate.kind.value,
-                    "category": candidate.category,
-                    "argv": list(candidate.argv),
-                    "reason": candidate.reason,
-                    "executed": False,
-                }
-                for candidate in detection.candidates
-            ],
-            "configuration_present": detection.configuration is not None,
-            "configuration_confirmed": self._configuration_confirmed,
-        }
-        reverse_payload = {
-            "advisory_only": True,
-            "provided": self._reverse_patch_description is not None,
-            "description": self._reverse_patch_description,
-            "changes_verdict": False,
-        }
         payloads = dict(log_payloads)
         payloads.update(
             {
                 "acceptance_spec.json": self._json_bytes(
                     context.acceptance.model_dump(mode="json")
                 ),
-                "acceptance_spec.sha256": f"{acceptance_hash}\n".encode("ascii"),
                 "patch.diff": context.patch_path.read_bytes(),
                 "changed_files.json": self._json_bytes(
                     {"changed_files": list(context.patch.changed_files)}
                 ),
-                "changed_symbols.json": self._json_bytes(
-                    {"changed_symbols": list(context.patch.changed_symbols)}
-                ),
-                "risk_report.md": "\n".join(risk_lines).encode("utf-8"),
                 "matrix.json": self._json_bytes(
                     {"steps": [step.model_dump(mode="json") for step in matrix_steps]}
                 ),
                 "verdict.json": self._json_bytes(verdict.model_dump(mode="json")),
                 "summary.md": summary.encode("utf-8"),
-                "project_detection.json": self._json_bytes(detection_payload),
-                "reverse_patch_check.json": self._json_bytes(reverse_payload),
             }
         )
         return payloads
@@ -893,6 +799,22 @@ class VerificationService:
         if candidate.is_absolute():
             return candidate.is_file() and os.access(candidate, os.X_OK)
         return shutil.which(program, path=path_environment) is not None
+
+    @classmethod
+    def _missing_executables(
+        cls,
+        steps: tuple[VerificationStep, ...],
+    ) -> tuple[str, ...]:
+        """在执行前一次性记录冻结矩阵缺失的外部程序。"""
+        environment, _ = _verification_environment()
+        executables = {
+            step.command[0] for step in steps if step.command[0] != "rivet-internal"
+        }
+        return tuple(
+            executable
+            for executable in sorted(executables)
+            if not cls._is_executable(executable, environment["PATH"])
+        )
 
     def _changed_content(
         self,

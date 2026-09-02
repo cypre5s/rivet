@@ -30,7 +30,6 @@ from .git_backend import GitBackend
 from .hashing import acceptance_sha256, sha256_digest
 from .models import (
     ApplyIntent,
-    DirtyPolicy,
     OrphanWorktree,
     RecoverableWorktree,
     RepositorySnapshot,
@@ -43,6 +42,7 @@ from .store import TransactionStore
 Clock = Callable[[], datetime]
 TERMINAL_STATES = frozenset({TransactionState.APPLIED, TransactionState.ABORTED})
 VERIFICATION_ATTEMPT_PATTERN = re.compile(r"^attempt_[0-9]{4}$")
+PROJECT_CONFIG_PATH = ".rivet/project.toml"
 
 
 def _new_identifier(prefix: str) -> str:
@@ -69,6 +69,7 @@ class TransactionManager:
         scope: ResourceScope,
         cache_root: Path | None = None,
         state_root: Path | None = None,
+        evidence_root: Path | None = None,
         clock: Clock | None = None,
     ) -> None:
         self._candidate = repository.resolve(strict=False)
@@ -78,6 +79,9 @@ class TransactionManager:
         )
         self._configured_state_root = (
             state_root.resolve(strict=False) if state_root is not None else None
+        )
+        self._configured_evidence_root = (
+            evidence_root.resolve(strict=False) if evidence_root is not None else None
         )
         self._clock = clock or (lambda: datetime.now(UTC))
         self._backend: GitBackend | None = None
@@ -102,13 +106,13 @@ class TransactionManager:
         expected_behaviors: tuple[str, ...],
         preserved_behaviors: tuple[str, ...],
         verification_commands: tuple[Command, ...],
-        behavior_verification_commands: tuple[Command, ...] = (),
+        behavior_verification_commands: tuple[Command, ...],
         max_wall_seconds: int,
         max_tokens: int,
         max_tool_calls: int,
         forbidden_paths: tuple[RepositoryPath, ...] = (),
         scope_reason: str = "完成用户任务所需的最小文件集合",
-        scope_source: Literal["explicit", "task", "plan", "project"] = "project",
+        scope_source: Literal["explicit", "task", "project"] = "project",
         max_cost_usd: Decimal | None = None,
         acceptable_risks: tuple[str, ...] = (),
         non_goals: tuple[str, ...] = (),
@@ -140,129 +144,65 @@ class TransactionManager:
 
     async def create(
         self,
-        *,
-        transaction_id: str | None = None,
-        dirty_policy: DirtyPolicy = DirtyPolicy.REJECT,
-    ) -> TransactionRecord:
-        """创建独立 Worktree，脏仓库仅在显式策略下生成快照。"""
-        backend = await self._ensure_backend()
-        store = self._require_store()
-        store.prepare()
-        selected_id = transaction_id or _new_identifier("tx")
-        record_path = store.record_path(selected_id)
-        if record_path.exists():
-            raise TransactionError(
-                "transaction.already_exists",
-                "事务 ID 已存在",
-            )
-        snapshot = await backend.inspect()
-        if snapshot.dirty and dirty_policy is DirtyPolicy.REJECT:
-            raise TransactionError(
-                "transaction.dirty_repository_rejected",
-                "检测到脏工作区，必须显式选择 snapshot 模式",
-            )
-        created_at = self._now()
-        dirty_snapshot_hash: str | None = None
-        base_commit = snapshot.head_commit
-        if snapshot.dirty:
-            temporary_index = (
-                self._require_cache_root() / "snapshot-indexes" / f"{selected_id}.index"
-            )
-            dirty_snapshot_hash = await backend.create_dirty_snapshot(
-                snapshot,
-                transaction_id=selected_id,
-                temporary_index=temporary_index,
-                timestamp=created_at,
-            )
-            base_commit = dirty_snapshot_hash
-        worktree = self._worktree_path_from(snapshot.repository_identity, selected_id)
-        if worktree.exists():
-            raise TransactionError(
-                "transaction.worktree_exists",
-                "事务 Worktree 路径已存在",
-            )
-        worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        worktree.parent.chmod(0o700)
-        try:
-            await backend.add_worktree(worktree, base_commit)
-        except BaseException:
-            if worktree.exists():
-                shutil.rmtree(worktree)
-            with suppress(TransactionError):
-                await backend.remove_worktree(worktree)
-            raise
-        try:
-            self._register_worktree(worktree)
-            record = TransactionRecord(
-                transaction_id=selected_id,
-                state=TransactionState.CREATED,
-                repository_identity=snapshot.repository_identity,
-                repository_fingerprint=snapshot.repository_fingerprint,
-                head_commit=snapshot.head_commit,
-                base_commit=base_commit,
-                branch=snapshot.branch,
-                detached_head=snapshot.detached_head,
-                dirty=snapshot.dirty,
-                dirty_snapshot_hash=dirty_snapshot_hash,
-                has_submodules=snapshot.has_submodules,
-                submodule_status_sha256=snapshot.submodule_status_sha256,
-                git_config_summary=snapshot.git_config_summary,
-                created_at=created_at,
-                updated_at=created_at,
-            )
-            store.save_record(record)
-            if snapshot.dirty:
-                record = self._transition(record, TransactionState.SNAPSHOTTED)
-                store.save_record(record)
-            record = self._transition(record, TransactionState.BASELINED)
-            store.save_record(record)
-        except BaseException:
-            await backend.remove_worktree(worktree)
-            self._release_registered_worktree(worktree)
-            raise
-        return record
-
-    async def freeze_acceptance(
-        self,
-        transaction_id: str,
         specification: AcceptanceSpec,
         *,
         confirmed: bool,
-    ) -> str:
-        """经显式确认只写一次 AcceptanceSpec，并记录规范哈希。"""
+        transaction_id: str | None = None,
+        expected_base_commit: str | None = None,
+    ) -> TransactionRecord:
+        """把首个持久事务记录直接写成 ACCEPTANCE_FROZEN。"""
         if not confirmed:
             raise TransactionError(
                 "transaction.acceptance_confirmation_required",
-                "冻结 AcceptanceSpec 需要显式确认",
+                "创建事务前必须显式确认 AcceptanceSpec",
             )
-        await self._ensure_backend()
+        backend = await self._ensure_backend()
         store = self._require_store()
-        record = store.load_record(transaction_id)
-        digest = acceptance_sha256(specification)
-        if record.acceptance_sha256 is not None:
-            existing = store.load_acceptance(
-                transaction_id,
-                expected_sha256=record.acceptance_sha256,
-            )
-            if existing != specification or digest != record.acceptance_sha256:
-                raise TransactionError(
-                    "transaction.acceptance_frozen",
-                    "AcceptanceSpec 已冻结且不可修改",
-                )
-            return record.acceptance_sha256
-        if record.state is not TransactionState.BASELINED:
+        snapshot = await backend.inspect()
+        if snapshot.dirty:
             raise TransactionError(
-                "transaction.acceptance_state_invalid",
-                "只有 BASELINED 事务可以冻结 AcceptanceSpec",
+                "transaction.dirty_repository_rejected",
+                "检测到脏工作区，请先 commit 或 stash 当前修改",
             )
-        stored_digest = store.write_acceptance(transaction_id, specification)
-        planned = self._transition(
-            record,
-            TransactionState.PLANNED,
-            acceptance_sha256=stored_digest,
+        project_config = backend.repository_root / PROJECT_CONFIG_PATH
+        if (
+            project_config.exists() or project_config.is_symlink()
+        ) and not await backend.is_tracked_path(PROJECT_CONFIG_PATH):
+            raise TransactionError(
+                "transaction.project_config_untracked",
+                "项目验证配置必须由 Git 跟踪后才能冻结事务",
+            )
+        if (
+            expected_base_commit is not None
+            and snapshot.head_commit != expected_base_commit
+        ):
+            raise TransactionError(
+                "transaction.proposal_base_drift",
+                "Git 基线已不同于用户确认的只读提案",
+            )
+        store.prepare()
+        selected_id = transaction_id or _new_identifier("tx")
+        acceptance_hash = acceptance_sha256(specification)
+        created_at = self._now()
+        record = TransactionRecord(
+            transaction_id=selected_id,
+            state=TransactionState.ACCEPTANCE_FROZEN,
+            repository_identity=snapshot.repository_identity,
+            repository_fingerprint=snapshot.repository_fingerprint,
+            head_commit=snapshot.head_commit,
+            base_commit=snapshot.head_commit,
+            branch=snapshot.branch,
+            detached_head=snapshot.detached_head,
+            has_submodules=snapshot.has_submodules,
+            submodule_status_sha256=snapshot.submodule_status_sha256,
+            git_config_summary=snapshot.git_config_summary,
+            acceptance_sha256=acceptance_hash,
+            created_at=created_at,
+            updated_at=created_at,
         )
-        store.save_record(planned)
-        return stored_digest
+        store.publish_frozen_transaction(record, specification)
+        await self._ensure_transaction_worktree(record)
+        return record
 
     async def load_acceptance_spec(self, transaction_id: str) -> AcceptanceSpec:
         """加载并复验事务绑定的冻结 AcceptanceSpec。"""
@@ -310,10 +250,43 @@ class TransactionManager:
         return self._require_store().patch_path(transaction_id, patch_id)
 
     def evidence_root(self, transaction_id: str) -> Path:
-        """返回事务私有状态内由验证模块管理的证据根。"""
+        """返回独立 XDG Evidence 根中当前事务的私有目录。"""
         store = self._require_store()
         store.load_record(transaction_id)
-        return store.transaction_directory(transaction_id) / "evidence"
+        return store.evidence_directory(transaction_id)
+
+    def store(self) -> TransactionStore:
+        """返回当前管理器绑定的 XDG 事务事实源。"""
+        return self._require_store()
+
+    async def candidate_diff(
+        self,
+        transaction_id: str,
+        *,
+        path: str | None = None,
+        max_bytes: int = 65_536,
+    ) -> str:
+        """读取 Worktree 相对冻结基线的有界候选补丁。"""
+        if max_bytes <= 0:
+            raise ValueError("候选补丁输出上限必须大于零")
+        backend = await self._ensure_backend()
+        store = self._require_store()
+        record = store.load_record(transaction_id)
+        self._verify_acceptance(record)
+        worktree = self._active_worktree(record)
+        paths: tuple[str, ...] = ()
+        if path is not None:
+            boundary = self.transaction_boundary(transaction_id)
+            resolved = boundary.resolve_repository(path, require_exists=False)
+            paths = (boundary.repository_relative(resolved),)
+        content = await backend.binary_diff(
+            worktree,
+            record.base_commit,
+            paths=paths,
+        )
+        truncated = len(content) > max_bytes
+        visible = content[:max_bytes].decode("utf-8", errors="replace")
+        return visible + ("\n[TRUNCATED]\n" if truncated else "")
 
     async def verification_context(
         self,
@@ -335,9 +308,10 @@ class TransactionManager:
         )
         patch, stored_content = self._load_current_patch(record)
         snapshot = await backend.inspect()
-        if (
-            snapshot.repository_identity != record.repository_identity
-            or snapshot.repository_fingerprint != record.repository_fingerprint
+        if not await self._verification_repository_matches(
+            backend,
+            snapshot,
+            record,
         ):
             raise TransactionError(
                 "transaction.verification_repository_drift",
@@ -470,14 +444,13 @@ class TransactionManager:
         transaction_id: str,
         *,
         patch_id: str | None = None,
-        changed_symbols: tuple[str, ...] = (),
     ) -> PatchSet:
         """生成完整 binary diff、保存 PatchSet 并进入 PATCHING。"""
         backend = await self._ensure_backend()
         store = self._require_store()
         record = store.load_record(transaction_id)
         if record.state not in {
-            TransactionState.PLANNED,
+            TransactionState.ACCEPTANCE_FROZEN,
             TransactionState.PATCHING,
             TransactionState.REJECTED,
             TransactionState.INCONCLUSIVE,
@@ -495,12 +468,6 @@ class TransactionManager:
             raise TransactionError("transaction.patch_empty", "事务没有可记录的修改")
         changed_files = await backend.changed_paths(worktree)
         created_files = await backend.added_paths(worktree, record.base_commit)
-        selected_symbols = changed_symbols or await self._extract_changed_symbols(
-            backend,
-            worktree,
-            record.base_commit,
-            changed_files,
-        )
         selected_patch_id = patch_id or _new_identifier("patch")
         patch = PatchSet(
             patch_id=selected_patch_id,
@@ -510,7 +477,6 @@ class TransactionManager:
             patch_sha256=sha256_digest(content),
             changed_files=changed_files,
             created_files=created_files,
-            changed_symbols=selected_symbols,
             contains_binary_diff=(
                 b"GIT binary patch" in content or b"Binary files " in content
             ),
@@ -524,36 +490,6 @@ class TransactionManager:
         )
         store.save_record(patching)
         return patch
-
-    @staticmethod
-    async def _extract_changed_symbols(
-        backend: GitBackend,
-        worktree: Path,
-        base_commit: str,
-        changed_files: tuple[str, ...],
-    ) -> tuple[str, ...]:
-        """有界读取补丁两侧源码并生成 Evidence 可复核符号差异。"""
-        from rivet.context.syntax import supports_syntax_path
-        from rivet.verify.symbols import extract_changed_symbols
-
-        before: dict[str, str] = {}
-        after: dict[str, str] = {}
-        for path in changed_files:
-            if not supports_syntax_path(path):
-                continue
-            old = await backend.file_at_revision(worktree, base_commit, path)
-            if old:
-                with suppress(UnicodeDecodeError):
-                    before[path] = old.decode("utf-8", errors="strict")
-            candidate = worktree / path
-            try:
-                if candidate.is_file() and not candidate.is_symlink():
-                    content = candidate.read_bytes()
-                    if len(content) <= 2 * 1024 * 1024:
-                        after[path] = content.decode("utf-8", errors="strict")
-            except (OSError, UnicodeDecodeError):
-                continue
-        return extract_changed_symbols(before=before, after=after)
 
     async def begin_verification(self, transaction_id: str) -> TransactionRecord:
         """锁定当前 PatchSet 并进入等待确定性 Verdict 的状态。"""
@@ -571,55 +507,6 @@ class TransactionManager:
         store.save_record(verifying)
         return verifying
 
-    async def adopt_project_verification_configuration(
-        self,
-        transaction_id: str,
-    ) -> TransactionRecord:
-        """允许候选事务只吸收一次显式项目验收配置，不放宽其他漂移。"""
-        backend = await self._ensure_backend()
-        store = self._require_store()
-        record = store.load_record(transaction_id)
-        if record.state is not TransactionState.PATCHING:
-            raise TransactionError(
-                "transaction.configuration_adoption_state_invalid",
-                "只有待验证候选补丁可以吸收项目验收配置",
-            )
-        self._verify_acceptance(record)
-        self._load_current_patch(record)
-        snapshot = await backend.inspect()
-        if snapshot.repository_fingerprint == record.repository_fingerprint:
-            return record
-        configuration_path = backend.repository_root / ".rivet" / "project.toml"
-        stable_repository = (
-            snapshot.repository_identity == record.repository_identity
-            and snapshot.head_commit == record.head_commit
-            and snapshot.branch == record.branch
-            and snapshot.detached_head == record.detached_head
-            and snapshot.has_submodules == record.has_submodules
-            and snapshot.submodule_status_sha256 == record.submodule_status_sha256
-            and snapshot.git_config_summary == record.git_config_summary
-        )
-        if (
-            record.dirty
-            or not stable_repository
-            or set(snapshot.status_paths) != {".rivet/project.toml"}
-            or configuration_path.is_symlink()
-            or not configuration_path.is_file()
-        ):
-            raise TransactionError(
-                "transaction.verification_repository_drift",
-                "候选补丁生成后主仓库发生了验收配置以外的漂移",
-            )
-        adopted = record.model_copy(
-            update={
-                "repository_fingerprint": snapshot.repository_fingerprint,
-                "dirty": snapshot.dirty,
-                "updated_at": self._now(),
-            }
-        )
-        store.save_record(adopted)
-        return adopted
-
     async def record_verdict(self, verdict: Verdict) -> TransactionRecord:
         """只接受与事务和验收哈希一致的程序化 Verdict。"""
         await self._ensure_backend()
@@ -632,14 +519,19 @@ class TransactionManager:
             )
         acceptance_hash = self._verify_acceptance(record)
         patch, _ = self._load_current_patch(record)
-        if verdict.acceptance_sha256 != acceptance_hash:
+        if (
+            verdict.base_commit != record.base_commit
+            or verdict.acceptance_sha256 != acceptance_hash
+            or verdict.patch_sha256 != patch.patch_sha256
+        ):
             raise TransactionError(
-                "transaction.verdict_acceptance_mismatch",
-                "Verdict 未绑定当前 AcceptanceSpec",
+                "transaction.verdict_binding_mismatch",
+                "Verdict 未绑定当前基线、AcceptanceSpec 与 PatchSet",
             )
         manifest_digest = store.verify_verdict_evidence(
             verdict,
-            expected_patch_sha256=patch.patch_sha256 if verdict.passed else None,
+            expected_base_commit=record.base_commit,
+            expected_patch_sha256=patch.patch_sha256,
         )
         target = {
             VerificationStatus.PASSED: TransactionState.VERIFIED,
@@ -681,12 +573,18 @@ class TransactionManager:
                 "transaction.apply_not_verified",
                 "只有 VERIFIED 事务允许 apply",
             )
-        self._verify_acceptance(record)
+        acceptance_hash = self._verify_acceptance(record)
         patch, stored_content = self._load_current_patch(record)
         store.verify_record_evidence(
             record,
             expected_patch_sha256=patch.patch_sha256,
         )
+        evidence_manifest_sha256 = record.evidence_manifest_sha256
+        if evidence_manifest_sha256 is None:
+            raise TransactionError(
+                "transaction.evidence_attestation_missing",
+                "VERIFIED 事务缺少 Evidence manifest 哈希",
+            )
         current_snapshot = await backend.inspect()
         if current_snapshot.repository_identity != record.repository_identity:
             raise TransactionError(
@@ -721,7 +619,10 @@ class TransactionManager:
             intent = ApplyIntent(
                 transaction_id=record.transaction_id,
                 patch_id=patch.patch_id,
+                base_commit=record.base_commit,
+                acceptance_sha256=acceptance_hash,
                 patch_sha256=patch.patch_sha256,
+                evidence_manifest_sha256=evidence_manifest_sha256,
                 repository_fingerprint=record.repository_fingerprint,
                 created_at=self._now(),
             )
@@ -737,12 +638,17 @@ class TransactionManager:
         return await self._finalize_applied(record)
 
     async def abort(self, transaction_id: str) -> TransactionRecord:
-        """幂等终止非应用事务并明确丢弃隔离 Worktree。"""
+        """幂等终止未进入 apply 临界区的事务并丢弃隔离 Worktree。"""
         await self._ensure_backend()
         store = self._require_store()
         record = store.load_record(transaction_id)
         if record.state in TERMINAL_STATES:
             return record
+        if store.has_apply_intent(transaction_id):
+            raise TransactionError(
+                "transaction.apply_recovery_required",
+                "事务已进入 apply 临界区，必须先确定性恢复 apply",
+            )
         aborted = self._transition(record, TransactionState.ABORTED)
         store.save_record(aborted)
         worktree = self._worktree_path_from(
@@ -800,7 +706,7 @@ class TransactionManager:
                 "transaction.recovery_terminal",
                 "终态事务不能恢复 Worktree",
             )
-        worktree = self._active_worktree(record)
+        worktree = await self._ensure_transaction_worktree(record)
         listed = await backend.list_worktrees()
         if (
             worktree not in listed
@@ -810,8 +716,7 @@ class TransactionManager:
                 "transaction.recovery_mismatch",
                 "Worktree 登记或基线与事务记录不一致",
             )
-        if record.acceptance_sha256 is not None:
-            self._verify_acceptance(record)
+        self._verify_acceptance(record)
         self._register_worktree(worktree)
         return record
 
@@ -859,8 +764,10 @@ class TransactionManager:
         state_root = self._configured_state_root or (
             runtime_paths.runtime_root / "transactions"
         )
+        evidence_root = self._configured_evidence_root or runtime_paths.evidence_root
         cache_root = cache_root.resolve(strict=False)
         state_root = state_root.resolve(strict=False)
+        evidence_root = evidence_root.resolve(strict=False)
         if _is_relative_to(cache_root, backend.repository_root) or _is_relative_to(
             backend.repository_root, cache_root
         ):
@@ -868,19 +775,52 @@ class TransactionManager:
                 "transaction.cache_not_isolated",
                 "Worktree cache 必须位于主仓库之外",
             )
+        if _is_relative_to(evidence_root, backend.repository_root) or _is_relative_to(
+            backend.repository_root, evidence_root
+        ):
+            raise TransactionError(
+                "transaction.evidence_not_isolated",
+                "Evidence 根必须位于主仓库之外",
+            )
+        if _is_relative_to(evidence_root, state_root) or _is_relative_to(
+            state_root, evidence_root
+        ):
+            raise TransactionError(
+                "transaction.state_roots_overlap",
+                "Transaction 与 Evidence 必须使用独立状态根",
+            )
         self._backend = backend
         self._cache_root = cache_root
-        self._store = TransactionStore(state_root)
+        self._store = TransactionStore(state_root, evidence_root=evidence_root)
         return backend
+
+    @staticmethod
+    async def _verification_repository_matches(
+        backend: GitBackend,
+        snapshot: RepositorySnapshot,
+        record: TransactionRecord,
+    ) -> bool:
+        """Verify 仅容忍同一 HEAD 上唯一已跟踪项目配置的内容漂移。"""
+        if snapshot.repository_identity != record.repository_identity:
+            return False
+        if snapshot.repository_fingerprint == record.repository_fingerprint:
+            return True
+        if (
+            snapshot.head_commit != record.head_commit
+            or snapshot.branch != record.branch
+            or snapshot.detached_head != record.detached_head
+            or snapshot.has_submodules != record.has_submodules
+            or snapshot.submodule_status_sha256 != record.submodule_status_sha256
+            or snapshot.git_config_summary != record.git_config_summary
+            or snapshot.status_paths != (PROJECT_CONFIG_PATH,)
+            or snapshot.untracked_paths
+        ):
+            return False
+        return await backend.is_tracked_path(PROJECT_CONFIG_PATH)
 
     def _verify_acceptance(self, record: TransactionRecord) -> str:
         """验证记录与只读 AcceptanceSpec 文件保持同一哈希。"""
         acceptance_hash = record.acceptance_sha256
-        if acceptance_hash is None:
-            raise TransactionError(
-                "transaction.acceptance_not_frozen",
-                "事务尚未冻结 AcceptanceSpec",
-            )
         self._require_store().load_acceptance(
             record.transaction_id,
             expected_sha256=acceptance_hash,
@@ -919,7 +859,10 @@ class TransactionManager:
         if (
             intent.transaction_id != record.transaction_id
             or intent.patch_id != patch.patch_id
+            or intent.base_commit != record.base_commit
+            or intent.acceptance_sha256 != record.acceptance_sha256
             or intent.patch_sha256 != patch.patch_sha256
+            or intent.evidence_manifest_sha256 != record.evidence_manifest_sha256
             or intent.repository_fingerprint != record.repository_fingerprint
         ):
             raise TransactionError(
@@ -951,6 +894,70 @@ class TransactionManager:
         )
         await self._cleanup_worktree(worktree)
         return applied
+
+    async def _ensure_transaction_worktree(self, record: TransactionRecord) -> Path:
+        """幂等恢复事务 Worktree，并从持久 Patch 重建候选内容。"""
+        backend = self._require_backend()
+        worktree = self._worktree_path_from(
+            record.repository_identity,
+            record.transaction_id,
+        )
+        if worktree.exists():
+            listed = await backend.list_worktrees()
+            if (
+                not worktree.is_dir()
+                or worktree not in listed
+                or await backend.worktree_head(worktree) != record.base_commit
+            ):
+                raise TransactionError(
+                    "transaction.worktree_mismatch",
+                    "现有事务 Worktree 与冻结基线不一致",
+                )
+            self._register_worktree(worktree)
+            return worktree
+        worktree.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        worktree.parent.chmod(0o700)
+        try:
+            # cache 目录可能在进程外被删除；先 prune Git 残留登记，避免同路径
+            # worktree add 被一个已经不存在的旧 Worktree 阻塞。
+            await backend.remove_worktree(worktree)
+            await backend.add_worktree(worktree, record.base_commit)
+            if record.current_patch_id is not None:
+                patch, stored_content = self._load_current_patch(record)
+                patch_path = self._require_store().patch_path(
+                    record.transaction_id,
+                    patch.patch_id,
+                )
+                await backend.apply_patch_to_worktree(
+                    worktree,
+                    patch_path,
+                    check_only=True,
+                )
+                await backend.apply_patch_to_worktree(
+                    worktree,
+                    patch_path,
+                    check_only=False,
+                )
+                rebuilt_content = await backend.binary_diff(
+                    worktree,
+                    record.base_commit,
+                )
+                if (
+                    rebuilt_content != stored_content
+                    or sha256_digest(rebuilt_content) != patch.patch_sha256
+                ):
+                    raise TransactionError(
+                        "transaction.worktree_rebuild_patch_mismatch",
+                        "重建 Worktree 的补丁与持久化 PatchSet 不一致",
+                    )
+        except BaseException:
+            if worktree.exists():
+                shutil.rmtree(worktree)
+            with suppress(TransactionError):
+                await backend.remove_worktree(worktree)
+            raise
+        self._register_worktree(worktree)
+        return worktree
 
     def _active_worktree(self, record: TransactionRecord) -> Path:
         """返回存在且位于派生 cache 路径的活动 Worktree。"""

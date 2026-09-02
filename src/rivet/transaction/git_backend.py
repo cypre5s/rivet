@@ -1,4 +1,4 @@
-"""以固定 Git argv 实现仓库指纹、快照、Worktree 和补丁原语。"""
+"""以固定 Git argv 实现仓库指纹、Worktree 和补丁原语。"""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import signal
 import stat
 from collections.abc import Mapping
 from contextlib import suppress
-from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
@@ -262,7 +261,13 @@ class GitBackend:
         )
         branch = branch_output.decode("utf-8", errors="strict").strip() or None
         status = await self.run_main(
-            ("status", "--porcelain=v1", "-z", "--untracked-files=all")
+            (
+                "status",
+                "--porcelain=v1",
+                "-z",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            )
         )
         unstaged_diff = await self.run_main(("diff", "--binary", "--no-ext-diff", "--"))
         staged_diff = await self.run_main(
@@ -338,82 +343,16 @@ class GitBackend:
             git_config_summary=tuple(config_summary),
         )
 
-    async def create_dirty_snapshot(
-        self,
-        snapshot: RepositorySnapshot,
-        *,
-        transaction_id: str,
-        temporary_index: Path,
-        timestamp: datetime,
-    ) -> str:
-        """用 stash tree 和临时 index 保存 tracked、staged 与 untracked。"""
-        stash_output = await self.run_main(
-            (
-                "-c",
-                "user.name=Rivet",
-                "-c",
-                "user.email=rivet@localhost",
-                "stash",
-                "create",
-                f"Rivet dirty snapshot {transaction_id}",
+    async def is_tracked_path(self, relative_path: str) -> bool:
+        """确认固定仓库相对路径当前仍由 Git index 跟踪。"""
+        _decode_path(relative_path.encode("utf-8", errors="strict"))
+        tracked = parse_nul_paths(
+            await self.run_main(
+                ("ls-files", "-z", "--", relative_path),
+                check=False,
             )
         )
-        stash_commit = stash_output.decode("ascii", errors="strict").strip()
-        if stash_commit and (len(stash_commit) != 40 or not stash_commit.isalnum()):
-            raise TransactionError(
-                "transaction.dirty_snapshot_invalid",
-                "Git stash create 返回了无效快照",
-            )
-        if not snapshot.untracked_paths:
-            if not stash_commit:
-                raise TransactionError(
-                    "transaction.dirty_snapshot_unsupported",
-                    "脏状态无法安全生成 tracked 快照",
-                )
-            return stash_commit
-        temporary_index.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        temporary_index.unlink(missing_ok=True)
-        environment = {"GIT_INDEX_FILE": str(temporary_index)}
-        source_commit = stash_commit or snapshot.head_commit
-        try:
-            await self.run_main(("read-tree", source_commit), environment=environment)
-            for start in range(0, len(snapshot.untracked_paths), 500):
-                chunk = snapshot.untracked_paths[start : start + 500]
-                await self.run_main(
-                    ("add", "--all", "--", *chunk),
-                    environment=environment,
-                )
-            tree = (
-                (await self.run_main(("write-tree",), environment=environment))
-                .decode("ascii", errors="strict")
-                .strip()
-            )
-            git_date = timestamp.strftime("%Y-%m-%dT%H:%M:%S %z")
-            commit_environment = {
-                **environment,
-                "GIT_AUTHOR_NAME": "Rivet",
-                "GIT_AUTHOR_EMAIL": "rivet@localhost",
-                "GIT_AUTHOR_DATE": git_date,
-                "GIT_COMMITTER_NAME": "Rivet",
-                "GIT_COMMITTER_EMAIL": "rivet@localhost",
-                "GIT_COMMITTER_DATE": git_date,
-            }
-            commit = await self.run_main(
-                (
-                    "commit-tree",
-                    tree,
-                    "-p",
-                    snapshot.head_commit,
-                    "-m",
-                    f"Rivet dirty snapshot {transaction_id}",
-                ),
-                environment=commit_environment,
-            )
-        finally:
-            temporary_index.unlink(missing_ok=True)
-            with suppress(OSError):
-                temporary_index.parent.rmdir()
-        return commit.decode("ascii", errors="strict").strip()
+        return tracked == (relative_path,)
 
     async def add_worktree(self, path: Path, base_commit: str) -> None:
         """从冻结基线创建 detached Worktree。"""
@@ -510,7 +449,13 @@ class GitBackend:
             check=False,
         )
 
-    async def binary_diff(self, worktree: Path, base_commit: str) -> bytes:
+    async def binary_diff(
+        self,
+        worktree: Path,
+        base_commit: str,
+        *,
+        paths: tuple[str, ...] = (),
+    ) -> bytes:
         """将 untracked 标记为 intent-to-add 后生成完整 binary diff。"""
         untracked = parse_nul_paths(
             await self.run_worktree(
@@ -518,8 +463,20 @@ class GitBackend:
                 ("ls-files", "--others", "--exclude-standard", "-z"),
             )
         )
-        for start in range(0, len(untracked), 500):
-            chunk = untracked[start : start + 500]
+        selected_untracked = (
+            tuple(
+                candidate
+                for candidate in untracked
+                if any(
+                    candidate == path or candidate.startswith(f"{path}/")
+                    for path in paths
+                )
+            )
+            if paths
+            else untracked
+        )
+        for start in range(0, len(selected_untracked), 500):
+            chunk = selected_untracked[start : start + 500]
             await self.run_worktree(
                 worktree,
                 ("add", "--intent-to-add", "--", *chunk),
@@ -533,6 +490,7 @@ class GitBackend:
                 "--no-ext-diff",
                 base_commit,
                 "--",
+                *paths,
             ),
             timeout_seconds=60.0,
         )

@@ -1,43 +1,42 @@
-"""以单 Writer Task 持久化有界、脱敏且可恢复的 Trace。"""
+"""以单 Writer、NDJSON 和 fsync 提供最小耐久 Trace。"""
 
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 from dataclasses import dataclass
+from pathlib import Path
+from typing import BinaryIO
 
-from rivet.contracts.common import RunId
+from pydantic import ValidationError
+
 from rivet.contracts.events import TraceEventEnvelope
 from rivet.kernel.resources import ResourceScope
-from rivet.trace.artifacts import TraceArtifactStore
-from rivet.trace.database import TraceDatabase
-from rivet.trace.errors import TraceShutdownError, TraceWriteError
+from rivet.trace.errors import (
+    CorruptTraceError,
+    TraceShutdownError,
+    TraceWriteError,
+)
 from rivet.trace.models import (
     DEFAULT_MAX_EVENT_BYTES,
-    LocatedTraceEvent,
-    OutputCapture,
     PersistedTraceEvent,
     RecoveryReport,
-    TraceReplayResult,
-    TraceState,
+    TraceScan,
     serialize_persisted_event,
 )
 from rivet.trace.paths import RuntimePaths
 from rivet.trace.redaction import SecretRedactor
-from rivet.trace.reducer import TraceReducer
-from rivet.trace.replay import TraceReplayer, scan_trace_file
 
 
 @dataclass(slots=True)
 class _WriteRequest:
-    """绑定已脱敏事件与等待持久化确认的 Future。"""
-
     event: TraceEventEnvelope
     future: asyncio.Future[PersistedTraceEvent]
 
 
 class TraceStore:
-    """协调 NDJSON 事实源、SQLite 索引、在线 reducer 与资源回收。"""
+    """NDJSON 是唯一事实源；事件成功返回前已 append、flush、fsync。"""
 
     def __init__(
         self,
@@ -45,7 +44,7 @@ class TraceStore:
         *,
         redactor: SecretRedactor | None = None,
         queue_capacity: int = 256,
-        batch_size: int = 128,
+        batch_size: int = 64,
         max_event_bytes: int = DEFAULT_MAX_EVENT_BYTES,
         shutdown_timeout_seconds: float = 1.0,
     ) -> None:
@@ -61,78 +60,79 @@ class TraceStore:
         self._max_event_bytes = max_event_bytes
         self._shutdown_timeout_seconds = shutdown_timeout_seconds
         self._redactor = redactor or SecretRedactor()
-        self.database = TraceDatabase(paths.database_path)
-        self.artifacts = TraceArtifactStore(paths, self._redactor)
         self._queue: asyncio.Queue[_WriteRequest | None] | None = None
         self._scope: ResourceScope | None = None
         self._writer_task: asyncio.Task[None] | None = None
-        self._reducers: dict[str, TraceReducer] = {}
+        self._lock_file: BinaryIO | None = None
+        self._events: list[PersistedTraceEvent] = []
+        self._event_runs: dict[str, str] = {}
         self._pending_event_runs: dict[str, str] = {}
         self._next_sequence = 1
         self._started = False
         self._accepting = False
         self._fatal_error: TraceWriteError | None = None
         self.queue_peak_size = 0
-        self.database_event_count_before_close = 0
         self.recovery_report = RecoveryReport(
             recovered_event_count=0,
-            skipped_event_count=0,
             truncated_bytes=0,
         )
 
     @property
     def pending_event_count(self) -> int:
-        """返回尚未收到 SQLite 提交确认的事件数。"""
         return len(self._pending_event_runs)
 
+    @property
+    def event_count(self) -> int:
+        return len(self._events)
+
     async def start(self) -> None:
-        """恢复尾部、重建 SQLite，并启动唯一 Writer Task。"""
+        """获得仓库级独占锁、恢复尾部并启动唯一 Writer。"""
         if self._started:
             return
         self.paths.prepare()
         self.paths.events_path.touch(mode=0o600, exist_ok=True)
         self.paths.events_path.chmod(0o600)
-        scan_result = scan_trace_file(self.paths.events_path, recover_tail=True)
-        self.recovery_report = scan_result.report
-        self._reducers.clear()
-        for located_event in scan_result.located_events:
-            record = located_event.record
-            reducer = self._reducers.setdefault(
-                record.event.run_id, TraceReducer(record.event.run_id)
-            )
-            reducer.apply(record)
-        states = tuple(
-            self._reducers[run_id].snapshot() for run_id in sorted(self._reducers)
-        )
-        self.database.open()
+        lock_path = self.paths.events_path.with_suffix(".lock")
+        lock_path.touch(mode=0o600, exist_ok=True)
+        lock_file = lock_path.open("a+b", buffering=0)
         try:
-            self.database.rebuild_indexes(scan_result.located_events, states)
-        except Exception:
-            self.database.close()
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            lock_file.close()
+            raise TraceWriteError("当前仓库已有 Trace Writer") from error
+        try:
+            scan = _scan_and_recover_tail(
+                self.paths.events_path,
+                max_event_bytes=self._max_event_bytes,
+            )
+        except BaseException:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
             raise
-        self._next_sequence = (
-            scan_result.located_events[-1].record.sequence + 1
-            if scan_result.located_events
-            else 1
-        )
+        self._lock_file = lock_file
+        self._events = list(scan.events)
+        self._event_runs = {
+            item.event.event_id: item.event.run_id for item in scan.events
+        }
+        self._next_sequence = len(scan.events) + 1
+        self.recovery_report = scan.report
         self._queue = asyncio.Queue(maxsize=self.queue_capacity)
-        self._scope = ResourceScope("trace.store")
-        self._scope.register_connection(self.database, description="Trace SQLite")
+        self._scope = ResourceScope("trace.ndjson")
         self._writer_task = self._scope.create_task(
-            self._writer_loop(), description="Trace 单 Writer"
+            self._writer_loop(), description="Trace NDJSON 单 Writer"
         )
         self._started = True
         self._accepting = True
 
     async def emit(self, event: TraceEventEnvelope) -> PersistedTraceEvent:
-        """等待单个事件完成 NDJSON 与 SQLite 双重持久化。"""
         records = await self.emit_many((event,))
         return records[0]
 
     async def emit_many(
-        self, events: tuple[TraceEventEnvelope, ...]
+        self,
+        events: tuple[TraceEventEnvelope, ...],
     ) -> tuple[PersistedTraceEvent, ...]:
-        """通过有界队列提交多个事件并保持调用顺序。"""
+        """保持调用顺序入队；每个 Future 只在整批 fsync 后完成。"""
         self._ensure_accepting()
         futures: list[asyncio.Future[PersistedTraceEvent]] = []
         try:
@@ -144,36 +144,22 @@ class TraceStore:
             raise
         if not futures:
             return ()
-        results = await asyncio.gather(*futures)
-        return tuple(results)
+        return tuple(await asyncio.gather(*futures))
 
-    def online_state(self, run_id: RunId) -> TraceState:
-        """返回当前 Writer 已确认事件的 reducer 快照。"""
-        reducer = self._reducers.get(run_id)
-        return (reducer or TraceReducer(run_id)).snapshot()
+    def events(self, run_id: str | None = None) -> tuple[PersistedTraceEvent, ...]:
+        """从当前已 fsync 的事实中返回稳定快照。"""
+        if run_id is None:
+            return tuple(self._events)
+        return tuple(item for item in self._events if item.event.run_id == run_id)
 
-    def replay(self, run_id: RunId) -> TraceReplayResult:
-        """从 NDJSON 事实源独立回放指定 run。"""
-        return TraceReplayer(self.paths.events_path).replay(run_id)
-
-    def capture_output(
-        self,
-        *,
-        run_id: str,
-        event_id: str,
-        stdout: str,
-        stderr: str,
-    ) -> OutputCapture:
-        """把完整脱敏输出写入独立 artifact。"""
-        return self.artifacts.capture(
-            run_id=run_id,
-            event_id=event_id,
-            stdout=stdout,
-            stderr=stderr,
-        )
+    def event(self, event_id: str) -> PersistedTraceEvent | None:
+        for item in self._events:
+            if item.event.event_id == event_id:
+                return item
+        return None
 
     async def close(self) -> None:
-        """停止接收、排空 Writer，并在一秒门禁内归零资源。"""
+        """停止接收、排空队列、关闭资源并释放跨进程锁。"""
         if not self._started:
             return
         self._accepting = False
@@ -183,24 +169,27 @@ class TraceStore:
         if writer_task is None or scope is None:
             raise TraceShutdownError("Trace Store 状态不完整")
         await queue.put(None)
-        shutdown_error: Exception | None = None
+        shutdown_error: BaseException | None = None
         try:
             await asyncio.wait_for(
                 asyncio.shield(writer_task),
                 timeout=self._shutdown_timeout_seconds,
             )
         except TimeoutError as error:
-            shutdown_error = TraceShutdownError("Trace Writer 关闭超过时限")
             writer_task.cancel()
             await asyncio.gather(writer_task, return_exceptions=True)
-            shutdown_error.__cause__ = error
-        self.database_event_count_before_close = self.database.event_count()
+            shutdown_error = error
         try:
             await scope.close()
             scope.assert_empty()
-        except Exception as error:
+        except BaseException as error:
             if shutdown_error is None:
                 shutdown_error = error
+        lock_file = self._lock_file
+        self._lock_file = None
+        if lock_file is not None:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+            lock_file.close()
         self._started = False
         self._writer_task = None
         self._scope = None
@@ -210,34 +199,32 @@ class TraceStore:
             raise self._fatal_error
 
     async def _enqueue(
-        self, event: TraceEventEnvelope
+        self,
+        event: TraceEventEnvelope,
     ) -> asyncio.Future[PersistedTraceEvent]:
-        """脱敏、限制大小、校验父链并放入有界队列。"""
         self._ensure_accepting()
-        redacted_event = self._redactor.redact_event(event)
-        probe_record = PersistedTraceEvent(
-            sequence=max(1, self._next_sequence), event=redacted_event
+        redacted = self._redactor.redact_event(event)
+        serialize_persisted_event(
+            PersistedTraceEvent(sequence=self._next_sequence, event=redacted),
+            max_event_bytes=self._max_event_bytes,
         )
-        serialize_persisted_event(probe_record, max_event_bytes=self._max_event_bytes)
-        event_id = redacted_event.event_id
-        if event_id in self._pending_event_runs:
+        event_id = redacted.event_id
+        if event_id in self._event_runs or event_id in self._pending_event_runs:
             raise TraceWriteError(f"Trace event_id 重复：{event_id}")
-        persisted_run_id = self.database.event_run_id(event_id)
-        if persisted_run_id is not None:
-            raise TraceWriteError(f"Trace event_id 重复：{event_id}")
-        parent_event_id = redacted_event.parent_event_id
-        if parent_event_id is not None:
-            parent_run_id = self._pending_event_runs.get(parent_event_id)
-            if parent_run_id is None:
-                parent_run_id = self.database.event_run_id(parent_event_id)
-            if parent_run_id != redacted_event.run_id:
-                raise TraceWriteError("父事件必须先提交且属于同一 run")
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future[PersistedTraceEvent] = loop.create_future()
-        self._pending_event_runs[event_id] = redacted_event.run_id
-        queue = self._require_queue()
+        parent_id = redacted.parent_event_id
+        if parent_id is not None:
+            parent_run = self._pending_event_runs.get(parent_id)
+            if parent_run is None:
+                parent_run = self._event_runs.get(parent_id)
+            if parent_run != redacted.run_id:
+                raise TraceWriteError("父事件必须先进入队列且属于同一 run")
+        future: asyncio.Future[PersistedTraceEvent] = (
+            asyncio.get_running_loop().create_future()
+        )
+        self._pending_event_runs[event_id] = redacted.run_id
         try:
-            await queue.put(_WriteRequest(event=redacted_event, future=future))
+            queue = self._require_queue()
+            await queue.put(_WriteRequest(redacted, future))
         except BaseException:
             self._pending_event_runs.pop(event_id, None)
             raise
@@ -245,7 +232,6 @@ class TraceStore:
         return future
 
     async def _writer_loop(self) -> None:
-        """按批写文件、fsync、提交索引，再确认 Future。"""
         queue = self._require_queue()
         with self.paths.events_path.open("ab", buffering=0) as event_file:
             while True:
@@ -263,69 +249,53 @@ class TraceStore:
                         close_after_batch = True
                         break
                     batch.append(next_request)
+                durable_offset = event_file.tell()
                 try:
-                    located_events: list[LocatedTraceEvent] = []
-                    serialized_lines: list[bytes] = []
-                    byte_offset = event_file.tell()
-                    for batch_index, batch_request in enumerate(batch):
-                        record = PersistedTraceEvent(
-                            sequence=self._next_sequence + batch_index,
-                            event=batch_request.event,
+                    records = tuple(
+                        PersistedTraceEvent(
+                            sequence=self._next_sequence + index,
+                            event=item.event,
                         )
-                        serialized = serialize_persisted_event(
-                            record, max_event_bytes=self._max_event_bytes
-                        )
-                        serialized_lines.append(serialized)
-                        located_events.append(
-                            LocatedTraceEvent(
-                                record=record,
-                                byte_offset=byte_offset,
-                                byte_length=len(serialized),
+                        for index, item in enumerate(batch)
+                    )
+                    for record in records:
+                        event_file.write(
+                            serialize_persisted_event(
+                                record,
+                                max_event_bytes=self._max_event_bytes,
                             )
                         )
-                        byte_offset += len(serialized)
-                    for serialized in serialized_lines:
-                        event_file.write(serialized)
                     event_file.flush()
                     os.fsync(event_file.fileno())
-                    located_tuple = tuple(located_events)
-                    self.database.append_events(located_tuple)
-                    affected_runs: set[str] = set()
-                    for located_event in located_tuple:
-                        record = located_event.record
-                        reducer = self._reducers.setdefault(
-                            record.event.run_id,
-                            TraceReducer(record.event.run_id),
-                        )
-                        reducer.apply(record)
-                        affected_runs.add(record.event.run_id)
-                    states = tuple(
-                        self._reducers[run_id].snapshot()
-                        for run_id in sorted(affected_runs)
+                except BaseException as error:
+                    rollback_error = _discard_uncommitted_tail(
+                        event_file,
+                        durable_offset=durable_offset,
                     )
-                    self.database.update_metrics(states)
-                    self._next_sequence += len(batch)
-                except Exception as error:
-                    failure = TraceWriteError("Trace Writer 持久化批次失败")
+                    failure = TraceWriteError("Trace NDJSON append/fsync 失败")
                     failure.__cause__ = error
+                    if rollback_error is not None:
+                        failure.add_note("Trace 未确认耐久尾部回滚也失败；状态不可信")
                     self._fatal_error = failure
                     self._accepting = False
                     self._fail_requests(batch, failure)
                     await self._reject_until_shutdown(queue, failure)
                     return
-                for batch_request, located_event in zip(
-                    batch, located_events, strict=True
-                ):
-                    self._pending_event_runs.pop(batch_request.event.event_id, None)
-                    if not batch_request.future.done():
-                        batch_request.future.set_result(located_event.record)
+                self._next_sequence += len(records)
+                for item, record in zip(batch, records, strict=True):
+                    self._pending_event_runs.pop(item.event.event_id, None)
+                    self._event_runs[item.event.event_id] = item.event.run_id
+                    self._events.append(record)
+                    if not item.future.done():
+                        item.future.set_result(record)
                 if close_after_batch:
                     return
 
     def _fail_requests(
-        self, requests: list[_WriteRequest], failure: TraceWriteError
+        self,
+        requests: list[_WriteRequest],
+        failure: TraceWriteError,
     ) -> None:
-        """向当前失败批次传播同一脱敏错误。"""
         for request in requests:
             self._pending_event_runs.pop(request.event.event_id, None)
             if not request.future.done():
@@ -336,7 +306,6 @@ class TraceStore:
         queue: asyncio.Queue[_WriteRequest | None],
         failure: TraceWriteError,
     ) -> None:
-        """持续拒绝已通过入口的请求，直至 close 发送哨兵。"""
         while True:
             request = await queue.get()
             if request is None:
@@ -344,14 +313,82 @@ class TraceStore:
             self._fail_requests([request], failure)
 
     def _ensure_accepting(self) -> None:
-        """拒绝未启动、关闭中或已致命失败的写入。"""
         if self._fatal_error is not None:
             raise self._fatal_error
         if not self._started or not self._accepting:
             raise TraceWriteError("Trace Store 尚未启动或正在关闭")
 
     def _require_queue(self) -> asyncio.Queue[_WriteRequest | None]:
-        """返回已初始化队列。"""
         if self._queue is None:
             raise TraceWriteError("Trace Writer 队列尚未初始化")
         return self._queue
+
+
+def _scan_and_recover_tail(
+    path: Path,
+    *,
+    max_event_bytes: int,
+) -> TraceScan:
+    """只截断无换行的尾部半条；完整损坏与序列/父链错误失败关闭。"""
+    data = path.read_bytes()
+    events: list[PersistedTraceEvent] = []
+    event_runs: dict[str, str] = {}
+    offset = 0
+    truncate_at: int | None = None
+    lines = data.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        is_last = index == len(lines) - 1
+        complete = line.endswith(b"\n")
+        if not complete:
+            if not is_last:
+                raise CorruptTraceError("Trace 中部事件不完整")
+            truncate_at = offset
+            break
+        if len(line) > max_event_bytes:
+            raise CorruptTraceError("Trace 包含超大完整事件")
+        try:
+            record = PersistedTraceEvent.model_validate_json(line)
+        except (ValidationError, ValueError):
+            if not is_last:
+                raise CorruptTraceError("Trace 中部事件损坏") from None
+            raise CorruptTraceError("Trace 完整事件损坏") from None
+        if record.sequence != len(events) + 1:
+            raise CorruptTraceError("Trace sequence 不连续")
+        event = record.event
+        if event.event_id in event_runs:
+            raise CorruptTraceError("Trace event_id 重复")
+        if event.parent_event_id is not None and (
+            event_runs.get(event.parent_event_id) != event.run_id
+        ):
+            raise CorruptTraceError("Trace 父事件缺失、乱序或跨 run")
+        events.append(record)
+        event_runs[event.event_id] = event.run_id
+        offset += len(line)
+    if truncate_at is not None:
+        with path.open("r+b") as stream:
+            stream.truncate(truncate_at)
+            stream.flush()
+            os.fsync(stream.fileno())
+    truncated = len(data) - (truncate_at if truncate_at is not None else len(data))
+    return TraceScan(
+        events=tuple(events),
+        report=RecoveryReport(
+            recovered_event_count=len(events),
+            truncated_bytes=truncated,
+        ),
+    )
+
+
+def _discard_uncommitted_tail(
+    event_file: BinaryIO,
+    *,
+    durable_offset: int,
+) -> BaseException | None:
+    """尽力移除未获得 fsync 确认的完整行，防止重启误认为事实。"""
+    try:
+        event_file.truncate(durable_offset)
+        event_file.flush()
+        os.fsync(event_file.fileno())
+    except BaseException as error:
+        return error
+    return None
